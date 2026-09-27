@@ -1,0 +1,153 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens.
+ *
+ * Lifted from the CRM's own src/constants/theme.ts so that Finance looks like
+ * the same product as the panel it opens from: brand purple #7137b3, the
+ * neutrals nudged a few degrees toward that hue rather than Tailwind's cool
+ * slate ramp, and one deep section colour per area of the app.
+ *
+ * NO HEX LITERALS IN COMPONENTS. Change a colour here, never in a screen —
+ * that rule is what made the CRM's dark mode a change to one file.
+ */
+@theme {
+  --color-brand: #7137b3;
+  --color-brand-dark: #5b2d8f;
+  --color-brand-deep: #3f1d6b;
+  --color-brand-soft: #f3eefb;
+
+  /* The action colour: the teal the admin panel puts on its primary button. */
+  --color-action: #0f766e;
+  --color-action-dark: #115e56;
+  --color-action-soft: #eefaf7;
+
+  --color-ink: #14101f;
+  --color-ink-muted: #5b5470;
+  --color-ink-faint: #8b8499;
+  --color-line: #e9e5f1;
+  --color-canvas: #f7f5fb;
+  --color-surface: #ffffff;
+
+  --color-positive: #15803d;
+  --color-positive-soft: #f0fdf4;
+  --color-negative: #b91c1c;
+  --color-negative-soft: #fef2f2;
+  --color-warn: #92400e;
+  --color-warn-soft: #fffbeb;
+
+  /* One deep colour per section, the CRM's SECTION table. */
+  --color-sec-sales: #0B5D3B;
+  --color-sec-purchases: #8C3B1B;
+  --color-sec-banking: #0F4C5C;
+  --color-sec-accounting: #22304E;
+  --color-sec-taxes: #6E1B47;
+  --color-sec-analytics: #4C2A85;
+  --color-sec-books: #4A3111;
+  --color-sec-reports: #2A2A63;
+  --color-sec-settings: #475569;
+
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --radius-card: 14px;
+}
+
+:root {
+  color-scheme: light;
+  --sidebar-active: #4c2a85;
+
+  /*
+   * The masthead.
+   *
+   * It stays dark in both themes — deliberately. The bar is chrome, not
+   * content, and a dark strip above a white ledger is the boundary the eye
+   * uses to stop treating the menu as part of the figures. It is also the
+   * colour the CRM's own admin panel wears, so the two products read as one.
+   */
+  --nav-bg: #191225;
+  --nav-line: #2b2138;
+  --nav-text: #cfc7dd;
+  --nav-text-dim: #8d84a1;
+  --nav-input: rgba(255, 255, 255, 0.07);
+}
+
+/*
+ * Dark mode.
+ *
+ * Toggled by a data attribute rather than by the media query alone, because a
+ * finance screen gets read beside the CRM and the two have to agree; the CRM
+ * carries an explicit theme setting, and this mirrors it.
+ */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --color-ink: #eceaf3;
+    --color-ink-muted: #a49cb8;
+    --color-ink-faint: #72698a;
+    --color-line: #282132;
+    --color-canvas: #0f0c16;
+    --color-surface: #171320;
+    --color-brand: #8b5cf6;
+    --color-brand-soft: #241a33;
+    --color-action: #2dd4bf;
+    --color-action-soft: #10241f;
+    --color-positive: #34d399;
+    --color-positive-soft: #12261d;
+    --color-negative: #f87171;
+    --color-negative-soft: #2a1517;
+    --color-warn: #fbbf24;
+    --color-warn-soft: #2b2210;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-ink: #eceaf3;
+  --color-ink-muted: #a49cb8;
+  --color-ink-faint: #72698a;
+  --color-line: #282132;
+  --color-canvas: #0f0c16;
+  --color-surface: #171320;
+  --color-brand: #8b5cf6;
+  --color-brand-soft: #241a33;
+  --color-action: #2dd4bf;
+  --color-action-soft: #10241f;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  padding: 0;
+  margin: 0;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/*
+ * Tabular numerals everywhere a figure appears.
+ *
+ * A ledger column whose digits are different widths cannot be scanned: the
+ * decimal points wander and the eye has to re-find them on every row. This is
+ * the single highest-value typographic rule in an accounting UI.
+ */
+.num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* The scrollable pane inside a card, so the page header stays put. */
+.scroll-x { overflow-x: auto; }
+.scroll-x::-webkit-scrollbar { height: 8px; }
+.scroll-x::-webkit-scrollbar-thumb { background: var(--color-line); border-radius: 4px; }
+
+input, select, textarea, button { font: inherit; color: inherit; }
+
+input[type="date"]::-webkit-calendar-picker-indicator { opacity: .55; cursor: pointer; }
+
+@media print {
+  .no-print { display: none !important; }
+  body { background: #fff; }
+  main { padding: 0 !important; }
+}

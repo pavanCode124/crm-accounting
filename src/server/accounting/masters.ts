@@ -1,0 +1,328 @@
+import 'server-only';
+import { all, one, run, tx, id, nowIso, scalar } from '../db';
+import { audit } from './audit';
+import type { Actor } from './engine';
+
+/**
+ * Configuration records: accounts, journals, partners, taxes, products,
+ * bookings, budgets.
+ *
+ * Reads and simple writes only — nothing here posts. Anything that moves the
+ * ledger lives in the services beside this file, so that "what can change a
+ * balance" stays a short list.
+ */
+
+// ------------------------------------------------------------------ accounts
+export interface AccountRow {
+  id: string; code: string; name: string; kind: string; currency: string | null;
+  reconcilable: number; active: number; description: string | null;
+}
+
+export function listAccounts(orgId: string, opts: { kinds?: string[]; activeOnly?: boolean } = {}): AccountRow[] {
+  const clauses = ['org_id = ?'];
+  const params: Array<string | number> = [orgId];
+  if (opts.activeOnly !== false) clauses.push('active = 1');
+  if (opts.kinds?.length) {
+    clauses.push(`kind IN (${opts.kinds.map(() => '?').join(',')})`);
+    params.push(...opts.kinds);
+  }
+  return all<AccountRow>(
+    `SELECT * FROM accounts WHERE ${clauses.join(' AND ')} ORDER BY code`, ...params,
+  );
+}
+
+export function getAccount(orgId: string, accountId: string): AccountRow | null {
+  return one<AccountRow>('SELECT * FROM accounts WHERE id=? AND org_id=?', accountId, orgId);
+}
+
+export function upsertAccount(orgId: string, a: {
+  id?: string; code: string; name: string; kind: string; reconcilable?: boolean;
+  currency?: string | null; description?: string | null; active?: boolean;
+}, actor: Actor = {}) {
+  return tx(() => {
+    if (a.id) {
+      run(
+        `UPDATE accounts SET code=?, name=?, kind=?, reconcilable=?, currency=?, description=?, active=?
+           WHERE id=? AND org_id=?`,
+        a.code, a.name, a.kind, a.reconcilable ? 1 : 0, a.currency ?? null,
+        a.description ?? null, a.active === false ? 0 : 1, a.id, orgId,
+      );
+      audit(orgId, actor, 'modified', 'account', a.id, `${a.code} ${a.name}`);
+      return a.id;
+    }
+    const accountId = id('acc');
+    run(
+      `INSERT INTO accounts (id, org_id, code, name, kind, currency, reconcilable, active, description)
+       VALUES (?,?,?,?,?,?,?,1,?)`,
+      accountId, orgId, a.code, a.name, a.kind, a.currency ?? null,
+      a.reconcilable ? 1 : 0, a.description ?? null,
+    );
+    audit(orgId, actor, 'created', 'account', accountId, `${a.code} ${a.name}`);
+    return accountId;
+  });
+}
+
+/**
+ * An account that has ever been posted to is archived, never deleted.
+ * Deleting it would orphan journal entry lines, which is the one thing a
+ * double-entry system can never allow.
+ */
+export function archiveAccount(orgId: string, accountId: string, actor: Actor = {}) {
+  const used = scalar('SELECT COUNT(*) FROM journal_entry_lines WHERE account_id=?', accountId);
+  if (used === 0) {
+    run('DELETE FROM accounts WHERE id=? AND org_id=?', accountId, orgId);
+    audit(orgId, actor, 'deleted', 'account', accountId, 'Unused account removed');
+    return 'deleted';
+  }
+  run('UPDATE accounts SET active=0 WHERE id=? AND org_id=?', accountId, orgId);
+  audit(orgId, actor, 'archived', 'account', accountId, `Archived (${used} posted line(s))`);
+  return 'archived';
+}
+
+// ------------------------------------------------------------------ journals
+export interface JournalRow {
+  id: string; code: string; name: string; type: string; currency: string | null;
+  default_account_id: string | null; sequence_code: string; active: number;
+  default_account_name?: string | null; entries?: number;
+}
+
+export function listJournals(orgId: string, type?: string): JournalRow[] {
+  return all<JournalRow>(
+    `SELECT j.*, a.name AS default_account_name,
+            (SELECT COUNT(*) FROM journal_entries e WHERE e.journal_id = j.id AND e.state='posted') AS entries
+       FROM journals j LEFT JOIN accounts a ON a.id = j.default_account_id
+      WHERE j.org_id = ? AND j.active = 1 AND (? IS NULL OR j.type = ?)
+      ORDER BY j.type, j.code`,
+    orgId, type ?? null, type ?? null,
+  );
+}
+
+export function upsertJournal(orgId: string, j: {
+  id?: string; code: string; name: string; type: string;
+  defaultAccountId?: string | null; currency?: string | null;
+}, actor: Actor = {}) {
+  return tx(() => {
+    if (j.id) {
+      run('UPDATE journals SET code=?, name=?, type=?, default_account_id=?, currency=? WHERE id=? AND org_id=?',
+        j.code, j.name, j.type, j.defaultAccountId ?? null, j.currency ?? null, j.id, orgId);
+      audit(orgId, actor, 'modified', 'journal', j.id, j.name);
+      return j.id;
+    }
+    const journalId = id('jrn');
+    const seqCode = `j_${j.code.toLowerCase()}`;
+    run(
+      `INSERT INTO journals (id, org_id, code, name, type, currency, default_account_id, sequence_code, active)
+       VALUES (?,?,?,?,?,?,?,?,1)`,
+      journalId, orgId, j.code, j.name, j.type, j.currency ?? null, j.defaultAccountId ?? null, seqCode,
+    );
+    run('INSERT INTO sequences (org_id, code, prefix, padding, next_no) VALUES (?,?,?,?,1)',
+      orgId, seqCode, j.code.toUpperCase(), 5);
+    audit(orgId, actor, 'created', 'journal', journalId, j.name);
+    return journalId;
+  });
+}
+
+// ------------------------------------------------------------------ partners
+export interface PartnerRow {
+  id: string; name: string; is_customer: number; is_supplier: number; partner_type: string;
+  email: string | null; phone: string | null; gstin: string | null; pan: string | null;
+  address: string | null; credit_limit: number; tds_section: string | null;
+  payment_terms_id: string | null; active: number;
+  receivable?: number; payable?: number;
+}
+
+export function listPartners(orgId: string, opts: {
+  side?: 'customer' | 'supplier'; search?: string; limit?: number;
+} = {}): PartnerRow[] {
+  const clauses = ['p.org_id = ?', 'p.active = 1'];
+  const params: Array<string | number> = [orgId];
+  if (opts.side === 'customer') clauses.push('p.is_customer = 1');
+  if (opts.side === 'supplier') clauses.push('p.is_supplier = 1');
+  if (opts.search) {
+    clauses.push('(p.name LIKE ? OR p.email LIKE ? OR p.phone LIKE ? OR p.gstin LIKE ?)');
+    const like = `%${opts.search}%`;
+    params.push(like, like, like, like);
+  }
+  return all<PartnerRow>(
+    `SELECT p.*,
+            COALESCE((SELECT SUM(CASE WHEN d.doc_type='out_invoice' THEN d.residual ELSE -d.residual END)
+                        FROM documents d WHERE d.partner_id=p.id AND d.state='posted'
+                          AND d.doc_type IN ('out_invoice','out_refund')),0) AS receivable,
+            COALESCE((SELECT SUM(CASE WHEN d.doc_type='in_invoice' THEN d.residual ELSE -d.residual END)
+                        FROM documents d WHERE d.partner_id=p.id AND d.state='posted'
+                          AND d.doc_type IN ('in_invoice','in_refund')),0) AS payable
+       FROM partners p WHERE ${clauses.join(' AND ')}
+      ORDER BY p.name LIMIT ${opts.limit ?? 300}`,
+    ...params,
+  );
+}
+
+export function getPartner(orgId: string, partnerId: string): PartnerRow | null {
+  return one<PartnerRow>('SELECT * FROM partners WHERE id=? AND org_id=?', partnerId, orgId);
+}
+
+export function upsertPartner(orgId: string, p: {
+  id?: string; name: string; isCustomer?: boolean; isSupplier?: boolean;
+  partnerType?: string; email?: string | null; phone?: string | null;
+  gstin?: string | null; pan?: string | null; address?: string | null;
+  creditLimit?: number; tdsSection?: string | null; paymentTermsId?: string | null;
+  crmLeadId?: string | null;
+}, actor: Actor = {}) {
+  return tx(() => {
+    if (p.id) {
+      run(
+        `UPDATE partners SET name=?, is_customer=?, is_supplier=?, partner_type=?, email=?, phone=?,
+                gstin=?, pan=?, address=?, credit_limit=?, tds_section=?, payment_terms_id=?
+           WHERE id=? AND org_id=?`,
+        p.name, p.isCustomer ? 1 : 0, p.isSupplier ? 1 : 0, p.partnerType ?? 'b2c',
+        p.email ?? null, p.phone ?? null, p.gstin ?? null, p.pan ?? null, p.address ?? null,
+        p.creditLimit ?? 0, p.tdsSection ?? null, p.paymentTermsId ?? null, p.id, orgId,
+      );
+      audit(orgId, actor, 'modified', 'partner', p.id, p.name);
+      return p.id;
+    }
+    const partnerId = id('prt');
+    run(
+      `INSERT INTO partners (id, org_id, name, is_customer, is_supplier, partner_type, crm_lead_id,
+                             email, phone, gstin, pan, address, credit_limit, tds_section,
+                             payment_terms_id, active, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)`,
+      partnerId, orgId, p.name, p.isCustomer ? 1 : 0, p.isSupplier ? 1 : 0,
+      p.partnerType ?? 'b2c', p.crmLeadId ?? null, p.email ?? null, p.phone ?? null,
+      p.gstin ?? null, p.pan ?? null, p.address ?? null, p.creditLimit ?? 0,
+      p.tdsSection ?? null, p.paymentTermsId ?? null, nowIso(),
+    );
+    audit(orgId, actor, 'created', 'partner', partnerId, p.name);
+    return partnerId;
+  });
+}
+
+// ------------------------------------------------------------------ products
+export function listProducts(orgId: string) {
+  return all<{
+    id: string; name: string; code: string | null; category: string;
+    sale_price: number; cost_price: number; income_account_id: string | null;
+    expense_account_id: string | null; sale_tax_id: string | null; purchase_tax_id: string | null;
+  }>('SELECT * FROM products WHERE org_id=? AND active=1 ORDER BY category, name', orgId);
+}
+
+export function upsertProduct(orgId: string, p: {
+  id?: string; name: string; code?: string | null; category: string;
+  salePrice?: number; costPrice?: number; incomeAccountId?: string | null;
+  expenseAccountId?: string | null; saleTaxId?: string | null; purchaseTaxId?: string | null;
+}, actor: Actor = {}) {
+  return tx(() => {
+    if (p.id) {
+      run(
+        `UPDATE products SET name=?, code=?, category=?, sale_price=?, cost_price=?,
+                income_account_id=?, expense_account_id=?, sale_tax_id=?, purchase_tax_id=?
+           WHERE id=? AND org_id=?`,
+        p.name, p.code ?? null, p.category, p.salePrice ?? 0, p.costPrice ?? 0,
+        p.incomeAccountId ?? null, p.expenseAccountId ?? null,
+        p.saleTaxId ?? null, p.purchaseTaxId ?? null, p.id, orgId,
+      );
+      return p.id;
+    }
+    const productId = id('prd');
+    run(
+      `INSERT INTO products (id, org_id, name, code, category, sale_price, cost_price,
+                             income_account_id, expense_account_id, sale_tax_id, purchase_tax_id, active)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,1)`,
+      productId, orgId, p.name, p.code ?? null, p.category, p.salePrice ?? 0, p.costPrice ?? 0,
+      p.incomeAccountId ?? null, p.expenseAccountId ?? null, p.saleTaxId ?? null, p.purchaseTaxId ?? null,
+    );
+    audit(orgId, actor, 'created', 'product', productId, p.name);
+    return productId;
+  });
+}
+
+// ------------------------------------------------------------------ bookings
+/**
+ * Create a booking AND its trip analytic account, together.
+ *
+ * Always together: a booking with no analytic account is a trip whose costs
+ * cannot be tagged, and it is discovered three invoices later when the margin
+ * report shows nothing. The CRM sync path calls this too.
+ */
+export function createBooking(orgId: string, b: {
+  ref: string; title: string; partnerId?: string | null; destination?: string | null;
+  packageName?: string | null; agentName?: string | null; branch?: string | null;
+  pax?: number; startDate?: string | null; endDate?: string | null;
+  sellValue?: number; status?: string;
+}, actor: Actor = {}): string {
+  return tx(() => {
+    const plan = one<{ id: string }>("SELECT id FROM analytic_plans WHERE org_id=? AND code='TRIPS'", orgId);
+    if (!plan) throw new Error('The Trips analytic plan is missing. Run the seed.');
+
+    const bookingId = id('bkg');
+    const analyticId = id('ana');
+    run(
+      `INSERT INTO analytic_accounts (id, org_id, plan_id, code, name, booking_id, partner_id, active)
+       VALUES (?,?,?,?,?,?,?,1)`,
+      analyticId, orgId, plan.id, b.ref, `${b.destination ?? b.title} ${b.ref}`,
+      bookingId, b.partnerId ?? null,
+    );
+    run(
+      `INSERT INTO bookings (id, org_id, ref, title, partner_id, destination, package_name,
+                             agent_name, branch, pax, start_date, end_date, sell_value, status,
+                             analytic_id, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      bookingId, orgId, b.ref, b.title, b.partnerId ?? null, b.destination ?? null,
+      b.packageName ?? null, b.agentName ?? null, b.branch ?? null, b.pax ?? 1,
+      b.startDate ?? null, b.endDate ?? null, b.sellValue ?? 0, b.status ?? 'confirmed',
+      analyticId, nowIso(),
+    );
+    audit(orgId, actor, 'created', 'booking', bookingId, `${b.ref} — ${b.title}`);
+    return bookingId;
+  });
+}
+
+export function getBooking(orgId: string, bookingId: string) {
+  return one<{
+    id: string; ref: string; title: string; partner_id: string | null; destination: string | null;
+    package_name: string | null; agent_name: string | null; pax: number; status: string;
+    start_date: string | null; end_date: string | null; sell_value: number; analytic_id: string | null;
+  }>('SELECT * FROM bookings WHERE id=? AND org_id=?', bookingId, orgId);
+}
+
+export function setBookingStatus(orgId: string, bookingId: string, status: string, actor: Actor = {}) {
+  run('UPDATE bookings SET status=? WHERE id=? AND org_id=?', status, bookingId, orgId);
+  audit(orgId, actor, 'modified', 'booking', bookingId, `Status → ${status}`);
+}
+
+// ------------------------------------------------------------------- budgets
+export function listBudgets(orgId: string) {
+  return all<{ id: string; name: string; owner: string | null; date_from: string; date_to: string; state: string }>(
+    'SELECT * FROM budgets WHERE org_id=? ORDER BY date_from DESC', orgId,
+  );
+}
+
+export function createBudget(orgId: string, b: {
+  name: string; owner?: string | null; dateFrom: string; dateTo: string;
+  lines: Array<{ accountId?: string | null; analyticId?: string | null; planned: number }>;
+}, actor: Actor = {}) {
+  return tx(() => {
+    const budgetId = id('bud');
+    run('INSERT INTO budgets (id, org_id, name, owner, date_from, date_to, state) VALUES (?,?,?,?,?,?,?)',
+      budgetId, orgId, b.name, b.owner ?? null, b.dateFrom, b.dateTo, 'confirmed');
+    for (const l of b.lines) {
+      run('INSERT INTO budget_lines (id, org_id, budget_id, account_id, analytic_id, planned) VALUES (?,?,?,?,?,?)',
+        id('bdl'), orgId, budgetId, l.accountId ?? null, l.analyticId ?? null, l.planned);
+    }
+    audit(orgId, actor, 'created', 'budget', budgetId, b.name);
+    return budgetId;
+  });
+}
+
+// ------------------------------------------------------------- payment terms
+export function listPaymentTerms(orgId: string) {
+  return all<{ id: string; name: string; days: number; note: string | null }>(
+    'SELECT * FROM payment_terms WHERE org_id=? ORDER BY days', orgId,
+  );
+}
+
+export function listUsers(orgId: string) {
+  return all<{ id: string; name: string; email: string | null; role: string }>(
+    'SELECT id, name, email, role FROM users WHERE org_id=? AND active=1 ORDER BY name', orgId,
+  );
+}
