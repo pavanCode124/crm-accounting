@@ -9,7 +9,7 @@ import type { Actor } from './engine';
  * the thing it describes, so a rolled-back post leaves no ghost line claiming
  * it happened — and a committed post can never be missing from the trail.
  */
-export function audit(
+export async function audit(
   orgId: string,
   actor: Actor,
   action: string,
@@ -18,7 +18,7 @@ export function audit(
   summary?: string,
   detail?: unknown,
 ) {
-  run(
+  await run(
     `INSERT INTO audit_log (org_id, at, user_id, user_name, action, model, record_id, summary, detail)
      VALUES (?,?,?,?,?,?,?,?,?)`,
     orgId, nowIso(), actor.id ?? null, actor.name ?? 'System',
@@ -32,16 +32,16 @@ export interface AuditRow {
   model: string; record_id: string; summary: string | null; detail: string | null;
 }
 
-export function auditFor(model: string, recordId: string): AuditRow[] {
-  return all<AuditRow>(
+export async function auditFor(model: string, recordId: string): Promise<AuditRow[]> {
+  return await all<AuditRow>(
     `SELECT id, at, user_name, action, model, record_id, summary, detail
        FROM audit_log WHERE model = ? AND record_id = ? ORDER BY id`,
     model, recordId,
   );
 }
 
-export function auditRecent(orgId: string, limit = 50): AuditRow[] {
-  return all<AuditRow>(
+export async function auditRecent(orgId: string, limit = 50): Promise<AuditRow[]> {
+  return await all<AuditRow>(
     `SELECT id, at, user_name, action, model, record_id, summary, detail
        FROM audit_log WHERE org_id = ? ORDER BY id DESC LIMIT ?`,
     orgId, limit,

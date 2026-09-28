@@ -11,13 +11,13 @@ export const dynamic = 'force-dynamic';
  * only in the `is_cash` flag and the words on the page.
  */
 export default async function CashBookPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
   const range = resolveRange(
-    { range: one(params, 'range'), from: one(params, 'from'), to: one(params, 'to') }, s.fyStartMonth,
+    { range: await one(params, 'range'), from: await one(params, 'from'), to: await one(params, 'to') }, s.fyStartMonth,
   );
   return (
     <CashBookView orgId={s.orgId} range={range} isCash
-      selected={one(params, 'account')} basePath="/reports/cash-book" />
+      selected={await one(params, 'account')} basePath="/reports/cash-book" />
   );
 }

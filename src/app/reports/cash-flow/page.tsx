@@ -17,12 +17,12 @@ export const dynamic = 'force-dynamic';
  * owner asks where the money went, not how depreciation was added back.
  */
 export default async function CashFlowPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
   const range = resolveRange(
-    { range: one(params, 'range'), from: one(params, 'from'), to: one(params, 'to') }, s.fyStartMonth,
+    { range: await one(params, 'range'), from: await one(params, 'from'), to: await one(params, 'to') }, s.fyStartMonth,
   );
-  const cf = cashFlow(s.orgId, range);
+  const cf = await cashFlow(s.orgId, range);
 
   return (
     <>

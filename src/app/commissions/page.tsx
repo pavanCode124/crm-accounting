@@ -22,10 +22,10 @@ export const dynamic = 'force-dynamic';
  * a commission cannot be calculated on a figure the books do not support.
  */
 export default async function CommissionsPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
-  const rows = listCommissions(s.orgId);
-  const bookings = bookingOptions(s.orgId);
+  const s = await ctx();
+  const m = await msg(await searchParams);
+  const rows = await listCommissions(s.orgId);
+  const bookings = await bookingOptions(s.orgId);
   const today = isoDate();
 
   const payable = rows.filter((r) => r.state === 'posted').reduce((sum, r) => sum + r.amount, 0);

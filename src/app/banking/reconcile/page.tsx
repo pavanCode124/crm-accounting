@@ -26,19 +26,19 @@ export const dynamic = 'force-dynamic';
  *   3. neither                          → post it straight to an account
  */
 export default async function ReconcilePage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
-  const m = msg(params);
-  const accounts = listBankAccounts(s.orgId);
-  const accountId = one(params, 'account') ?? accounts[0]?.id;
-  const txns = listBankTransactions(s.orgId, { bankAccountId: accountId, state: 'unreconciled', limit: 40 });
+  const m = await msg(params);
+  const accounts = await listBankAccounts(s.orgId);
+  const accountId = await one(params, 'account') ?? accounts[0]?.id;
+  const txns = await listBankTransactions(s.orgId, { bankAccountId: accountId, state: 'unreconciled', limit: 40 });
 
-  const customers = partnerOptions(s.orgId, 'customer');
-  const suppliers = partnerOptions(s.orgId, 'supplier');
-  const glAccounts = accountOptions(s.orgId);
-  const openInvoices = listDocuments(s.orgId, { docType: 'out_invoice', state: 'posted', limit: 200 })
+  const customers = await partnerOptions(s.orgId, 'customer');
+  const suppliers = await partnerOptions(s.orgId, 'supplier');
+  const glAccounts = await accountOptions(s.orgId);
+  const openInvoices = (await listDocuments(s.orgId, { docType: 'out_invoice', state: 'posted', limit: 200 }))
     .filter((d) => d.residual > 0);
-  const openBills = listDocuments(s.orgId, { docType: 'in_invoice', state: 'posted', limit: 200 })
+  const openBills = (await listDocuments(s.orgId, { docType: 'in_invoice', state: 'posted', limit: 200 }))
     .filter((d) => d.residual > 0);
   const returnTo = `/banking/reconcile?account=${accountId}`;
 
@@ -70,9 +70,9 @@ export default async function ReconcilePage({ searchParams }: { searchParams: Pr
         </Card>
       ) : (
         <div className="space-y-4">
-          {txns.map((t) => {
+          {txns.map(async (t) => {
             const inbound = t.amount > 0;
-            const suggestions = suggestMatches(s.orgId, t.id);
+            const suggestions = await suggestMatches(s.orgId, t.id);
             const partners = inbound ? customers : suppliers;
             const docs = inbound ? openInvoices : openBills;
 

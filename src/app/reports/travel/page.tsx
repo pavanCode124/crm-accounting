@@ -20,11 +20,11 @@ export const dynamic = 'force-dynamic';
  * that conversation a navigation exercise.
  */
 export default async function TravelReportsPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
-  const tab = one(params, 'tab') ?? 'suppliers';
+  const tab = await one(params, 'tab') ?? 'suppliers';
   const range = resolveRange(
-    { range: one(params, 'range'), from: one(params, 'from'), to: one(params, 'to') }, s.fyStartMonth,
+    { range: await one(params, 'range'), from: await one(params, 'from'), to: await one(params, 'to') }, s.fyStartMonth,
   );
 
   const tabs = [
@@ -52,8 +52,8 @@ export default async function TravelReportsPage({ searchParams }: { searchParams
   );
 }
 
-function SupplierCosts({ orgId, range }: { orgId: string; range: { from: string; to: string } }) {
-  const rows = supplierCostReport(orgId, range);
+async function SupplierCosts({ orgId, range }: { orgId: string; range: { from: string; to: string } }) {
+  const rows = await supplierCostReport(orgId, range);
   const purchases = rows.reduce((s, r) => s + r.purchases, 0);
   return (
     <Card title="Supplier cost report" subtitle="What was bought, what has been paid, what is still owed."
@@ -97,8 +97,8 @@ function SupplierCosts({ orgId, range }: { orgId: string; range: { from: string;
   );
 }
 
-function BookingPayments({ orgId }: { orgId: string }) {
-  const rows = bookingPaymentReport(orgId);
+async function BookingPayments({ orgId }: { orgId: string }) {
+  const rows = await bookingPaymentReport(orgId);
   return (
     <Card title="Booking payment report" subtitle="Every booking, what it was invoiced and what has landed."
       padded={false}>
@@ -130,8 +130,8 @@ function BookingPayments({ orgId }: { orgId: string }) {
   );
 }
 
-function CustomerValue({ orgId }: { orgId: string }) {
-  const rows = customerLifetimeValue(orgId);
+async function CustomerValue({ orgId }: { orgId: string }) {
+  const rows = await customerLifetimeValue(orgId);
   return (
     <Card title="Customer lifetime value"
       subtitle="Revenue is net of tax, so it compares like with like across GST rates." padded={false}>
@@ -169,8 +169,8 @@ function CustomerValue({ orgId }: { orgId: string }) {
   );
 }
 
-function Cancellations({ orgId }: { orgId: string }) {
-  const rows = cancellationReport(orgId);
+async function Cancellations({ orgId }: { orgId: string }) {
+  const rows = await cancellationReport(orgId);
   return (
     <Card title="Cancellation report"
       subtitle="What was billed, what was credited back, and what the trip still cost the agency." padded={false}>

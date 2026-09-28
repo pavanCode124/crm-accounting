@@ -5,7 +5,7 @@ import { AgeingReport } from '@/components/AgeingReport';
 export const dynamic = 'force-dynamic';
 
 export default async function Page() {
-  const s = ctx();
+  const s = await ctx();
   return (
     <>
       <PageHeader title="Accounts Receivable Ageing" subtitle="Who owes what, and for how long it has been owed." accent="var(--color-sec-reports)" />

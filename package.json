@@ -2,7 +2,7 @@
   "name": "tripzo-accounting",
   "version": "0.1.0",
   "private": true,
-  "description": "TripzoCRM Finance \u2014 double-entry travel ERP accounting",
+  "description": "TripzoCRM Finance — double-entry travel ERP accounting",
   "scripts": {
     "dev": "next dev -p 3100",
     "build": "next build",
@@ -11,7 +11,9 @@
     "reset": "node scripts/reset.mjs"
   },
   "dependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "next": "^16.3.6",
+    "pg": "^8.23.0",
     "react": "19.1.1",
     "react-dom": "19.1.1",
     "server-only": "^0.0.1"
@@ -19,9 +21,13 @@
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.13",
     "@types/node": "^22.15.3",
+    "@types/pg": "^8.23.1",
     "@types/react": "^19.1.9",
     "@types/react-dom": "^19.1.7",
     "tailwindcss": "^4.1.13",
     "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20.9"
   }
 }

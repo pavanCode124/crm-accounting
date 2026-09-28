@@ -11,11 +11,11 @@ export const dynamic = 'force-dynamic';
 const LINES = 8;
 
 export default async function NewBudgetPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
+  const s = await ctx();
+  const m = await msg(await searchParams);
   const fy = fiscalYearOf(isoDate(), s.fyStartMonth);
-  const accounts = accountOptions(s.orgId, ['expense_direct', 'expense_operating', 'income']);
-  const analytics = analyticOptions(s.orgId);
+  const accounts = await accountOptions(s.orgId, ['expense_direct', 'expense_operating', 'income']);
+  const analytics = await analyticOptions(s.orgId);
 
   return (
     <>

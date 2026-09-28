@@ -20,14 +20,14 @@ export const dynamic = 'force-dynamic';
 export default async function EntryPage({ params, searchParams }: {
   params: Promise<{ id: string }>; searchParams: Promise<SearchParams>;
 }) {
-  const s = ctx();
+  const s = await ctx();
   const { id } = await params;
-  const m = msg(await searchParams);
-  const data = journalEntry(s.orgId, id);
+  const m = await msg(await searchParams);
+  const data = await journalEntry(s.orgId, id);
   if (!data) return <Banner tone="error">That entry no longer exists.</Banner>;
 
   const { entry, lines } = data;
-  const trail = auditFor('journal_entry', id);
+  const trail = await auditFor('journal_entry', id);
   const debit = lines.reduce((sum, l) => sum + l.debit, 0);
   const credit = lines.reduce((sum, l) => sum + l.credit, 0);
   const today = isoDate();

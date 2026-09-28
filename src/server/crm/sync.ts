@@ -142,8 +142,8 @@ export async function syncFromCrm(orgId: string, actor: Actor = {}): Promise<Syn
   const summary =
     `${report.customers} customer(s), ${report.suppliers} supplier(s), ${report.bookings} booking(s), ` +
     `${report.invoices} invoice(s), ${report.payments} payment(s), ${report.skipped} skipped`;
-  recordSync(orgId, summary, crmOrg ? { id: crmOrg.id, name: crmOrg.name } : undefined);
-  audit(orgId, actor, 'synced', 'crm', orgId, `CRM sync — ${summary}`);
+  await recordSync(orgId, summary, crmOrg ? { id: crmOrg.id, name: crmOrg.name } : undefined);
+  await audit(orgId, actor, 'synced', 'crm', orgId, `CRM sync — ${summary}`);
   return report;
 }
 
@@ -163,7 +163,7 @@ async function syncOrg(orgId: string, s: CrmSession, report: SyncReport): Promis
     const body = await crmGet<CrmOrg | { organization?: CrmOrg }>(s, '/api/organizations/mine');
     const org = (body as { organization?: CrmOrg })?.organization ?? (body as CrmOrg);
     if (!org?.name) return null;
-    run('UPDATE organizations SET name = ? WHERE id = ?', org.extended_name || org.name, orgId);
+    await run('UPDATE organizations SET name = ? WHERE id = ?', org.extended_name || org.name, orgId);
     report.org = org.extended_name || org.name;
     return org;
   } catch (e) {
@@ -186,9 +186,9 @@ async function syncSuppliers(orgId: string, s: CrmSession, report: SyncReport, a
   }
 
   for (const sup of list) {
-    const existing = linkedLocalId(orgId, 'partner', sup.id);
+    const existing = await linkedLocalId(orgId, 'partner', sup.id);
     const address = [sup.billing_address, sup.city, sup.country].filter(Boolean).join(', ') || null;
-    const localId = upsertPartner(orgId, {
+    const localId = await upsertPartner(orgId, {
       id: existing ?? undefined,
       name: sup.company_name || sup.alias_name || 'Unnamed supplier',
       isCustomer: false,
@@ -197,7 +197,7 @@ async function syncSuppliers(orgId: string, s: CrmSession, report: SyncReport, a
       gstin: sup.gstin,
       address,
     }, actor);
-    link(orgId, 'partner', sup.id, localId);
+    await link(orgId, 'partner', sup.id, localId);
     if (!existing) report.suppliers++;
   }
 }
@@ -222,8 +222,8 @@ async function syncLeads(orgId: string, s: CrmSession, report: SyncReport, actor
 
   for (const lead of list) {
     const name = [lead.first_name, lead.last_name].filter(Boolean).join(' ').trim() || 'Unnamed lead';
-    const existing = linkedLocalId(orgId, 'partner', lead.id);
-    const partnerId = upsertPartner(orgId, {
+    const existing = await linkedLocalId(orgId, 'partner', lead.id);
+    const partnerId = await upsertPartner(orgId, {
       id: existing ?? undefined,
       name,
       isCustomer: true,
@@ -233,7 +233,7 @@ async function syncLeads(orgId: string, s: CrmSession, report: SyncReport, actor
       phone: lead.mobile_number,
       address: lead.city_country,
     }, actor);
-    link(orgId, 'partner', lead.id, partnerId);
+    await link(orgId, 'partner', lead.id, partnerId);
     byLead.set(lead.id, partnerId);
     if (!existing) report.customers++;
 
@@ -243,9 +243,9 @@ async function syncLeads(orgId: string, s: CrmSession, report: SyncReport, actor
     // profitability report full of empty rows.
     const ref = lead.package_number?.trim();
     if (!ref) continue;
-    if (linkedLocalId(orgId, 'booking', lead.id)) continue;
+    if (await linkedLocalId(orgId, 'booking', lead.id)) continue;
     try {
-      const bookingId = createBooking(orgId, {
+      const bookingId = await createBooking(orgId, {
         ref,
         title: `${lead.trip_type ?? 'Trip'} — ${name}`,
         partnerId,
@@ -255,7 +255,7 @@ async function syncLeads(orgId: string, s: CrmSession, report: SyncReport, actor
         sellValue: toMinorSafe(lead.total_amount),
         status: 'confirmed',
       }, actor);
-      link(orgId, 'booking', lead.id, bookingId);
+      await link(orgId, 'booking', lead.id, bookingId);
       report.bookings++;
     } catch (e) {
       // Almost always a duplicate ref, which is a CRM data question rather than
@@ -282,20 +282,20 @@ async function syncInvoices(
     return;
   }
 
-  const journal = pickJournal(orgId, 'sale');
-  const revenue = pickAccount(orgId, ['income', 'income_other']);
+  const journal = await pickJournal(orgId, 'sale');
+  const revenue = await pickAccount(orgId, ['income', 'income_other']);
   if (!journal || !revenue) {
     report.warnings.push('No sales journal or revenue account configured — invoices were not imported.');
     return;
   }
 
   for (const inv of list) {
-    if (linkedLocalId(orgId, 'document', inv.id)) { report.skipped++; continue; }
+    if (await linkedLocalId(orgId, 'document', inv.id)) { report.skipped++; continue; }
     // A draft is a proposal and a cancelled invoice never happened. Neither is
     // a fact the ledger should carry.
     if (inv.status === 'draft' || inv.status === 'cancelled') { report.skipped++; continue; }
 
-    const partnerId = resolvePartner(orgId, inv, leadPartner, actor);
+    const partnerId = await resolvePartner(orgId, inv, leadPartner, actor);
     if (!partnerId) { report.warnings.push(`Invoice ${inv.invoice_number}: no customer.`); continue; }
 
     // The CRM stores a whole-currency decimal; the ledger stores minor units as
@@ -307,7 +307,7 @@ async function syncInvoices(
            amount: Number(inv.subtotal ?? inv.total ?? 0), item_type: 'other' }];
 
     try {
-      const docId = createDocument({
+      const docId = await createDocument({
         orgId,
         docType: inv.doc_type === 'refund' ? 'out_refund' : 'out_invoice',
         partnerId,
@@ -315,7 +315,7 @@ async function syncInvoices(
         docDate: dateOnly(inv.issue_date) ?? isoDate(),
         dueDate: dateOnly(inv.due_date),
         currency: inv.currency || 'INR',
-        bookingId: inv.lead_id ? linkedLocalId(orgId, 'booking', inv.lead_id) : null,
+        bookingId: inv.lead_id ? await linkedLocalId(orgId, 'booking', inv.lead_id) : null,
         note: [inv.notes, `Imported from TripzoCRM invoice ${inv.invoice_number}`]
           .filter(Boolean).join(' · '),
         lines: items.map((it) => ({
@@ -327,7 +327,7 @@ async function syncInvoices(
       }, actor);
 
       // NOT posted. It is a draft in Review & Post until an accountant says so.
-      link(orgId, 'document', inv.id, docId);
+      await link(orgId, 'document', inv.id, docId);
       report.invoices++;
 
       await syncPayments(orgId, s, report, actor, inv, partnerId);
@@ -350,15 +350,15 @@ async function syncPayments(
     return;
   }
 
-  const journal = pickJournal(orgId, 'bank');
+  const journal = await pickJournal(orgId, 'bank');
   if (!journal) { report.warnings.push('No bank journal — payments were not imported.'); return; }
 
   for (const p of list) {
-    if (linkedLocalId(orgId, 'payment', p.id)) { report.skipped++; continue; }
+    if (await linkedLocalId(orgId, 'payment', p.id)) { report.skipped++; continue; }
     const amount = toMinorSafe(p.amount);
     if (amount <= 0) continue;
     try {
-      const paymentId = createPayment({
+      const paymentId = await createPayment({
         orgId,
         direction: 'inbound',
         partnerId,
@@ -379,7 +379,7 @@ async function syncPayments(
           .filter(Boolean).join(' · '),
         post: false,
       }, actor);
-      link(orgId, 'payment', p.id, paymentId);
+      await link(orgId, 'payment', p.id, paymentId);
       report.payments++;
     } catch (e) {
       report.warnings.push(`Payment on ${inv.invoice_number}: ${msgOf(e)}`);
@@ -400,23 +400,23 @@ async function syncPayments(
  * to keep, and refusing it would mean losing revenue from the books over a
  * missing contact record.
  */
-function resolvePartner(
+async function resolvePartner(
   orgId: string, inv: CrmInvoice, leadPartner: Map<string, string>, actor: Actor,
-): string | null {
+): Promise<string | null> {
   if (inv.lead_id) {
-    const byLead = leadPartner.get(inv.lead_id) ?? linkedLocalId(orgId, 'partner', inv.lead_id);
+    const byLead = leadPartner.get(inv.lead_id) ?? await linkedLocalId(orgId, 'partner', inv.lead_id);
     if (byLead) return byLead;
   }
   const name = inv.customer_name?.trim();
   if (!name) return null;
 
-  const match = all<{ id: string }>(
+  const match = (await all<{ id: string }>(
     'SELECT id FROM partners WHERE org_id=? AND is_customer=1 AND LOWER(name)=LOWER(?) LIMIT 1',
     orgId, name,
-  )[0];
+  ))[0];
   if (match) return match.id;
 
-  return upsertPartner(orgId, {
+  return await upsertPartner(orgId, {
     name,
     isCustomer: true,
     isSupplier: false,
@@ -426,12 +426,12 @@ function resolvePartner(
   }, actor);
 }
 
-function pickJournal(orgId: string, type: string): string | null {
-  return listJournals(orgId, type)[0]?.id ?? null;
+async function pickJournal(orgId: string, type: string): Promise<string | null> {
+  return (await listJournals(orgId, type))[0]?.id ?? null;
 }
 
-function pickAccount(orgId: string, kinds: string[]): string | null {
-  return listAccounts(orgId, { kinds })[0]?.id ?? null;
+async function pickAccount(orgId: string, kinds: string[]): Promise<string | null> {
+  return (await listAccounts(orgId, { kinds }))[0]?.id ?? null;
 }
 
 /** A CRM timestamp is an ISO datetime; every date column here is a plain date. */
@@ -460,6 +460,6 @@ function msgOf(e: unknown): string {
  * deleted in this system — so it is a "let me import it again alongside" tool,
  * not an undo. The screen says so in those words.
  */
-export function forgetSyncLinks(orgId: string) {
-  tx(() => { run('DELETE FROM crm_links WHERE org_id = ?', orgId); });
+export async function forgetSyncLinks(orgId: string) {
+  await tx(async () => { await run('DELETE FROM crm_links WHERE org_id = ?', orgId); });
 }

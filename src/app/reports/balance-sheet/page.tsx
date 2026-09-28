@@ -18,10 +18,10 @@ export const dynamic = 'force-dynamic';
  * from — and the proof line at the bottom says whether the statement balances.
  */
 export default async function BalanceSheetPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
-  const asOf = one(params, 'as_of') ?? isoDate();
-  const bs = balanceSheet(s.orgId, asOf, s.fyStartMonth);
+  const asOf = await one(params, 'as_of') ?? isoDate();
+  const bs = await balanceSheet(s.orgId, asOf, s.fyStartMonth);
 
   return (
     <>

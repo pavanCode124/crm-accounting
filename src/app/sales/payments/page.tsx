@@ -6,8 +6,8 @@ import { PaymentsView } from '@/components/PaymentsView';
 export const dynamic = 'force-dynamic';
 
 export default async function Page({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
+  const s = await ctx();
+  const m = await msg(await searchParams);
   return (
     <>
       <PageHeader title="Payments Received" subtitle="Receipts and customer advances, and what each one settled." accent="var(--color-sec-sales)" />

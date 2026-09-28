@@ -20,20 +20,20 @@ export const dynamic = 'force-dynamic';
  * than printing a meaningless cumulative figure across unrelated accounts.
  */
 export default async function GeneralLedgerPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
   const range = resolveRange(
-    { range: one(params, 'range'), from: one(params, 'from'), to: one(params, 'to') }, s.fyStartMonth,
+    { range: await one(params, 'range'), from: await one(params, 'from'), to: await one(params, 'to') }, s.fyStartMonth,
   );
   const filters = {
-    accountId: one(params, 'account'),
-    journalId: one(params, 'journal'),
-    partnerId: one(params, 'partner'),
-    bookingId: one(params, 'booking'),
-    analyticId: one(params, 'analytic'),
+    accountId: await one(params, 'account'),
+    journalId: await one(params, 'journal'),
+    partnerId: await one(params, 'partner'),
+    bookingId: await one(params, 'booking'),
+    analyticId: await one(params, 'analytic'),
   };
 
-  const { lines, opening } = generalLedger(s.orgId, { ...range, ...filters, limit: 2000 });
+  const { lines, opening } = await generalLedger(s.orgId, { ...range, ...filters, limit: 2000 });
   const debit = lines.reduce((sum, l) => sum + l.debit, 0);
   const credit = lines.reduce((sum, l) => sum + l.credit, 0);
   const single = Boolean(filters.accountId);
@@ -41,11 +41,11 @@ export default async function GeneralLedgerPage({ searchParams }: { searchParams
   // unrelated accounts is arithmetic, not a balance.
   const closing = opening + debit - credit;
 
-  const accounts = listAccounts(s.orgId, { activeOnly: false });
-  const journals = listJournals(s.orgId);
-  const partners = listPartners(s.orgId);
-  const analytics = listAnalyticAccounts(s.orgId);
-  const bookings = listBookings(s.orgId, { limit: 200 });
+  const accounts = await listAccounts(s.orgId, { activeOnly: false });
+  const journals = await listJournals(s.orgId);
+  const partners = await listPartners(s.orgId);
+  const analytics = await listAnalyticAccounts(s.orgId);
+  const bookings = await listBookings(s.orgId, { limit: 200 });
 
   return (
     <>

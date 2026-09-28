@@ -18,12 +18,12 @@ export const dynamic = 'force-dynamic';
  * cannot drift from the accounts, because it IS the accounts.
  */
 export default async function BudgetsPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
-  const m = msg(params);
-  const budgets = listBudgets(s.orgId);
-  const selected = one(params, 'id') ?? budgets[0]?.id;
-  const detail = selected ? budgetWithActuals(s.orgId, selected) : null;
+  const m = await msg(params);
+  const budgets = await listBudgets(s.orgId);
+  const selected = await one(params, 'id') ?? budgets[0]?.id;
+  const detail = selected ? await budgetWithActuals(s.orgId, selected) : null;
 
   return (
     <>

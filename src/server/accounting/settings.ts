@@ -50,22 +50,22 @@ export type SettingKey =
   | 'plan.branches'
   | 'plan.agents';
 
-export function setSetting(orgId: string, key: SettingKey, value: string) {
-  run(
+export async function setSetting(orgId: string, key: SettingKey, value: string) {
+  await run(
     `INSERT INTO org_settings (org_id, key, value) VALUES (?,?,?)
        ON CONFLICT(org_id, key) DO UPDATE SET value = excluded.value`,
     orgId, key, value,
   );
 }
 
-export function getSetting(orgId: string, key: SettingKey): string | null {
-  return one<{ value: string }>(
+export async function getSetting(orgId: string, key: SettingKey): Promise<string | null> {
+  return (await one<{ value: string }>(
     'SELECT value FROM org_settings WHERE org_id = ? AND key = ?', orgId, key,
-  )?.value ?? null;
+  ))?.value ?? null;
 }
 
-export function requireSetting(orgId: string, key: SettingKey): string {
-  const v = getSetting(orgId, key);
+export async function requireSetting(orgId: string, key: SettingKey): Promise<string> {
+  const v = await getSetting(orgId, key);
   if (!v) {
     throw new Error(
       `Accounting setting "${key}" is not configured for this organisation. ` +
@@ -75,9 +75,9 @@ export function requireSetting(orgId: string, key: SettingKey): string {
   return v;
 }
 
-export function allSettings(orgId: string): Record<string, string> {
+export async function allSettings(orgId: string): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
-  for (const r of all<{ key: string; value: string }>(
+  for (const r of await all<{ key: string; value: string }>(
     'SELECT key, value FROM org_settings WHERE org_id = ?', orgId,
   )) out[r.key] = r.value;
   return out;
@@ -88,20 +88,20 @@ export function allSettings(orgId: string): Record<string, string> {
  * default. Agencies that keep B2B receivables separate from retail set the
  * override on the partner and nothing else changes.
  */
-export function receivableAccount(orgId: string, partnerId: string): string {
-  return one<{ receivable_account_id: string | null }>(
+export async function receivableAccount(orgId: string, partnerId: string): Promise<string> {
+  return (await one<{ receivable_account_id: string | null }>(
     'SELECT receivable_account_id FROM partners WHERE id = ? AND org_id = ?', partnerId, orgId,
-  )?.receivable_account_id ?? requireSetting(orgId, 'account.receivable');
+  ))?.receivable_account_id ?? await requireSetting(orgId, 'account.receivable');
 }
 
-export function payableAccount(orgId: string, partnerId: string): string {
-  return one<{ payable_account_id: string | null }>(
+export async function payableAccount(orgId: string, partnerId: string): Promise<string> {
+  return (await one<{ payable_account_id: string | null }>(
     'SELECT payable_account_id FROM partners WHERE id = ? AND org_id = ?', partnerId, orgId,
-  )?.payable_account_id ?? requireSetting(orgId, 'account.payable');
+  ))?.payable_account_id ?? await requireSetting(orgId, 'account.payable');
 }
 
-export function accountByCode(orgId: string, code: string): string | null {
-  return one<{ id: string }>(
+export async function accountByCode(orgId: string, code: string): Promise<string | null> {
+  return (await one<{ id: string }>(
     'SELECT id FROM accounts WHERE org_id = ? AND code = ?', orgId, code,
-  )?.id ?? null;
+  ))?.id ?? null;
 }

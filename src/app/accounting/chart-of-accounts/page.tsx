@@ -22,11 +22,11 @@ export const dynamic = 'force-dynamic';
  * anywhere for it to disagree with.
  */
 export default async function ChartOfAccountsPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
-  const m = msg(params);
-  const group = one(params, 'group');
-  const accounts = accountsWithBalances(s.orgId, isoDate());
+  const m = await msg(params);
+  const group = await one(params, 'group');
+  const accounts = await accountsWithBalances(s.orgId, isoDate());
   const shown = group ? accounts.filter((a) => kindGroup(a.kind) === group) : accounts;
 
   // Totalled over the rows ACTUALLY SHOWN, so the footer agrees with the table

@@ -23,8 +23,8 @@ export interface BankAccountRow {
   journal_id: string | null; active: number; balance?: number; unreconciled?: number;
 }
 
-export function listBankAccounts(orgId: string): BankAccountRow[] {
-  return all<BankAccountRow>(
+export async function listBankAccounts(orgId: string): Promise<BankAccountRow[]> {
+  return await all<BankAccountRow>(
     `SELECT ba.*,
             COALESCE((SELECT SUM(l.debit - l.credit) FROM journal_entry_lines l
                        WHERE l.account_id = ba.account_id AND l.state='posted'),0) AS balance,
@@ -35,22 +35,22 @@ export function listBankAccounts(orgId: string): BankAccountRow[] {
   );
 }
 
-export function getBankAccount(orgId: string, bankAccountId: string): BankAccountRow | null {
-  return one<BankAccountRow>(
+export async function getBankAccount(orgId: string, bankAccountId: string): Promise<BankAccountRow | null> {
+  return await one<BankAccountRow>(
     `SELECT ba.*, COALESCE((SELECT SUM(l.debit - l.credit) FROM journal_entry_lines l
                              WHERE l.account_id = ba.account_id AND l.state='posted'),0) AS balance
        FROM bank_accounts ba WHERE ba.id = ? AND ba.org_id = ?`, bankAccountId, orgId,
   );
 }
 
-export function listBankTransactions(orgId: string, opts: {
+export async function listBankTransactions(orgId: string, opts: {
   bankAccountId?: string; state?: string; limit?: number;
 } = {}) {
   const clauses = ['bt.org_id = ?'];
   const params: Array<string | number> = [orgId];
   if (opts.bankAccountId) { clauses.push('bt.bank_account_id = ?'); params.push(opts.bankAccountId); }
   if (opts.state) { clauses.push('bt.state = ?'); params.push(opts.state); }
-  return all<{
+  return await all<{
     id: string; txn_date: string; description: string | null; reference: string | null;
     amount: number; balance: number | null; state: string; bank_account_id: string;
     bank_name: string; matched_payment_id: string | null; partner_id: string | null;
@@ -84,25 +84,25 @@ export interface ImportRow {
  * the time — a bank exports "last 30 days" twice — and a duplicated receipt
  * that gets reconciled twice is a real, hard-to-unpick error.
  */
-export function importStatement(
+export async function importStatement(
   orgId: string,
   bankAccountId: string,
   rows: ImportRow[],
   actor: Actor = {},
-): { imported: number; skipped: number; batch: string } {
-  return tx(() => {
+): Promise<{ imported: number; skipped: number; batch: string }> {
+  return await tx(async () => {
     const batch = id('imp');
     let imported = 0;
     let skipped = 0;
     for (const r of rows) {
-      const dupe = scalar(
+      const dupe = await scalar(
         `SELECT COUNT(*) FROM bank_transactions
           WHERE org_id=? AND bank_account_id=? AND txn_date=? AND amount=?
             AND COALESCE(reference,'') = COALESCE(?,'')`,
         orgId, bankAccountId, r.date, r.amount, r.reference ?? null,
       );
       if (dupe > 0) { skipped += 1; continue; }
-      run(
+      await run(
         `INSERT INTO bank_transactions
            (id, org_id, bank_account_id, txn_date, description, reference, amount, balance,
             state, import_batch, created_at)
@@ -112,7 +112,7 @@ export function importStatement(
       );
       imported += 1;
     }
-    audit(orgId, actor, 'imported', 'bank_statement', bankAccountId,
+    await audit(orgId, actor, 'imported', 'bank_statement', bankAccountId,
       `${imported} line(s) imported, ${skipped} duplicate(s) skipped`);
     return { imported, skipped, batch };
   });
@@ -236,8 +236,8 @@ export interface MatchSuggestion {
  * first — and it is most of the volume in a travel agency, where customers pay
  * round numbers by UPI with their name attached.
  */
-export function suggestMatches(orgId: string, txnId: string, limit = 6): MatchSuggestion[] {
-  const txn = one<{ id: string; amount: number; txn_date: string; description: string | null; reference: string | null }>(
+export async function suggestMatches(orgId: string, txnId: string, limit = 6): Promise<MatchSuggestion[]> {
+  const txn = await one<{ id: string; amount: number; txn_date: string; description: string | null; reference: string | null }>(
     'SELECT id, amount, txn_date, description, reference FROM bank_transactions WHERE id = ? AND org_id = ?',
     txnId, orgId,
   );
@@ -249,7 +249,7 @@ export function suggestMatches(orgId: string, txnId: string, limit = 6): MatchSu
   const out: MatchSuggestion[] = [];
 
   // 1. A payment already keyed in but not yet tied to the statement.
-  for (const p of all<{ id: string; number: string; amount: number; pay_date: string; partner_id: string; partner_name: string; reference: string | null }>(
+  for (const p of await all<{ id: string; number: string; amount: number; pay_date: string; partner_id: string; partner_name: string; reference: string | null }>(
     `SELECT p.id, p.number, p.amount, p.pay_date, p.partner_id, pt.name AS partner_name, p.reference
        FROM payments p LEFT JOIN partners pt ON pt.id = p.partner_id
       WHERE p.org_id = ? AND p.direction = ? AND p.state IN ('posted','reconciled')
@@ -271,7 +271,7 @@ export function suggestMatches(orgId: string, txnId: string, limit = 6): MatchSu
 
   // 2. An open invoice or bill the money most likely settles.
   const types = inbound ? ['out_invoice'] : ['in_invoice'];
-  for (const d of all<{ id: string; number: string; residual: number; doc_date: string; partner_id: string; partner_name: string }>(
+  for (const d of await all<{ id: string; number: string; residual: number; doc_date: string; partner_id: string; partner_name: string }>(
     `SELECT d.id, d.number, d.residual, d.doc_date, d.partner_id, p.name AS partner_name
        FROM documents d JOIN partners p ON p.id = d.partner_id
       WHERE d.org_id = ? AND d.state='posted' AND d.residual > 0
@@ -303,16 +303,16 @@ export function suggestMatches(orgId: string, txnId: string, limit = 6): MatchSu
 }
 
 /** Tie a statement line to a payment that was already recorded. */
-export function matchToPayment(orgId: string, txnId: string, paymentId: string, actor: Actor = {}) {
-  return tx(() => {
-    const txn = one<{ amount: number }>('SELECT amount FROM bank_transactions WHERE id=? AND org_id=?', txnId, orgId);
-    const pay = one<{ amount: number; number: string }>('SELECT amount, number FROM payments WHERE id=? AND org_id=?', paymentId, orgId);
+export async function matchToPayment(orgId: string, txnId: string, paymentId: string, actor: Actor = {}) {
+  return await tx(async () => {
+    const txn = await one<{ amount: number }>('SELECT amount FROM bank_transactions WHERE id=? AND org_id=?', txnId, orgId);
+    const pay = await one<{ amount: number; number: string }>('SELECT amount, number FROM payments WHERE id=? AND org_id=?', paymentId, orgId);
     if (!txn || !pay) throw new PostingError('Unknown transaction or payment.');
     if (Math.abs(txn.amount) !== pay.amount) {
       throw new PostingError('The statement line and the payment are different amounts.');
     }
-    run(`UPDATE bank_transactions SET state='reconciled', matched_payment_id=? WHERE id=?`, paymentId, txnId);
-    audit(orgId, actor, 'reconciled', 'bank_transaction', txnId, `Matched to ${pay.number}`);
+    await run(`UPDATE bank_transactions SET state='reconciled', matched_payment_id=? WHERE id=?`, paymentId, txnId);
+    await audit(orgId, actor, 'reconciled', 'bank_transaction', txnId, `Matched to ${pay.number}`);
   });
 }
 
@@ -320,21 +320,21 @@ export function matchToPayment(orgId: string, txnId: string, paymentId: string, 
  * Create the payment a statement line represents, and reconcile in one step.
  * This is the common path: the money arrived and nobody had keyed it yet.
  */
-export function reconcileAsPayment(orgId: string, txnId: string, opts: {
+export async function reconcileAsPayment(orgId: string, txnId: string, opts: {
   partnerId: string; documentId?: string | null; isAdvance?: boolean; bookingId?: string | null;
 }, actor: Actor = {}) {
-  return tx(() => {
-    const txn = one<{ id: string; amount: number; txn_date: string; description: string | null; reference: string | null; bank_account_id: string }>(
+  return await tx(async () => {
+    const txn = await one<{ id: string; amount: number; txn_date: string; description: string | null; reference: string | null; bank_account_id: string }>(
       'SELECT * FROM bank_transactions WHERE id=? AND org_id=?', txnId, orgId,
     );
     if (!txn) throw new PostingError('Unknown transaction.');
-    const bank = one<{ journal_id: string | null }>(
+    const bank = await one<{ journal_id: string | null }>(
       'SELECT journal_id FROM bank_accounts WHERE id=?', txn.bank_account_id,
     );
     if (!bank?.journal_id) throw new PostingError('This bank account has no journal configured.');
 
     const inbound = txn.amount > 0;
-    const paymentId = createPayment({
+    const paymentId = await createPayment({
       orgId,
       direction: inbound ? 'inbound' : 'outbound',
       side: inbound ? 'customer' : 'supplier',
@@ -352,9 +352,9 @@ export function reconcileAsPayment(orgId: string, txnId: string, opts: {
         : [],
     }, actor);
 
-    run(`UPDATE bank_transactions SET state='reconciled', matched_payment_id=?, partner_id=? WHERE id=?`,
+    await run(`UPDATE bank_transactions SET state='reconciled', matched_payment_id=?, partner_id=? WHERE id=?`,
       paymentId, opts.partnerId, txnId);
-    audit(orgId, actor, 'reconciled', 'bank_transaction', txnId, 'Payment created from statement line');
+    await audit(orgId, actor, 'reconciled', 'bank_transaction', txnId, 'Payment created from statement line');
     return paymentId;
   });
 }
@@ -363,20 +363,20 @@ export function reconcileAsPayment(orgId: string, txnId: string, opts: {
  * Post a statement line straight to an account — bank charges, interest, a
  * transfer. No partner, no document, just the two sides of the entry.
  */
-export function reconcileToAccount(orgId: string, txnId: string, accountId: string, label: string, actor: Actor = {}) {
-  return tx(() => {
-    const txn = one<{ amount: number; txn_date: string; description: string | null; bank_account_id: string }>(
+export async function reconcileToAccount(orgId: string, txnId: string, accountId: string, label: string, actor: Actor = {}) {
+  return await tx(async () => {
+    const txn = await one<{ amount: number; txn_date: string; description: string | null; bank_account_id: string }>(
       'SELECT * FROM bank_transactions WHERE id=? AND org_id=?', txnId, orgId,
     );
     if (!txn) throw new PostingError('Unknown transaction.');
-    const bank = one<{ account_id: string; journal_id: string | null }>(
+    const bank = await one<{ account_id: string; journal_id: string | null }>(
       'SELECT account_id, journal_id FROM bank_accounts WHERE id=?', txn.bank_account_id,
     );
     if (!bank?.journal_id) throw new PostingError('This bank account has no journal configured.');
 
     const amount = Math.abs(txn.amount);
     const inbound = txn.amount > 0;
-    const entryId = postEntry({
+    const entryId = await postEntry({
       orgId,
       journalId: bank.journal_id,
       date: txn.txn_date,
@@ -395,27 +395,27 @@ export function reconcileToAccount(orgId: string, txnId: string, accountId: stri
         ],
     }, actor);
 
-    run(`UPDATE bank_transactions SET state='reconciled', entry_id=? WHERE id=?`, entryId, txnId);
-    audit(orgId, actor, 'reconciled', 'bank_transaction', txnId, label);
+    await run(`UPDATE bank_transactions SET state='reconciled', entry_id=? WHERE id=?`, entryId, txnId);
+    await audit(orgId, actor, 'reconciled', 'bank_transaction', txnId, label);
     return entryId;
   });
 }
 
 /** Money between the agency's own accounts — bank to cash, bank to bank. */
-export function transfer(orgId: string, opts: {
+export async function transfer(orgId: string, opts: {
   fromBankAccountId: string; toBankAccountId: string; date: string; amount: number; note?: string;
 }, actor: Actor = {}) {
-  return tx(() => {
+  return await tx(async () => {
     if (opts.fromBankAccountId === opts.toBankAccountId) {
       throw new PostingError('Choose two different accounts.');
     }
-    const from = getBankAccount(orgId, opts.fromBankAccountId);
-    const to = getBankAccount(orgId, opts.toBankAccountId);
+    const from = await getBankAccount(orgId, opts.fromBankAccountId);
+    const to = await getBankAccount(orgId, opts.toBankAccountId);
     if (!from || !to) throw new PostingError('Unknown bank account.');
     const label = opts.note ?? `Transfer ${from.name} → ${to.name}`;
-    return postEntry({
+    return await postEntry({
       orgId,
-      journalId: from.journal_id ?? requireSetting(orgId, 'journal.bank'),
+      journalId: from.journal_id ?? await requireSetting(orgId, 'journal.bank'),
       date: opts.date,
       reference: 'Internal transfer',
       narration: label,

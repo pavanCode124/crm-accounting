@@ -22,13 +22,13 @@ export const dynamic = 'force-dynamic';
 export default async function BankAccountPage({ params, searchParams }: {
   params: Promise<{ id: string }>; searchParams: Promise<SearchParams>;
 }) {
-  const s = ctx();
+  const s = await ctx();
   const { id } = await params;
-  const m = msg(await searchParams);
-  const account = getBankAccount(s.orgId, id);
+  const m = await msg(await searchParams);
+  const account = await getBankAccount(s.orgId, id);
   if (!account) return <Banner tone="error">That bank account no longer exists.</Banner>;
 
-  const txns = listBankTransactions(s.orgId, { bankAccountId: id, limit: 200 });
+  const txns = await listBankTransactions(s.orgId, { bankAccountId: id, limit: 200 });
   const unreconciled = txns.filter((t) => t.state === 'unreconciled');
   const statementNet = txns.reduce((sum, t) => sum + t.amount, 0);
 

@@ -20,16 +20,16 @@ export const dynamic = 'force-dynamic';
  * Rule 3 in reverse — from the ledger back to the document.
  */
 export default async function EntriesPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
-  const m = msg(params);
+  const m = await msg(params);
   const range = resolveRange(
-    { range: one(params, 'range'), from: one(params, 'from'), to: one(params, 'to') }, s.fyStartMonth,
+    { range: await one(params, 'range'), from: await one(params, 'from'), to: await one(params, 'to') }, s.fyStartMonth,
   );
-  const journalId = one(params, 'journal');
-  const state = one(params, 'state');
+  const journalId = await one(params, 'journal');
+  const state = await one(params, 'state');
 
-  const entries = all<{
+  const entries = await all<{
     id: string; entry_no: string | null; entry_date: string; reference: string | null;
     narration: string | null; state: string; journal_code: string; journal_name: string;
     source_model: string | null; source_id: string | null; debit: number; credit: number;
@@ -44,13 +44,13 @@ export default async function EntriesPage({ searchParams }: { searchParams: Prom
             COALESCE((SELECT SUM(l.credit) FROM journal_entry_lines l WHERE l.entry_id = e.id),0) AS credit
        FROM journal_entries e JOIN journals j ON j.id = e.journal_id
       WHERE e.org_id = ? AND e.entry_date BETWEEN ? AND ?
-        AND (? IS NULL OR e.journal_id = ?) AND (? IS NULL OR e.state = ?)
+        AND (?::text IS NULL OR e.journal_id = ?) AND (?::text IS NULL OR e.state = ?)
       ORDER BY e.entry_date DESC, e.entry_no DESC LIMIT 300`,
     s.orgId, range.from, range.to, journalId ?? null, journalId ?? null, state ?? null, state ?? null,
   );
 
-  const proof = ledgerTotals(s.orgId, range.from, range.to);
-  const journals = listJournals(s.orgId);
+  const proof = await ledgerTotals(s.orgId, range.from, range.to);
+  const journals = await listJournals(s.orgId);
 
   // These total the 300 rows on screen, which is NOT the same figure as `proof`
   // — that one is every posted line in the window, drafts excluded and no row

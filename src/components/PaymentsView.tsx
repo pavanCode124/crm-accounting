@@ -18,21 +18,21 @@ import {
  * document. The UNALLOCATED panel is therefore first — a receipt sitting
  * unapplied is the single most common reason a customer balance looks wrong.
  */
-export function PaymentsView({ orgId, direction }: { orgId: string; direction: 'inbound' | 'outbound' }) {
+export async function PaymentsView({ orgId, direction }: { orgId: string; direction: 'inbound' | 'outbound' }) {
   const inbound = direction === 'inbound';
   // Listed by SIDE, not by direction, so a customer refund stays on the Sales
   // screen where the person looking for it expects to find it.
-  const payments = listPayments(orgId, { side: inbound ? 'customer' : 'supplier', limit: 120 });
+  const payments = await listPayments(orgId, { side: inbound ? 'customer' : 'supplier', limit: 120 });
   const unapplied = payments.filter((p) => p.unallocated > 0 && p.state !== 'cancelled');
-  const openDocs = listDocuments(orgId, {
+  const openDocs = (await listDocuments(orgId, {
     docType: inbound ? 'out_invoice' : 'in_invoice', state: 'posted', limit: 200,
-  }).filter((d) => d.residual > 0);
+  })).filter((d) => d.residual > 0);
 
   const today = isoDate();
-  const banks = bankAccountOptions(orgId);
-  const journals = journalOptions(orgId, ['bank', 'cash']);
-  const partners = partnerOptions(orgId, inbound ? 'customer' : 'supplier');
-  const bookings = bookingOptions(orgId);
+  const banks = await bankAccountOptions(orgId);
+  const journals = await journalOptions(orgId, ['bank', 'cash']);
+  const partners = await partnerOptions(orgId, inbound ? 'customer' : 'supplier');
+  const bookings = await bookingOptions(orgId);
   const basePath = inbound ? '/sales' : '/purchases';
 
   const total = payments.filter((p) => p.state !== 'cancelled').reduce((s, p) => s + p.amount, 0);
@@ -109,8 +109,8 @@ export function PaymentsView({ orgId, direction }: { orgId: string; direction: '
                   </tr>
                 </thead>
                 <tbody>
-                  {payments.map((p) => {
-                    const allocs = allocationsOfPayment(p.id);
+                  {payments.map(async (p) => {
+                    const allocs = await allocationsOfPayment(p.id);
                     return (
                       <tr key={p.id} className="hover:bg-canvas">
                         <Td><span className="font-bold">{p.number}</span></Td>

@@ -19,10 +19,10 @@ export const dynamic = 'force-dynamic';
  * that reopening appearing in the audit trail.
  */
 export default async function PeriodsPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
-  const periods = listPeriods(s.orgId);
-  const years = listFiscalYears(s.orgId);
+  const s = await ctx();
+  const m = await msg(await searchParams);
+  const periods = await listPeriods(s.orgId);
+  const years = await listFiscalYears(s.orgId);
   const today = isoDate();
   const nextFy = fiscalYearOf(today, s.fyStartMonth);
   const mayClose = can(s.role, 'period.close');

@@ -18,12 +18,12 @@ export const dynamic = 'force-dynamic';
  * that is discovered three invoices later when its margin reads zero.
  */
 export default async function BookingsPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
-  const m = msg(params);
-  const search = one(params, 'q');
-  const bookings = listBookings(s.orgId, { search, status: one(params, 'status') });
-  const profit = new Map(tripProfitability(s.orgId).map((t) => [t.booking_id, t]));
+  const m = await msg(params);
+  const search = await one(params, 'q');
+  const bookings = await listBookings(s.orgId, { search, status: await one(params, 'status') });
+  const profit = new Map((await tripProfitability(s.orgId)).map((t) => [t.booking_id, t]));
 
   return (
     <>

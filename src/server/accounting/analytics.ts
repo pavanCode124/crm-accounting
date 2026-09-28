@@ -26,9 +26,9 @@ function marginOf(revenue: number, profit: number): number {
   return revenue === 0 ? 0 : (profit / revenue) * 100;
 }
 
-export function analyticProfitability(orgId: string, opts: {
+export async function analyticProfitability(orgId: string, opts: {
   planCode?: string; from?: string; to?: string; analyticId?: string; limit?: number;
-} = {}): AnalyticProfit[] {
+} = {}): Promise<AnalyticProfit[]> {
   const clauses = ['ad.org_id = ?', "ad.state = 'posted'"];
   const params: Array<string | number> = [orgId];
   if (opts.planCode) { clauses.push('pl.code = ?'); params.push(opts.planCode); }
@@ -36,7 +36,7 @@ export function analyticProfitability(orgId: string, opts: {
   if (opts.from) { clauses.push('ad.entry_date >= ?'); params.push(opts.from); }
   if (opts.to) { clauses.push('ad.entry_date <= ?'); params.push(opts.to); }
 
-  return all<{
+  return (await all<{
     analytic_id: string; code: string; name: string; plan_code: string;
     booking_id: string | null; booking_ref: string | null; revenue: number; cost: number;
   }>(
@@ -50,23 +50,23 @@ export function analyticProfitability(orgId: string, opts: {
        JOIN accounts a ON a.id = ad.account_id
        LEFT JOIN bookings b ON b.id = an.booking_id
       WHERE ${clauses.join(' AND ')}
-      GROUP BY ad.analytic_id
+      GROUP BY ad.analytic_id, an.code, an.name, pl.code, an.booking_id, b.ref
       ORDER BY revenue DESC
       LIMIT ${opts.limit ?? 200}`,
     ...params,
-  ).map((r) => {
+  )).map((r) => {
     const profit = r.revenue - r.cost;
     return { ...r, profit, margin: marginOf(r.revenue, profit) };
   });
 }
 
 /** The cost split behind a trip's margin — hotel, flights, transport, visa. */
-export function analyticCostBreakdown(orgId: string, analyticId: string) {
-  return all<{ code: string; name: string; kind: string; amount: number }>(
+export async function analyticCostBreakdown(orgId: string, analyticId: string) {
+  return await all<{ code: string; name: string; kind: string; amount: number }>(
     `SELECT a.code, a.name, a.kind, COALESCE(SUM(ad.amount),0) AS amount
        FROM analytic_distributions ad JOIN accounts a ON a.id = ad.account_id
       WHERE ad.org_id = ? AND ad.analytic_id = ? AND ad.state='posted'
-      GROUP BY a.id HAVING amount <> 0 ORDER BY a.kind, amount DESC`,
+      GROUP BY a.id HAVING COALESCE(SUM(ad.amount),0) <> 0 ORDER BY a.kind, amount DESC`,
     orgId, analyticId,
   );
 }
@@ -89,8 +89,8 @@ export interface BookingFinancials {
   counts: { invoices: number; bills: number; payments: number; refunds: number };
 }
 
-export function bookingFinancials(orgId: string, bookingId: string): BookingFinancials | null {
-  const booking = one<BookingFinancials['booking']>(
+export async function bookingFinancials(orgId: string, bookingId: string): Promise<BookingFinancials | null> {
+  const booking = await one<BookingFinancials['booking']>(
     `SELECT b.id, b.ref, b.title, b.destination, b.package_name, b.partner_id,
             p.name AS partner_name, b.agent_name, b.pax, b.start_date, b.end_date,
             b.sell_value, b.status, b.analytic_id
@@ -99,21 +99,21 @@ export function bookingFinancials(orgId: string, bookingId: string): BookingFina
   );
   if (!booking) return null;
 
-  const invoiced = scalar(
+  const invoiced = await scalar(
     `SELECT COALESCE(SUM(CASE WHEN doc_type='out_invoice' THEN total ELSE -total END),0)
        FROM documents WHERE org_id=? AND booking_id=? AND state='posted'
          AND doc_type IN ('out_invoice','out_refund')`, orgId, bookingId,
   );
-  const outstanding = scalar(
+  const outstanding = await scalar(
     `SELECT COALESCE(SUM(CASE WHEN doc_type='out_invoice' THEN residual ELSE -residual END),0)
        FROM documents WHERE org_id=? AND booking_id=? AND state='posted'
          AND doc_type IN ('out_invoice','out_refund')`, orgId, bookingId,
   );
-  const received = scalar(
+  const received = await scalar(
     `SELECT COALESCE(SUM(amount),0) FROM payments
       WHERE org_id=? AND booking_id=? AND direction='inbound' AND state<>'cancelled'`, orgId, bookingId,
   );
-  const advances = scalar(
+  const advances = await scalar(
     `SELECT COALESCE(SUM(unallocated),0) FROM payments
       WHERE org_id=? AND booking_id=? AND direction='inbound' AND is_advance=1 AND state<>'cancelled'`,
     orgId, bookingId,
@@ -123,7 +123,7 @@ export function bookingFinancials(orgId: string, bookingId: string): BookingFina
   // employee expense or a cash payment tagged to the trip is part of its cost
   // even though no vendor bill was ever raised.
   const analyticId = booking.analytic_id;
-  const breakdown = analyticId ? analyticCostBreakdown(orgId, analyticId) : [];
+  const breakdown = analyticId ? await analyticCostBreakdown(orgId, analyticId) : [];
   const costLines = breakdown.filter((r) => r.kind.startsWith('expense'))
     .map((r) => ({ code: r.code, name: r.name, amount: r.amount }));
   const cost = costLines.reduce((s, r) => s + r.amount, 0);
@@ -132,10 +132,10 @@ export function bookingFinancials(orgId: string, bookingId: string): BookingFina
   const profit = revenue - cost;
 
   const counts = {
-    invoices: scalar(`SELECT COUNT(*) FROM documents WHERE org_id=? AND booking_id=? AND doc_type='out_invoice' AND state='posted'`, orgId, bookingId),
-    bills: scalar(`SELECT COUNT(*) FROM documents WHERE org_id=? AND booking_id=? AND doc_type='in_invoice' AND state='posted'`, orgId, bookingId),
-    payments: scalar(`SELECT COUNT(*) FROM payments WHERE org_id=? AND booking_id=? AND state<>'cancelled'`, orgId, bookingId),
-    refunds: scalar(`SELECT COUNT(*) FROM documents WHERE org_id=? AND booking_id=? AND doc_type='out_refund' AND state='posted'`, orgId, bookingId),
+    invoices: await scalar(`SELECT COUNT(*) FROM documents WHERE org_id=? AND booking_id=? AND doc_type='out_invoice' AND state='posted'`, orgId, bookingId),
+    bills: await scalar(`SELECT COUNT(*) FROM documents WHERE org_id=? AND booking_id=? AND doc_type='in_invoice' AND state='posted'`, orgId, bookingId),
+    payments: await scalar(`SELECT COUNT(*) FROM payments WHERE org_id=? AND booking_id=? AND state<>'cancelled'`, orgId, bookingId),
+    refunds: await scalar(`SELECT COUNT(*) FROM documents WHERE org_id=? AND booking_id=? AND doc_type='out_refund' AND state='posted'`, orgId, bookingId),
   };
 
   return {
@@ -148,8 +148,8 @@ export function bookingFinancials(orgId: string, bookingId: string): BookingFina
 // Travel reports (plan section 40)
 // ---------------------------------------------------------------------------
 
-export function tripProfitability(orgId: string, p: { from?: string; to?: string } = {}) {
-  return analyticProfitability(orgId, { planCode: 'TRIPS', ...p });
+export async function tripProfitability(orgId: string, p: { from?: string; to?: string } = {}) {
+  return await analyticProfitability(orgId, { planCode: 'TRIPS', ...p });
 }
 
 /**
@@ -159,8 +159,8 @@ export function tripProfitability(orgId: string, p: { from?: string; to?: string
  * account, because a booking belongs to exactly one package and tagging every
  * line twice would double the analytic rows for no new information.
  */
-export function packageProfitability(orgId: string, p: { from?: string; to?: string } = {}) {
-  return all<{ package_name: string; bookings: number; revenue: number; cost: number }>(
+export async function packageProfitability(orgId: string, p: { from?: string; to?: string } = {}) {
+  return (await all<{ package_name: string; bookings: number; revenue: number; cost: number }>(
     `SELECT COALESCE(b.package_name, 'Unpackaged') AS package_name,
             COUNT(DISTINCT b.id) AS bookings,
             COALESCE(SUM(CASE WHEN a.kind IN ('income','income_other') THEN -ad.amount END),0) AS revenue,
@@ -170,17 +170,17 @@ export function packageProfitability(orgId: string, p: { from?: string; to?: str
        JOIN bookings b ON b.id = an.booking_id
        JOIN accounts a ON a.id = ad.account_id
       WHERE ad.org_id = ? AND ad.state='posted'
-        AND (? IS NULL OR ad.entry_date >= ?) AND (? IS NULL OR ad.entry_date <= ?)
+        AND (?::text IS NULL OR ad.entry_date >= ?) AND (?::text IS NULL OR ad.entry_date <= ?)
       GROUP BY package_name ORDER BY revenue DESC`,
     orgId, p.from ?? null, p.from ?? null, p.to ?? null, p.to ?? null,
-  ).map((r) => {
+  )).map((r) => {
     const profit = r.revenue - r.cost;
     return { ...r, profit, margin: marginOf(r.revenue, profit) };
   });
 }
 
-export function agentPerformance(orgId: string, p: { from?: string; to?: string } = {}) {
-  return all<{ agent_name: string; bookings: number; revenue: number; cost: number; commission: number }>(
+export async function agentPerformance(orgId: string, p: { from?: string; to?: string } = {}) {
+  return (await all<{ agent_name: string; bookings: number; revenue: number; cost: number; commission: number }>(
     `SELECT COALESCE(b.agent_name,'Unassigned') AS agent_name,
             COUNT(DISTINCT b.id) AS bookings,
             COALESCE(SUM(CASE WHEN a.kind IN ('income','income_other') THEN -ad.amount END),0) AS revenue,
@@ -192,17 +192,17 @@ export function agentPerformance(orgId: string, p: { from?: string; to?: string 
        JOIN bookings b ON b.id = an.booking_id
        JOIN accounts a ON a.id = ad.account_id
       WHERE ad.org_id = ? AND ad.state='posted'
-        AND (? IS NULL OR ad.entry_date >= ?) AND (? IS NULL OR ad.entry_date <= ?)
-      GROUP BY agent_name ORDER BY revenue DESC`,
+        AND (?::text IS NULL OR ad.entry_date >= ?) AND (?::text IS NULL OR ad.entry_date <= ?)
+      GROUP BY b.agent_name ORDER BY revenue DESC`,
     orgId, p.from ?? null, p.from ?? null, p.to ?? null, p.to ?? null,
-  ).map((r) => {
+  )).map((r) => {
     const profit = r.revenue - r.cost;
     return { ...r, profit, margin: marginOf(r.revenue, profit) };
   });
 }
 
-export function supplierCostReport(orgId: string, p: { from?: string; to?: string } = {}) {
-  return all<{ partner_id: string; name: string; purchases: number; paid: number; outstanding: number; bills: number }>(
+export async function supplierCostReport(orgId: string, p: { from?: string; to?: string } = {}) {
+  return await all<{ partner_id: string; name: string; purchases: number; paid: number; outstanding: number; bills: number }>(
     `SELECT p.id AS partner_id, p.name,
             COALESCE(SUM(CASE WHEN d.doc_type='in_invoice' THEN d.total ELSE -d.total END),0) AS purchases,
             COALESCE(SUM(CASE WHEN d.doc_type='in_invoice' THEN d.total - d.residual - d.withheld_tax ELSE 0 END),0) AS paid,
@@ -210,14 +210,14 @@ export function supplierCostReport(orgId: string, p: { from?: string; to?: strin
             COUNT(d.id) AS bills
        FROM partners p JOIN documents d ON d.partner_id = p.id
       WHERE p.org_id = ? AND d.state='posted' AND d.doc_type IN ('in_invoice','in_refund')
-        AND (? IS NULL OR d.doc_date >= ?) AND (? IS NULL OR d.doc_date <= ?)
+        AND (?::text IS NULL OR d.doc_date >= ?) AND (?::text IS NULL OR d.doc_date <= ?)
       GROUP BY p.id ORDER BY purchases DESC`,
     orgId, p.from ?? null, p.from ?? null, p.to ?? null, p.to ?? null,
   );
 }
 
-export function bookingPaymentReport(orgId: string) {
-  return all<{
+export async function bookingPaymentReport(orgId: string) {
+  return await all<{
     booking_id: string; ref: string; title: string; partner_name: string | null;
     total: number; paid: number; balance: number; due_date: string | null; status: string;
   }>(
@@ -231,13 +231,13 @@ export function bookingPaymentReport(orgId: string) {
        LEFT JOIN documents d ON d.booking_id = b.id AND d.state='posted'
             AND d.doc_type IN ('out_invoice','out_refund')
       WHERE b.org_id = ?
-      GROUP BY b.id ORDER BY balance DESC, b.ref DESC`,
+      GROUP BY b.id, p.name ORDER BY balance DESC, b.ref DESC`,
     orgId,
   );
 }
 
-export function customerLifetimeValue(orgId: string) {
-  return all<{
+export async function customerLifetimeValue(orgId: string) {
+  return await all<{
     partner_id: string; name: string; bookings: number; revenue: number;
     outstanding: number; profit: number;
   }>(
@@ -253,14 +253,16 @@ export function customerLifetimeValue(orgId: string) {
        LEFT JOIN documents d ON d.partner_id = p.id AND d.state='posted'
             AND d.doc_type IN ('out_invoice','out_refund')
       WHERE p.org_id = ? AND p.is_customer = 1
-      GROUP BY p.id HAVING revenue <> 0 OR bookings > 0
+      GROUP BY p.id
+      HAVING COALESCE(SUM(CASE WHEN d.doc_type='out_invoice' THEN d.untaxed ELSE -d.untaxed END),0) <> 0
+          OR (SELECT COUNT(*) FROM bookings b WHERE b.partner_id = p.id) > 0
       ORDER BY revenue DESC`,
     orgId,
   );
 }
 
-export function cancellationReport(orgId: string) {
-  return all<{
+export async function cancellationReport(orgId: string) {
+  return (await all<{
     booking_id: string; ref: string; title: string; revenue: number;
     refund: number; cost: number; net: number;
   }>(
@@ -277,20 +279,20 @@ export function cancellationReport(orgId: string) {
       WHERE b.org_id = ? AND b.status = 'cancelled'
       ORDER BY b.ref DESC`,
     orgId,
-  ).map((r) => ({ ...r, net: r.revenue - r.refund - r.cost }));
+  )).map((r) => ({ ...r, net: r.revenue - r.refund - r.cost }));
 }
 
 // ---------------------------------------------------------------------------
 // Budgets (plan section 38)
 // ---------------------------------------------------------------------------
 
-export function budgetWithActuals(orgId: string, budgetId: string) {
-  const budget = one<{ id: string; name: string; owner: string | null; date_from: string; date_to: string; state: string }>(
+export async function budgetWithActuals(orgId: string, budgetId: string) {
+  const budget = await one<{ id: string; name: string; owner: string | null; date_from: string; date_to: string; state: string }>(
     'SELECT * FROM budgets WHERE id = ? AND org_id = ?', budgetId, orgId,
   );
   if (!budget) return null;
 
-  const lines = all<{
+  const rows = await all<{
     id: string; planned: number; account_id: string | null; analytic_id: string | null;
     account_code: string | null; account_name: string | null; analytic_name: string | null;
   }>(
@@ -300,48 +302,51 @@ export function budgetWithActuals(orgId: string, budgetId: string) {
        LEFT JOIN accounts a ON a.id = bl.account_id
        LEFT JOIN analytic_accounts an ON an.id = bl.analytic_id
       WHERE bl.budget_id = ?`, budgetId,
-  ).map((l) => {
+  );
+
+  const lines = [];
+  for (const l of rows) {
     // Actual is read from the ledger over the budget's own window, filtered by
     // whichever dimensions the line names. A budget line with neither is a
     // planning row with no actual, and reads as 0 rather than as everything.
     const actual = l.analytic_id
-      ? scalar(
+      ? await scalar(
         `SELECT COALESCE(SUM(ad.amount),0) FROM analytic_distributions ad
           WHERE ad.org_id=? AND ad.analytic_id=? AND ad.state='posted'
             AND ad.entry_date BETWEEN ? AND ?
-            AND (? IS NULL OR ad.account_id = ?)`,
+            AND (?::text IS NULL OR ad.account_id = ?)`,
         orgId, l.analytic_id, budget.date_from, budget.date_to, l.account_id ?? null, l.account_id ?? null,
       )
       : l.account_id
-        ? scalar(
+        ? await scalar(
           `SELECT COALESCE(SUM(debit - credit),0) FROM journal_entry_lines
             WHERE org_id=? AND account_id=? AND state='posted' AND entry_date BETWEEN ? AND ?`,
           orgId, l.account_id, budget.date_from, budget.date_to,
         )
         : 0;
     const remaining = l.planned - actual;
-    return {
+    lines.push({
       ...l, actual, remaining,
       variancePct: l.planned === 0 ? 0 : (remaining / l.planned) * 100,
-    };
-  });
+    });
+  }
 
   const planned = lines.reduce((s, l) => s + l.planned, 0);
   const actual = lines.reduce((s, l) => s + l.actual, 0);
   return { budget, lines, planned, actual, remaining: planned - actual };
 }
 
-export function listAnalyticAccounts(orgId: string, planCode?: string) {
-  return all<{ id: string; code: string; name: string; plan_code: string; plan_name: string; booking_id: string | null }>(
+export async function listAnalyticAccounts(orgId: string, planCode?: string) {
+  return await all<{ id: string; code: string; name: string; plan_code: string; plan_name: string; booking_id: string | null }>(
     `SELECT an.id, an.code, an.name, pl.code AS plan_code, pl.name AS plan_name, an.booking_id
        FROM analytic_accounts an JOIN analytic_plans pl ON pl.id = an.plan_id
-      WHERE an.org_id = ? AND an.active = 1 AND (? IS NULL OR pl.code = ?)
+      WHERE an.org_id = ? AND an.active = 1 AND (?::text IS NULL OR pl.code = ?)
       ORDER BY pl.code, an.code`,
     orgId, planCode ?? null, planCode ?? null,
   );
 }
 
-export function listBookings(orgId: string, opts: { status?: string; search?: string; limit?: number } = {}) {
+export async function listBookings(orgId: string, opts: { status?: string; search?: string; limit?: number } = {}) {
   const clauses = ['b.org_id = ?'];
   const params: Array<string | number> = [orgId];
   if (opts.status) { clauses.push('b.status = ?'); params.push(opts.status); }
@@ -350,7 +355,7 @@ export function listBookings(orgId: string, opts: { status?: string; search?: st
     const like = `%${opts.search}%`;
     params.push(like, like, like);
   }
-  return all<{
+  return await all<{
     id: string; ref: string; title: string; destination: string | null; status: string;
     partner_name: string | null; agent_name: string | null; start_date: string | null;
     sell_value: number; pax: number; analytic_id: string | null;

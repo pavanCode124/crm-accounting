@@ -26,7 +26,7 @@ export interface ShellUser {
   name: string; role: string; orgName: string;
 }
 
-export function Shell({ user, children }: { user: ShellUser; children: React.ReactNode }) {
+export function Shell({ user, demo, children }: { user: ShellUser; demo?: boolean; children: React.ReactNode }) {
   const pathname = usePathname();
 
   const visible = NAV
@@ -36,6 +36,17 @@ export function Shell({ user, children }: { user: ShellUser; children: React.Rea
   return (
     <div className="flex min-h-screen flex-col">
       <Masthead user={user} sections={visible} pathname={pathname} />
+      {/*
+        * Demo mode is the absence of a database, not a deliberate flag, so a
+        * deployment can end up here by losing a variable. This strip is what
+        * stops invented figures being read as the agency's real books — it says
+        * so on every screen rather than only on the one nobody opens.
+        */}
+      {demo && (
+        <div className="bg-amber-400 px-4 py-1.5 text-center text-[12.5px] font-bold text-amber-950 md:px-8">
+          Demo data — not connected to TripzoCRM. Every figure below is sample bookkeeping, and changes are lost on restart.
+        </div>
+      )}
       <main className="flex-1 px-4 py-6 md:px-8 md:py-7">{children}</main>
     </div>
   );

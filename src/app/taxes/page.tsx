@@ -20,10 +20,10 @@ export const dynamic = 'force-dynamic';
  * two to the government.
  */
 export default async function TaxesPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
+  const s = await ctx();
+  const m = await msg(await searchParams);
 
-  const taxes = all<{
+  const taxes = await all<{
     id: string; name: string; rate_bps: number; scope: string; tax_group: string;
     price_included: number; threshold: number; account_name: string | null; account_code: string | null;
     is_child: number; parent_name: string | null; used: number;

@@ -35,8 +35,8 @@ export class ForbiddenError extends Error {
   }
 }
 
-export function getSession(): Session {
-  const org = one<{ id: string; name: string; currency: string; fy_start_month: number }>(
+export async function getSession(): Promise<Session> {
+  const org = await one<{ id: string; name: string; currency: string; fy_start_month: number }>(
     'SELECT id, name, currency, fy_start_month FROM organizations ORDER BY created_at LIMIT 1',
   );
   if (!org) {
@@ -44,11 +44,11 @@ export function getSession(): Session {
   }
   const wanted = process.env.TRIPZO_USER;
   const user =
-    (wanted ? one<{ id: string; name: string; role: string }>(
+    (wanted ? await one<{ id: string; name: string; role: string }>(
       'SELECT id, name, role FROM users WHERE org_id = ? AND (id = ? OR email = ?)',
       org.id, wanted, wanted,
     ) : null)
-    ?? one<{ id: string; name: string; role: string }>(
+    ?? await one<{ id: string; name: string; role: string }>(
       `SELECT id, name, role FROM users WHERE org_id = ? AND active = 1
         ORDER BY CASE role WHEN 'admin' THEN 0 WHEN 'accountant' THEN 1 ELSE 2 END LIMIT 1`,
       org.id,
@@ -70,8 +70,8 @@ export function actorOf(s: Session) {
 }
 
 /** Throws unless the current session holds `cap`. Server-side only, by design. */
-export function requireCap(cap: FinanceCap): Session {
-  const s = getSession();
+export async function requireCap(cap: FinanceCap): Promise<Session> {
+  const s = await getSession();
   if (!can(s.role, cap)) throw new ForbiddenError(cap);
   return s;
 }

@@ -15,17 +15,17 @@ export const dynamic = 'force-dynamic';
  * the same two tabs the list screen uses, and the tab you were on carries over.
  */
 export default async function NewAssetPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
-  const m = msg(params);
-  const tab = one(params, 'tab') === 'deferrals' ? 'deferrals' : 'assets';
+  const m = await msg(params);
+  const tab = await one(params, 'tab') === 'deferrals' ? 'deferrals' : 'assets';
   const today = isoDate();
 
-  const fixedAccounts = accountOptions(s.orgId, ['asset_fixed']);
-  const depAccounts = accountOptions(s.orgId, ['expense_depreciation', 'expense_operating']);
-  const prepaidAccounts = accountOptions(s.orgId, ['asset_prepaid', 'liability_current']);
-  const pnlAccounts = accountOptions(s.orgId, ['expense_operating', 'expense_direct', 'income']);
-  const journals = journalOptions(s.orgId, ['general']);
+  const fixedAccounts = await accountOptions(s.orgId, ['asset_fixed']);
+  const depAccounts = await accountOptions(s.orgId, ['expense_depreciation', 'expense_operating']);
+  const prepaidAccounts = await accountOptions(s.orgId, ['asset_prepaid', 'liability_current']);
+  const pnlAccounts = await accountOptions(s.orgId, ['expense_operating', 'expense_direct', 'income']);
+  const journals = await journalOptions(s.orgId, ['general']);
 
   return (
     <>

@@ -26,15 +26,15 @@ export const dynamic = 'force-dynamic';
  * prefixed, so the shape of an entry is legible before a single figure is read.
  */
 export default async function DayBookPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
   const range = resolveRange(
-    { range: one(params, 'range'), from: one(params, 'from'), to: one(params, 'to') }, s.fyStartMonth,
+    { range: await one(params, 'range'), from: await one(params, 'from'), to: await one(params, 'to') }, s.fyStartMonth,
   );
-  const journalId = one(params, 'journal');
+  const journalId = await one(params, 'journal');
 
-  const entries = dayBook(s.orgId, range, { journalId, limit: 400 });
-  const journals = listJournals(s.orgId);
+  const entries = await dayBook(s.orgId, range, { journalId, limit: 400 });
+  const journals = await listJournals(s.orgId);
   const debit = entries.reduce((sum, e) => sum + e.debit, 0);
   const credit = entries.reduce((sum, e) => sum + e.credit, 0);
 

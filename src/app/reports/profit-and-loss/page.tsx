@@ -18,13 +18,13 @@ export const dynamic = 'force-dynamic';
  * both into one "expenses" block hides the first question entirely.
  */
 export default async function PlPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
   const range = resolveRange(
-    { range: one(params, 'range'), from: one(params, 'from'), to: one(params, 'to') }, s.fyStartMonth,
+    { range: await one(params, 'range'), from: await one(params, 'from'), to: await one(params, 'to') }, s.fyStartMonth,
   );
   const prior = priorYear(range);
-  const pl = profitAndLoss(s.orgId, range, prior);
+  const pl = await profitAndLoss(s.orgId, range, prior);
 
   return (
     <>

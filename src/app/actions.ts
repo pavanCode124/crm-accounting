@@ -59,9 +59,16 @@ function money(f: FormData, k: string): number { return toMinor(str(f, k) || '0'
 function bool(f: FormData, k: string): boolean { return f.get(k) === 'on' || f.get(k) === 'true'; }
 
 /** Run a service call and turn any failure into a message the user can act on. */
-function guard<T>(fn: () => T): { value?: T } & Result {
+/**
+ * `await fn()`, not `fn()`. The services became asynchronous when the ledger
+ * moved to Postgres, and a try/catch around an un-awaited call catches nothing:
+ * the promise rejects after the handler has already returned "Done", so the
+ * accountant is told a posting succeeded while the error surfaces as an
+ * unhandled rejection in the server log. The await is what keeps this a guard.
+ */
+async function guard<T>(fn: () => T | Promise<T>): Promise<{ value?: T } & Result> {
   try {
-    return { value: fn(), ok: 'Done' };
+    return { value: await fn(), ok: 'Done' };
   } catch (e) {
     const message = e instanceof ForbiddenError
       ? e.message
@@ -117,7 +124,7 @@ function readLines(f: FormData) {
 export async function saveDocumentAction(formData: FormData) {
   const docType = str(formData, 'doc_type') as DocType;
   const isBill = docType.startsWith('in_');
-  const s = requireCap(isBill ? 'bill.create' : 'invoice.create');
+  const s = await requireCap(isBill ? 'bill.create' : 'invoice.create');
   const listPath = isBill ? '/purchases/bills' : '/sales/invoices';
   const existing = opt(formData, 'id');
 
@@ -142,15 +149,15 @@ export async function saveDocumentAction(formData: FormData) {
     lines,
   };
 
-  const r = guard(() => {
-    if (existing) { updateDocument(existing, input, actorOf(s)); return existing; }
-    return createDocument(input, actorOf(s));
+  const r = await guard(async () => {
+    if (existing) { await updateDocument(existing, input, actorOf(s)); return existing; }
+    return await createDocument(input, actorOf(s));
   });
   if (r.error) back(`${listPath}/new`, r);
 
   const docId = r.value!;
   if (bool(formData, 'post_now')) {
-    const posted = guard(() => postDocument(s.orgId, docId, actorOf(s)));
+    const posted = await guard(async () => await postDocument(s.orgId, docId, actorOf(s)));
     if (posted.error) back(`${listPath}/${docId}`, posted);
   }
   back(`${listPath}/${docId}`, { ok: 'Saved' });
@@ -159,36 +166,36 @@ export async function saveDocumentAction(formData: FormData) {
 export async function postDocumentAction(formData: FormData) {
   const docId = str(formData, 'id');
   const isBill = str(formData, 'doc_type').startsWith('in_');
-  const s = requireCap(isBill ? 'bill.post' : 'invoice.post');
-  const r = guard(() => postDocument(s.orgId, docId, actorOf(s)));
+  const s = await requireCap(isBill ? 'bill.post' : 'invoice.post');
+  const r = await guard(async () => await postDocument(s.orgId, docId, actorOf(s)));
   back(`${isBill ? '/purchases/bills' : '/sales/invoices'}/${docId}`, r.error ? r : { ok: 'Posted to the ledger.' });
 }
 
 export async function reverseDocumentAction(formData: FormData) {
   const docId = str(formData, 'id');
   const isBill = str(formData, 'doc_type').startsWith('in_');
-  const s = requireCap(isBill ? 'bill.post' : 'invoice.post');
-  const r = guard(() => reverseDocument(
+  const s = await requireCap(isBill ? 'bill.post' : 'invoice.post');
+  const r = await guard(async () => await reverseDocument(
     s.orgId, docId, str(formData, 'date') || isoDate(), actorOf(s), opt(formData, 'reason') ?? undefined,
   ));
   back(`${isBill ? '/purchases/bills' : '/sales/invoices'}/${docId}`, r.error ? r : { ok: 'Reversed.' });
 }
 
 export async function creditNoteAction(formData: FormData) {
-  const s = requireCap('invoice.create');
+  const s = await requireCap('invoice.create');
   const sourceId = str(formData, 'id');
   const pctValue = parseFloat(str(formData, 'percent') || '100');
-  const r = guard(() => {
-    const noteId = createCreditNote(s.orgId, sourceId, {
+  const r = await guard(async () => {
+    const noteId = await createCreditNote(s.orgId, sourceId, {
       date: str(formData, 'date') || isoDate(),
       bps: Math.round(pctValue * 100),
       reason: str(formData, 'reason') || 'Cancellation',
     }, actorOf(s));
-    if (bool(formData, 'post_now')) postDocument(s.orgId, noteId, actorOf(s));
+    if (bool(formData, 'post_now')) await postDocument(s.orgId, noteId, actorOf(s));
     return noteId;
   });
   if (r.error) back(`/sales/invoices/${sourceId}`, r);
-  const doc = getDocument(s.orgId, r.value!);
+  const doc = await getDocument(s.orgId, r.value!);
   const path = doc?.doc_type === 'in_refund' ? '/purchases/debit-notes' : '/sales/credit-notes';
   back(`${path}/${r.value}`, { ok: 'Credit note created.' });
 }
@@ -198,7 +205,7 @@ export async function creditNoteAction(formData: FormData) {
 // ---------------------------------------------------------------------------
 
 export async function registerPaymentAction(formData: FormData) {
-  const s = requireCap('payment.create');
+  const s = await requireCap('payment.create');
   const direction = str(formData, 'direction') === 'outbound' ? 'outbound' : 'inbound';
   // The side is sent by the form because the direction cannot imply it: a
   // customer refund is outbound money against the receivable side.
@@ -207,7 +214,7 @@ export async function registerPaymentAction(formData: FormData) {
   const amount = money(formData, 'amount');
   const listPath = direction === 'inbound' ? '/sales/payments' : '/purchases/payments';
 
-  const r = guard(() => createPayment({
+  const r = await guard(async () => await createPayment({
     orgId: s.orgId,
     direction,
     side,
@@ -238,36 +245,36 @@ export async function registerPaymentAction(formData: FormData) {
  * once both are posted.
  */
 export async function postPaymentAction(formData: FormData) {
-  const s = requireCap('payment.approve');
-  const r = guard(() => postPayment(s.orgId, str(formData, 'id'), actorOf(s)));
+  const s = await requireCap('payment.approve');
+  const r = await guard(async () => await postPayment(s.orgId, str(formData, 'id'), actorOf(s)));
   back(str(formData, 'return_to') || '/accounting/review', r.error ? r : { ok: 'Payment posted to the ledger.' });
 }
 
 export async function allocateAction(formData: FormData) {
-  const s = requireCap('payment.create');
-  const r = guard(() => allocate(
+  const s = await requireCap('payment.create');
+  const r = await guard(async () => await allocate(
     s.orgId, str(formData, 'payment_id'), str(formData, 'document_id'), money(formData, 'amount'), actorOf(s),
   ));
   back(str(formData, 'return_to') || '/sales/payments', r.error ? r : { ok: 'Allocated.' });
 }
 
 export async function unallocateAction(formData: FormData) {
-  const s = requireCap('payment.create');
-  const r = guard(() => unallocate(s.orgId, Number(str(formData, 'allocation_id')), actorOf(s)));
+  const s = await requireCap('payment.create');
+  const r = await guard(async () => await unallocate(s.orgId, Number(str(formData, 'allocation_id')), actorOf(s)));
   back(str(formData, 'return_to') || '/sales/payments', r.error ? r : { ok: 'Allocation removed.' });
 }
 
 export async function applyCreditAction(formData: FormData) {
-  const s = requireCap('payment.create');
-  const r = guard(() => applyCreditNote(
+  const s = await requireCap('payment.create');
+  const r = await guard(async () => await applyCreditNote(
     s.orgId, str(formData, 'credit_id'), str(formData, 'invoice_id'), money(formData, 'amount'), actorOf(s),
   ));
   back(str(formData, 'return_to') || '/sales/credit-notes', r.error ? r : { ok: 'Credit applied.' });
 }
 
 export async function reversePaymentAction(formData: FormData) {
-  const s = requireCap('payment.approve');
-  const r = guard(() => reversePayment(
+  const s = await requireCap('payment.approve');
+  const r = await guard(async () => await reversePayment(
     s.orgId, str(formData, 'id'), str(formData, 'date') || isoDate(), actorOf(s), opt(formData, 'reason') ?? undefined,
   ));
   back(str(formData, 'return_to') || '/sales/payments', r.error ? r : { ok: 'Payment reversed.' });
@@ -278,7 +285,7 @@ export async function reversePaymentAction(formData: FormData) {
 // ---------------------------------------------------------------------------
 
 export async function saveJournalEntryAction(formData: FormData) {
-  const s = requireCap('journal.create');
+  const s = await requireCap('journal.create');
   const accounts = formData.getAll('line_account').map(String);
   const debits = formData.getAll('line_debit').map(String);
   const credits = formData.getAll('line_credit').map(String);
@@ -306,23 +313,23 @@ export async function saveJournalEntryAction(formData: FormData) {
   };
 
   const postNow = bool(formData, 'post_now');
-  if (postNow) requireCap('journal.post');
-  const r = guard(() => (postNow ? postEntry(input, actorOf(s)) : draftEntry(input, actorOf(s))));
+  if (postNow) await requireCap('journal.post');
+  const r = await guard(async () => (postNow ? await postEntry(input, actorOf(s)) : await draftEntry(input, actorOf(s))));
   if (r.error) back('/accounting/entries/new', r);
   back(`/accounting/entries/${r.value}`, { ok: postNow ? 'Posted.' : 'Saved as draft.' });
 }
 
 export async function postEntryAction(formData: FormData) {
-  const s = requireCap('journal.post');
+  const s = await requireCap('journal.post');
   const entryId = str(formData, 'id');
-  const r = guard(() => postDraft(s.orgId, entryId, actorOf(s)));
+  const r = await guard(async () => await postDraft(s.orgId, entryId, actorOf(s)));
   back(str(formData, 'return_to') || `/accounting/entries/${entryId}`, r.error ? r : { ok: 'Posted.' });
 }
 
 export async function reverseEntryAction(formData: FormData) {
-  const s = requireCap('journal.post');
+  const s = await requireCap('journal.post');
   const entryId = str(formData, 'id');
-  const r = guard(() => reverseEntry(
+  const r = await guard(async () => await reverseEntry(
     s.orgId, entryId, str(formData, 'date') || isoDate(), actorOf(s), opt(formData, 'reason') ?? undefined,
   ));
   back(`/accounting/entries/${entryId}`, r.error ? r : { ok: 'Reversed.' });
@@ -333,7 +340,7 @@ export async function reverseEntryAction(formData: FormData) {
 // ---------------------------------------------------------------------------
 
 export async function importStatementAction(formData: FormData) {
-  const s = requireCap('bank.reconcile');
+  const s = await requireCap('bank.reconcile');
   const bankAccountId = str(formData, 'bank_account_id');
   const file = formData.get('file');
   const pasted = str(formData, 'csv');
@@ -345,7 +352,7 @@ export async function importStatementAction(formData: FormData) {
   if (!parsed.rows.length) {
     back(`/banking/${bankAccountId}`, { error: parsed.errors[0] ?? 'Nothing could be read from that file.' });
   }
-  const r = guard(() => importStatement(s.orgId, bankAccountId, parsed.rows, actorOf(s)));
+  const r = await guard(async () => await importStatement(s.orgId, bankAccountId, parsed.rows, actorOf(s)));
   if (r.error) back(`/banking/${bankAccountId}`, r);
   back(`/banking/reconcile?account=${bankAccountId}`, {
     ok: `${r.value!.imported} line(s) imported${r.value!.skipped ? `, ${r.value!.skipped} duplicate(s) skipped` : ''}.`,
@@ -353,18 +360,18 @@ export async function importStatementAction(formData: FormData) {
 }
 
 export async function reconcileAction(formData: FormData) {
-  const s = requireCap('bank.reconcile');
+  const s = await requireCap('bank.reconcile');
   const txnId = str(formData, 'txn_id');
   const mode = str(formData, 'mode');
   const returnTo = str(formData, 'return_to') || '/banking/reconcile';
 
-  const r = guard(() => {
-    if (mode === 'payment') return matchToPayment(s.orgId, txnId, str(formData, 'payment_id'), actorOf(s));
+  const r = await guard(async () => {
+    if (mode === 'payment') return await matchToPayment(s.orgId, txnId, str(formData, 'payment_id'), actorOf(s));
     if (mode === 'account') {
-      return reconcileToAccount(s.orgId, txnId, str(formData, 'account_id'),
+      return await reconcileToAccount(s.orgId, txnId, str(formData, 'account_id'),
         str(formData, 'label') || 'Bank entry', actorOf(s));
     }
-    return reconcileAsPayment(s.orgId, txnId, {
+    return await reconcileAsPayment(s.orgId, txnId, {
       partnerId: str(formData, 'partner_id'),
       documentId: opt(formData, 'document_id'),
       isAdvance: bool(formData, 'is_advance'),
@@ -374,8 +381,8 @@ export async function reconcileAction(formData: FormData) {
 }
 
 export async function transferAction(formData: FormData) {
-  const s = requireCap('payment.create');
-  const r = guard(() => transfer(s.orgId, {
+  const s = await requireCap('payment.create');
+  const r = await guard(async () => await transfer(s.orgId, {
     fromBankAccountId: str(formData, 'from_id'),
     toBankAccountId: str(formData, 'to_id'),
     date: str(formData, 'date') || isoDate(),
@@ -390,26 +397,26 @@ export async function transferAction(formData: FormData) {
 // ---------------------------------------------------------------------------
 
 export async function setPeriodStateAction(formData: FormData) {
-  const s = requireCap('period.close');
+  const s = await requireCap('period.close');
   const state = str(formData, 'state') as 'open' | 'locked' | 'closed';
-  const r = guard(() => setPeriodState(s.orgId, str(formData, 'id'), state, actorOf(s)));
+  const r = await guard(async () => await setPeriodState(s.orgId, str(formData, 'id'), state, actorOf(s)));
   back('/accounting/periods', r.error ? r : { ok: `Period ${state}.` });
 }
 
 export async function closeYearAction(formData: FormData) {
-  const s = requireCap('period.close');
-  const r = guard(() => closeFiscalYear(s.orgId, str(formData, 'id'), actorOf(s)));
+  const s = await requireCap('period.close');
+  const r = await guard(async () => await closeFiscalYear(s.orgId, str(formData, 'id'), actorOf(s)));
   back('/accounting/periods', r.error ? r : { ok: 'Year closed and rolled into retained earnings.' });
 }
 
 export async function createFiscalYearAction(formData: FormData) {
-  const s = requireCap('period.close');
-  const r = guard(() => createFiscalYear(s.orgId, str(formData, 'start') || isoDate(), actorOf(s)));
+  const s = await requireCap('period.close');
+  const r = await guard(async () => await createFiscalYear(s.orgId, str(formData, 'start') || isoDate(), actorOf(s)));
   back('/accounting/periods', r.error ? r : { ok: 'Fiscal year created with twelve periods.' });
 }
 
 export async function openingBalancesAction(formData: FormData) {
-  const s = requireCap('coa.configure');
+  const s = await requireCap('coa.configure');
   const accounts = formData.getAll('line_account').map(String);
   const debits = formData.getAll('line_debit').map(String);
   const credits = formData.getAll('line_credit').map(String);
@@ -419,7 +426,7 @@ export async function openingBalancesAction(formData: FormData) {
     credit: toMinor(credits[i] || '0'),
   })).filter((l) => l.accountId && (l.debit || l.credit));
 
-  const r = guard(() => postOpeningBalances(s.orgId, {
+  const r = await guard(async () => await postOpeningBalances(s.orgId, {
     date: str(formData, 'date') || isoDate(),
     lines,
     balancingAccountId: opt(formData, 'balancing_account_id'),
@@ -432,9 +439,9 @@ export async function openingBalancesAction(formData: FormData) {
 // ---------------------------------------------------------------------------
 
 export async function saveExpenseAction(formData: FormData) {
-  const s = requireCap('payment.create');
-  const r = guard(() => {
-    const expenseId = createExpense({
+  const s = await requireCap('payment.create');
+  const r = await guard(async () => {
+    const expenseId = await createExpense({
       orgId: s.orgId,
       employeeName: str(formData, 'employee_name') || s.userName,
       description: str(formData, 'description'),
@@ -447,7 +454,7 @@ export async function saveExpenseAction(formData: FormData) {
       paidBy: str(formData, 'paid_by') === 'company' ? 'company' : 'employee',
       journalId: opt(formData, 'journal_id'),
     }, actorOf(s));
-    submitExpense(s.orgId, expenseId, actorOf(s));
+    await submitExpense(s.orgId, expenseId, actorOf(s));
     return expenseId;
   });
   back(r.error ? '/expenses/new' : '/expenses', r.error ? r : { ok: 'Expense submitted.' });
@@ -456,12 +463,12 @@ export async function saveExpenseAction(formData: FormData) {
 export async function expenseWorkflowAction(formData: FormData) {
   const action = str(formData, 'action');
   const expenseId = str(formData, 'id');
-  const s = requireCap(action === 'approve' || action === 'refuse' ? 'payment.approve' : 'payment.create');
-  const r = guard(() => {
-    if (action === 'approve') return approveExpense(s.orgId, expenseId, actorOf(s));
-    if (action === 'refuse') return refuseExpense(s.orgId, expenseId, str(formData, 'reason') || 'Refused', actorOf(s));
-    if (action === 'submit') return submitExpense(s.orgId, expenseId, actorOf(s));
-    return reimburseExpense(s.orgId, expenseId, {
+  const s = await requireCap(action === 'approve' || action === 'refuse' ? 'payment.approve' : 'payment.create');
+  const r = await guard(async () => {
+    if (action === 'approve') return await approveExpense(s.orgId, expenseId, actorOf(s));
+    if (action === 'refuse') return await refuseExpense(s.orgId, expenseId, str(formData, 'reason') || 'Refused', actorOf(s));
+    if (action === 'submit') return await submitExpense(s.orgId, expenseId, actorOf(s));
+    return await reimburseExpense(s.orgId, expenseId, {
       date: str(formData, 'date') || isoDate(),
       journalId: str(formData, 'journal_id'),
     }, actorOf(s));
@@ -470,8 +477,8 @@ export async function expenseWorkflowAction(formData: FormData) {
 }
 
 export async function employeeAdvanceAction(formData: FormData) {
-  const s = requireCap('payment.create');
-  const r = guard(() => payEmployeeAdvance(s.orgId, {
+  const s = await requireCap('payment.create');
+  const r = await guard(async () => await payEmployeeAdvance(s.orgId, {
     employeeName: str(formData, 'employee_name'),
     amount: money(formData, 'amount'),
     date: str(formData, 'date') || isoDate(),
@@ -482,12 +489,12 @@ export async function employeeAdvanceAction(formData: FormData) {
 }
 
 export async function commissionAction(formData: FormData) {
-  const s = requireCap('payment.create');
-  const r = guard(() => {
+  const s = await requireCap('payment.create');
+  const r = await guard(async () => {
     if (str(formData, 'action') === 'post') {
-      return postCommission(s.orgId, str(formData, 'id'), str(formData, 'date') || isoDate(), actorOf(s));
+      return await postCommission(s.orgId, str(formData, 'id'), str(formData, 'date') || isoDate(), actorOf(s));
     }
-    return createCommission(s.orgId, {
+    return await createCommission(s.orgId, {
       agentName: str(formData, 'agent_name'),
       bookingId: str(formData, 'booking_id'),
       basis: str(formData, 'basis') === 'margin' ? 'margin' : 'revenue',
@@ -504,9 +511,9 @@ export async function commissionAction(formData: FormData) {
 // ---------------------------------------------------------------------------
 
 export async function saveAssetAction(formData: FormData) {
-  const s = requireCap('journal.create');
-  const r = guard(() => {
-    const assetId = createAsset({
+  const s = await requireCap('journal.create');
+  const r = await guard(async () => {
+    const assetId = await createAsset({
       orgId: s.orgId,
       name: str(formData, 'name'),
       assetAccountId: str(formData, 'asset_account_id'),
@@ -520,7 +527,7 @@ export async function saveAssetAction(formData: FormData) {
       lifeMonths: Number(str(formData, 'life_months') || '36'),
       decliningBps: Math.round(parseFloat(str(formData, 'declining_rate') || '0') * 100),
     }, actorOf(s));
-    if (bool(formData, 'confirm_now')) confirmAsset(s.orgId, assetId, actorOf(s));
+    if (bool(formData, 'confirm_now')) await confirmAsset(s.orgId, assetId, actorOf(s));
     return assetId;
   });
   back(r.error ? '/assets/new?tab=assets' : '/assets?tab=assets',
@@ -528,14 +535,14 @@ export async function saveAssetAction(formData: FormData) {
 }
 
 export async function runDepreciationAction(formData: FormData) {
-  const s = requireCap('journal.post');
-  const r = guard(() => runDepreciation(s.orgId, str(formData, 'up_to') || isoDate(), actorOf(s)));
+  const s = await requireCap('journal.post');
+  const r = await guard(async () => await runDepreciation(s.orgId, str(formData, 'up_to') || isoDate(), actorOf(s)));
   back('/assets', r.error ? r : { ok: `${r.value ?? 0} depreciation entr(ies) posted.` });
 }
 
 export async function saveDeferralAction(formData: FormData) {
-  const s = requireCap('journal.create');
-  const r = guard(() => createDeferral({
+  const s = await requireCap('journal.create');
+  const r = await guard(async () => await createDeferral({
     orgId: s.orgId,
     name: str(formData, 'name'),
     kind: str(formData, 'kind') === 'revenue' ? 'revenue' : 'expense',
@@ -551,8 +558,8 @@ export async function saveDeferralAction(formData: FormData) {
 }
 
 export async function runDeferralsAction(formData: FormData) {
-  const s = requireCap('journal.post');
-  const r = guard(() => runDeferrals(s.orgId, str(formData, 'up_to') || isoDate(), actorOf(s)));
+  const s = await requireCap('journal.post');
+  const r = await guard(async () => await runDeferrals(s.orgId, str(formData, 'up_to') || isoDate(), actorOf(s)));
   back('/assets', r.error ? r : { ok: `${r.value ?? 0} slice(s) recognised.` });
 }
 
@@ -561,8 +568,8 @@ export async function runDeferralsAction(formData: FormData) {
 // ---------------------------------------------------------------------------
 
 export async function saveAccountAction(formData: FormData) {
-  const s = requireCap('coa.configure');
-  const r = guard(() => upsertAccount(s.orgId, {
+  const s = await requireCap('coa.configure');
+  const r = await guard(async () => await upsertAccount(s.orgId, {
     id: opt(formData, 'id') ?? undefined,
     code: str(formData, 'code'),
     name: str(formData, 'name'),
@@ -585,17 +592,17 @@ export async function saveAccountAction(formData: FormData) {
  * the outcome instead of racing to undo each other.
  */
 export async function setReconcilableAction(formData: FormData) {
-  const s = requireCap('coa.configure');
+  const s = await requireCap('coa.configure');
   const accountId = str(formData, 'id');
   const on = str(formData, 'on') === '1';
-  const r = guard(() => setAccountReconcilable(s.orgId, accountId, on, actorOf(s)));
+  const r = await guard(async () => await setAccountReconcilable(s.orgId, accountId, on, actorOf(s)));
   back(str(formData, 'return_to') || '/accounting/chart-of-accounts',
     r.error ? r : { ok: on ? 'Reconciliation allowed on this account.' : 'Reconciliation switched off.' });
 }
 
 export async function saveJournalAction(formData: FormData) {
-  const s = requireCap('coa.configure');
-  const r = guard(() => upsertJournal(s.orgId, {
+  const s = await requireCap('coa.configure');
+  const r = await guard(async () => await upsertJournal(s.orgId, {
     id: opt(formData, 'id') ?? undefined,
     code: str(formData, 'code').toUpperCase(),
     name: str(formData, 'name'),
@@ -607,9 +614,9 @@ export async function saveJournalAction(formData: FormData) {
 }
 
 export async function savePartnerAction(formData: FormData) {
-  const s = requireCap('finance.view');
+  const s = await requireCap('finance.view');
   const side = str(formData, 'side');
-  const r = guard(() => upsertPartner(s.orgId, {
+  const r = await guard(async () => await upsertPartner(s.orgId, {
     id: opt(formData, 'id') ?? undefined,
     name: str(formData, 'name'),
     isCustomer: side !== 'supplier',
@@ -628,8 +635,8 @@ export async function savePartnerAction(formData: FormData) {
 }
 
 export async function saveTaxAction(formData: FormData) {
-  const s = requireCap('tax.configure');
-  const r = guard(() => {
+  const s = await requireCap('tax.configure');
+  const r = await guard(async () => {
     const taxId = opt(formData, 'id');
     const fields: Array<string | number | null> = [
       str(formData, 'name'),
@@ -641,12 +648,12 @@ export async function saveTaxAction(formData: FormData) {
       money(formData, 'threshold'),
     ];
     if (taxId) {
-      run(`UPDATE taxes SET name=?, rate_bps=?, scope=?, tax_group=?, price_included=?, account_id=?, threshold=?
+      await run(`UPDATE taxes SET name=?, rate_bps=?, scope=?, tax_group=?, price_included=?, account_id=?, threshold=?
              WHERE id=? AND org_id=?`, ...fields, taxId, s.orgId);
       return taxId;
     }
     const newId = id('tax');
-    run(`INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
+    await run(`INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
                             price_included, account_id, threshold, active)
          VALUES (?,?,?,'percent',?,?,?,?,?,?,1)`,
       newId, s.orgId, fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6]);
@@ -656,8 +663,8 @@ export async function saveTaxAction(formData: FormData) {
 }
 
 export async function saveProductAction(formData: FormData) {
-  const s = requireCap('coa.configure');
-  const r = guard(() => upsertProduct(s.orgId, {
+  const s = await requireCap('coa.configure');
+  const r = await guard(async () => await upsertProduct(s.orgId, {
     id: opt(formData, 'id') ?? undefined,
     name: str(formData, 'name'),
     category: str(formData, 'category') || 'other',
@@ -673,8 +680,8 @@ export async function saveProductAction(formData: FormData) {
 }
 
 export async function createBookingAction(formData: FormData) {
-  const s = requireCap('finance.view');
-  const r = guard(() => createBooking(s.orgId, {
+  const s = await requireCap('finance.view');
+  const r = await guard(async () => await createBooking(s.orgId, {
     ref: str(formData, 'ref'),
     title: str(formData, 'title'),
     partnerId: opt(formData, 'partner_id'),
@@ -692,11 +699,11 @@ export async function createBookingAction(formData: FormData) {
 }
 
 export async function saveBudgetAction(formData: FormData) {
-  const s = requireCap('budget.manage');
+  const s = await requireCap('budget.manage');
   const accounts = formData.getAll('line_account').map(String);
   const analytics = formData.getAll('line_analytic').map(String);
   const planned = formData.getAll('line_planned').map(String);
-  const r = guard(() => createBudget(s.orgId, {
+  const r = await guard(async () => await createBudget(s.orgId, {
     name: str(formData, 'name'),
     owner: opt(formData, 'owner'),
     dateFrom: str(formData, 'date_from'),
@@ -711,11 +718,11 @@ export async function saveBudgetAction(formData: FormData) {
 }
 
 export async function saveSettingsAction(formData: FormData) {
-  const s = requireCap('coa.configure');
-  const r = guard(() => {
+  const s = await requireCap('coa.configure');
+  const r = await guard(async () => {
     for (const [key, value] of formData.entries()) {
       if (!key.startsWith('setting.') || typeof value !== 'string' || !value) continue;
-      setSetting(s.orgId, key.slice('setting.'.length) as SettingKey, value);
+      await setSetting(s.orgId, key.slice('setting.'.length) as SettingKey, value);
     }
   });
   back('/settings', r.error ? r : { ok: 'Settings saved.' });
@@ -729,9 +736,9 @@ export async function saveSettingsAction(formData: FormData) {
  * typed confirmation before it calls this.
  */
 export async function resetAction(formData: FormData) {
-  requireCap('coa.configure');
+  await requireCap('coa.configure');
   if (str(formData, 'confirm') !== 'RESET') back('/settings', { error: 'Type RESET to confirm.' });
-  const r = guard(() => resetAndSeed());
+  const r = await guard(async () => await resetAndSeed());
   back('/settings', r.error ? r : { ok: 'Books reset and re-seeded.' });
 }
 
@@ -746,7 +753,7 @@ export async function resetAction(formData: FormData) {
  * usual `guard()` cannot wrap it — that helper takes a synchronous thunk.
  */
 export async function crmConnectAction(formData: FormData) {
-  const s = requireCap('coa.configure');
+  const s = await requireCap('coa.configure');
   const email = str(formData, 'email');
   const password = String(formData.get('password') ?? '');
   if (!email || !password) back('/settings/crm-sync', { error: 'Email and password are both needed.' });
@@ -761,7 +768,7 @@ export async function crmConnectAction(formData: FormData) {
 }
 
 export async function crmSyncAction() {
-  const s = requireCap('coa.configure');
+  const s = await requireCap('coa.configure');
   let summary: string;
   try {
     const r = await syncFromCrm(s.orgId, actorOf(s));
@@ -777,17 +784,17 @@ export async function crmSyncAction() {
 }
 
 export async function crmDisconnectAction() {
-  const s = requireCap('coa.configure');
-  const r = guard(() => disconnectCrm(s.orgId));
+  const s = await requireCap('coa.configure');
+  const r = await guard(async () => await disconnectCrm(s.orgId));
   back('/settings/crm-sync', r.error ? r : { ok: 'Disconnected. The stored token has been deleted.' });
 }
 
 export async function crmForgetLinksAction(formData: FormData) {
-  const s = requireCap('coa.configure');
+  const s = await requireCap('coa.configure');
   if (str(formData, 'confirm') !== 'FORGET') {
     back('/settings/crm-sync', { error: 'Type FORGET to confirm.' });
   }
-  const r = guard(() => forgetSyncLinks(s.orgId));
+  const r = await guard(async () => await forgetSyncLinks(s.orgId));
   back('/settings/crm-sync', r.error ? r : { ok: 'Import history cleared. The next sync will re-import everything.' });
 }
 

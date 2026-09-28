@@ -81,8 +81,8 @@ export class PostingError extends Error {
  * year's periods yet should still be able to raise an invoice. Locking is an
  * explicit act, so the absence of a period cannot mean "locked".
  */
-export function assertPeriodOpen(orgId: string, date: string) {
-  const period = one<{ name: string; state: string }>(
+export async function assertPeriodOpen(orgId: string, date: string) {
+  const period = await one<{ name: string; state: string }>(
     `SELECT name, state FROM accounting_periods
       WHERE org_id = ? AND date_from <= ? AND date_to >= ?`,
     orgId, date, date,
@@ -117,9 +117,9 @@ function assertBalanced(lines: PostingLine[]) {
   }
 }
 
-function assertAccounts(orgId: string, lines: PostingLine[]) {
+async function assertAccounts(orgId: string, lines: PostingLine[]) {
   for (const l of lines) {
-    const acc = one<{ id: string; active: number }>(
+    const acc = await one<{ id: string; active: number }>(
       'SELECT id, active FROM accounts WHERE id = ? AND org_id = ?', l.accountId, orgId,
     );
     if (!acc) throw new PostingError(`Account ${l.accountId} does not exist in this organisation.`);
@@ -138,25 +138,25 @@ function assertAccounts(orgId: string, lines: PostingLine[]) {
  * sequence bump and the audit row. A partially written entry would be an
  * unbalanced ledger, which no report could explain and no user could repair.
  */
-export function postEntry(input: PostingInput, actor: Actor = {}): string {
+export async function postEntry(input: PostingInput, actor: Actor = {}): Promise<string> {
   const lines = input.lines.filter((l) => (l.debit ?? 0) !== 0 || (l.credit ?? 0) !== 0);
   assertBalanced(lines);
 
-  return tx(() => {
-    assertPeriodOpen(input.orgId, input.date);
-    assertAccounts(input.orgId, lines);
+  return await tx(async () => {
+    await assertPeriodOpen(input.orgId, input.date);
+    await assertAccounts(input.orgId, lines);
 
-    const journal = one<{ id: string; sequence_code: string; code: string }>(
+    const journal = await one<{ id: string; sequence_code: string; code: string }>(
       'SELECT id, sequence_code, code FROM journals WHERE id = ? AND org_id = ?',
       input.journalId, input.orgId,
     );
     if (!journal) throw new PostingError('Unknown journal.');
 
     const entryId = id('je');
-    const entryNo = nextNumber(input.orgId, journal.sequence_code, journal.code);
+    const entryNo = await nextNumber(input.orgId, journal.sequence_code, journal.code);
     const now = nowIso();
 
-    run(
+    await run(
       `INSERT INTO journal_entries
          (id, org_id, journal_id, entry_no, entry_date, reference, narration, state,
           source_model, source_id, currency, created_by, created_at, posted_by, posted_at)
@@ -168,21 +168,21 @@ export function postEntry(input: PostingInput, actor: Actor = {}): string {
       actor.id ?? null, now, actor.id ?? null, now,
     );
 
-    for (const l of lines) writeLine(input, entryId, l, 'posted');
+    for (const l of lines) await writeLine(input, entryId, l, 'posted');
 
-    audit(input.orgId, actor, 'posted', 'journal_entry', entryId,
+    await audit(input.orgId, actor, 'posted', 'journal_entry', entryId,
       `${entryNo} · ${input.reference ?? input.narration ?? journal.code}`);
     return entryId;
   });
 }
 
 /** A draft entry: written but not part of any balance until it is posted. */
-export function draftEntry(input: PostingInput, actor: Actor = {}): string {
+export async function draftEntry(input: PostingInput, actor: Actor = {}): Promise<string> {
   const lines = input.lines.filter((l) => (l.debit ?? 0) !== 0 || (l.credit ?? 0) !== 0);
-  return tx(() => {
-    assertAccounts(input.orgId, lines);
+  return await tx(async () => {
+    await assertAccounts(input.orgId, lines);
     const entryId = id('je');
-    run(
+    await run(
       `INSERT INTO journal_entries
          (id, org_id, journal_id, entry_no, entry_date, reference, narration, state,
           source_model, source_id, currency, created_by, created_at)
@@ -192,49 +192,49 @@ export function draftEntry(input: PostingInput, actor: Actor = {}): string {
       input.sourceModel ?? 'manual', input.sourceId ?? null,
       input.currency ?? 'INR', actor.id ?? null, nowIso(),
     );
-    for (const l of lines) writeLine(input, entryId, l, 'draft');
-    audit(input.orgId, actor, 'created', 'journal_entry', entryId, 'Draft entry');
+    for (const l of lines) await writeLine(input, entryId, l, 'draft');
+    await audit(input.orgId, actor, 'created', 'journal_entry', entryId, 'Draft entry');
     return entryId;
   });
 }
 
 /** Post an entry that already exists in draft. */
-export function postDraft(orgId: string, entryId: string, actor: Actor = {}): string {
-  return tx(() => {
-    const entry = one<{ id: string; state: string; entry_date: string; journal_id: string; reference: string }>(
+export async function postDraft(orgId: string, entryId: string, actor: Actor = {}): Promise<string> {
+  return await tx(async () => {
+    const entry = await one<{ id: string; state: string; entry_date: string; journal_id: string; reference: string }>(
       'SELECT id, state, entry_date, journal_id, reference FROM journal_entries WHERE id = ? AND org_id = ?',
       entryId, orgId,
     );
     if (!entry) throw new PostingError('Unknown entry.');
     if (entry.state === 'posted') throw new PostingError('This entry is already posted.');
     if (entry.state === 'reversed') throw new PostingError('A reversed entry cannot be posted again.');
-    assertPeriodOpen(orgId, entry.entry_date);
+    await assertPeriodOpen(orgId, entry.entry_date);
 
-    const lines = all<{ debit: number; credit: number; account_id: string }>(
+    const lines = await all<{ debit: number; credit: number; account_id: string }>(
       'SELECT debit, credit, account_id FROM journal_entry_lines WHERE entry_id = ?', entryId,
     );
     assertBalanced(lines.map((l) => ({ accountId: l.account_id, debit: l.debit, credit: l.credit })));
 
-    const journal = one<{ sequence_code: string; code: string }>(
+    const journal = (await one<{ sequence_code: string; code: string }>(
       'SELECT sequence_code, code FROM journals WHERE id = ?', entry.journal_id,
-    )!;
-    const entryNo = nextNumber(orgId, journal.sequence_code, journal.code);
+    ))!;
+    const entryNo = await nextNumber(orgId, journal.sequence_code, journal.code);
 
-    run(
+    await run(
       `UPDATE journal_entries SET state='posted', entry_no=?, posted_by=?, posted_at=? WHERE id=?`,
       entryNo, actor.id ?? null, nowIso(), entryId,
     );
-    run(`UPDATE journal_entry_lines SET state='posted' WHERE entry_id=?`, entryId);
-    run(`UPDATE analytic_distributions SET state='posted' WHERE line_id IN
+    await run(`UPDATE journal_entry_lines SET state='posted' WHERE entry_id=?`, entryId);
+    await run(`UPDATE analytic_distributions SET state='posted' WHERE line_id IN
            (SELECT id FROM journal_entry_lines WHERE entry_id=?)`, entryId);
-    audit(orgId, actor, 'posted', 'journal_entry', entryId, entryNo);
+    await audit(orgId, actor, 'posted', 'journal_entry', entryId, entryNo);
     return entryId;
   });
 }
 
-function writeLine(input: PostingInput, entryId: string, l: PostingLine, state: string) {
+async function writeLine(input: PostingInput, entryId: string, l: PostingLine, state: string) {
   const lineId = id('jel');
-  run(
+  await run(
     `INSERT INTO journal_entry_lines
        (id, org_id, entry_id, account_id, partner_id, label, debit, credit,
         currency, amount_currency, rate_e6, tax_id, tax_base, booking_id, entry_date, state)
@@ -267,9 +267,9 @@ function writeLine(input: PostingInput, entryId: string, l: PostingLine, state: 
    */
   let spread = l.analytic ?? (l.analyticId ? [{ analyticId: l.analyticId, bps: 10000 }] : []);
   if (!spread.length && l.bookingId) {
-    const fromBooking = one<{ analytic_id: string | null }>(
+    const fromBooking = (await one<{ analytic_id: string | null }>(
       'SELECT analytic_id FROM bookings WHERE id = ? AND org_id = ?', l.bookingId, input.orgId,
-    )?.analytic_id;
+    ))?.analytic_id;
     if (fromBooking) spread = [{ analyticId: fromBooking, bps: 10000 }];
   }
   if (!spread.length) return;
@@ -279,7 +279,7 @@ function writeLine(input: PostingInput, entryId: string, l: PostingLine, state: 
     throw new PostingError(`Analytic distribution must total 100% (got ${(totalBps / 100).toFixed(2)}%).`);
   }
 
-  const kind = one<{ kind: string }>('SELECT kind FROM accounts WHERE id = ?', l.accountId)?.kind ?? '';
+  const kind = (await one<{ kind: string }>('SELECT kind FROM accounts WHERE id = ?', l.accountId))?.kind ?? '';
   // Only P&L lines carry analytic weight. Tagging the receivable side of an
   // invoice to a trip would double-count it: the revenue line already is the
   // trip's income, and the receivable is merely how it was financed.
@@ -289,7 +289,7 @@ function writeLine(input: PostingInput, entryId: string, l: PostingLine, state: 
   // revenue negative, profit = -SUM.
   const signed = (Math.round(l.debit ?? 0) - Math.round(l.credit ?? 0));
   for (const a of spread) {
-    run(
+    await run(
       `INSERT INTO analytic_distributions
          (org_id, line_id, analytic_id, bps, amount, entry_date, account_id, state)
        VALUES (?,?,?,?,?,?,?,?)`,
@@ -307,16 +307,16 @@ function writeLine(input: PostingInput, entryId: string, l: PostingLine, state: 
  * keeps both the original mistake and its correction in the audit trail, and
  * keeps a closed period's totals untouched.
  */
-export function reverseEntry(orgId: string, entryId: string, date: string, actor: Actor = {}, reason?: string): string {
-  return tx(() => {
-    const entry = one<{ id: string; journal_id: string; entry_no: string; state: string; source_model: string; source_id: string; currency: string }>(
+export async function reverseEntry(orgId: string, entryId: string, date: string, actor: Actor = {}, reason?: string): Promise<string> {
+  return await tx(async () => {
+    const entry = await one<{ id: string; journal_id: string; entry_no: string; state: string; source_model: string; source_id: string; currency: string }>(
       `SELECT id, journal_id, entry_no, state, source_model, source_id, currency
          FROM journal_entries WHERE id = ? AND org_id = ?`, entryId, orgId,
     );
     if (!entry) throw new PostingError('Unknown entry.');
     if (entry.state !== 'posted') throw new PostingError('Only a posted entry can be reversed.');
 
-    const lines = all<{
+    const lines = await all<{
       account_id: string; partner_id: string | null; label: string | null;
       debit: number; credit: number; booking_id: string | null; id: string;
       currency: string | null; amount_currency: number; rate_e6: number | null;
@@ -324,22 +324,29 @@ export function reverseEntry(orgId: string, entryId: string, date: string, actor
                currency, amount_currency, rate_e6
           FROM journal_entry_lines WHERE entry_id = ?`, entryId);
 
-    const reversed: PostingLine[] = lines.map((l) => ({
-      accountId: l.account_id,
-      partnerId: l.partner_id,
-      label: `Reversal — ${l.label ?? ''}`.trim(),
-      debit: l.credit,
-      credit: l.debit,
-      bookingId: l.booking_id,
-      currency: l.currency,
-      amountCurrency: -l.amount_currency,
-      rateE6: l.rate_e6,
-      analytic: all<{ analytic_id: string; bps: number }>(
+    // A loop rather than Promise.all over the map: each iteration reads the
+    // line's analytic split on the transaction's single connection, and
+    // issuing those concurrently would only queue them anyway.
+    const reversed: PostingLine[] = [];
+    for (const l of lines) {
+      const analytic = (await all<{ analytic_id: string; bps: number }>(
         'SELECT analytic_id, bps FROM analytic_distributions WHERE line_id = ?', l.id,
-      ).map((a) => ({ analyticId: a.analytic_id, bps: a.bps })),
-    })).map((l) => (l.analytic && l.analytic.length ? l : { ...l, analytic: undefined }));
+      )).map((a) => ({ analyticId: a.analytic_id, bps: a.bps }));
+      reversed.push({
+        accountId: l.account_id,
+        partnerId: l.partner_id,
+        label: `Reversal — ${l.label ?? ''}`.trim(),
+        debit: l.credit,
+        credit: l.debit,
+        bookingId: l.booking_id,
+        currency: l.currency,
+        amountCurrency: -l.amount_currency,
+        rateE6: l.rate_e6,
+        analytic: analytic.length ? analytic : undefined,
+      });
+    }
 
-    const newId = postEntry({
+    const newId = await postEntry({
       orgId,
       journalId: entry.journal_id,
       date,
@@ -351,9 +358,9 @@ export function reverseEntry(orgId: string, entryId: string, date: string, actor
       lines: reversed,
     }, actor);
 
-    run(`UPDATE journal_entries SET state='reversed' WHERE id=?`, entryId);
-    run(`UPDATE journal_entries SET reversal_of=? WHERE id=?`, entryId, newId);
-    audit(orgId, actor, 'reversed', 'journal_entry', entryId,
+    await run(`UPDATE journal_entries SET state='reversed' WHERE id=?`, entryId);
+    await run(`UPDATE journal_entries SET reversal_of=? WHERE id=?`, entryId, newId);
+    await audit(orgId, actor, 'reversed', 'journal_entry', entryId,
       `${entry.entry_no} reversed${reason ? ` — ${reason}` : ''}`);
     return newId;
   });
@@ -372,28 +379,28 @@ export interface BalanceQuery {
   includeDraft?: boolean;
 }
 
-export function accountBalance(orgId: string, accountId: string, q: BalanceQuery = {}): number {
+export async function accountBalance(orgId: string, accountId: string, q: BalanceQuery = {}): Promise<number> {
   const state = q.includeDraft ? "('draft','posted')" : "('posted')";
-  return scalar(
+  return await scalar(
     `SELECT COALESCE(SUM(debit - credit), 0) FROM journal_entry_lines
       WHERE org_id = ? AND account_id = ? AND state IN ${state}
-        AND (? IS NULL OR entry_date >= ?) AND (? IS NULL OR entry_date <= ?)`,
+        AND (?::text IS NULL OR entry_date >= ?) AND (?::text IS NULL OR entry_date <= ?)`,
     orgId, accountId, q.from ?? null, q.from ?? null, q.to ?? null, q.to ?? null,
   );
 }
 
 /** Signed by the account's natural side, which is what a report wants to print. */
-export function accountBalanceNatural(orgId: string, accountId: string, q: BalanceQuery = {}): number {
-  const kind = one<{ kind: string }>('SELECT kind FROM accounts WHERE id = ?', accountId)?.kind ?? 'asset_current';
-  return accountBalance(orgId, accountId, q) * kindSign(kind);
+export async function accountBalanceNatural(orgId: string, accountId: string, q: BalanceQuery = {}): Promise<number> {
+  const kind = (await one<{ kind: string }>('SELECT kind FROM accounts WHERE id = ?', accountId))?.kind ?? 'asset_current';
+  return await accountBalance(orgId, accountId, q) * kindSign(kind);
 }
 
 /** Total debits and credits over a window — the trial balance's proof line. */
-export function ledgerTotals(orgId: string, from?: string, to?: string) {
-  const row = one<{ d: number; c: number }>(
+export async function ledgerTotals(orgId: string, from?: string, to?: string) {
+  const row = await one<{ d: number; c: number }>(
     `SELECT COALESCE(SUM(debit),0) AS d, COALESCE(SUM(credit),0) AS c
        FROM journal_entry_lines WHERE org_id = ? AND state = 'posted'
-         AND (? IS NULL OR entry_date >= ?) AND (? IS NULL OR entry_date <= ?)`,
+         AND (?::text IS NULL OR entry_date >= ?) AND (?::text IS NULL OR entry_date <= ?)`,
     orgId, from ?? null, from ?? null, to ?? null, to ?? null,
   );
   return { debit: row?.d ?? 0, credit: row?.c ?? 0, balanced: (row?.d ?? 0) === (row?.c ?? 0) };
@@ -405,8 +412,8 @@ export function ledgerTotals(orgId: string, from?: string, to?: string) {
  * Returned in natural sign: positive is a profit. The Balance Sheet adds this
  * to equity so it balances before the year has been closed.
  */
-export function profitForPeriod(orgId: string, from: string, to: string): number {
-  return -scalar(
+export async function profitForPeriod(orgId: string, from: string, to: string): Promise<number> {
+  return -await scalar(
     `SELECT COALESCE(SUM(l.debit - l.credit), 0)
        FROM journal_entry_lines l JOIN accounts a ON a.id = l.account_id
       WHERE l.org_id = ? AND l.state = 'posted'

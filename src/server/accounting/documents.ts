@@ -76,11 +76,11 @@ export interface DocRow {
 // Draft
 // ---------------------------------------------------------------------------
 
-export function createDocument(input: DocInput, actor: Actor = {}): string {
-  return tx(() => {
+export async function createDocument(input: DocInput, actor: Actor = {}): Promise<string> {
+  return await tx(async () => {
     const docId = id('doc');
-    const due = input.dueDate ?? deriveDueDate(input);
-    run(
+    const due = input.dueDate ?? await deriveDueDate(input);
+    await run(
       `INSERT INTO documents
          (id, org_id, doc_type, partner_id, journal_id, booking_id, analytic_id,
           doc_date, due_date, payment_terms_id, supplier_ref, currency, rate_e6,
@@ -92,51 +92,53 @@ export function createDocument(input: DocInput, actor: Actor = {}): string {
       input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
       input.note ?? null, actor.id ?? null, nowIso(),
     );
-    replaceLines(input.orgId, docId, input.lines, input.analyticId ?? null);
-    recomputeTotals(input.orgId, docId, input.withholdingTaxId ?? null);
-    audit(input.orgId, actor, 'created', 'document', docId,
+    await replaceLines(input.orgId, docId, input.lines, input.analyticId ?? null);
+    await recomputeTotals(input.orgId, docId, input.withholdingTaxId ?? null);
+    await audit(input.orgId, actor, 'created', 'document', docId,
       `${DOC_TYPES[input.docType].label} drafted`);
     return docId;
   });
 }
 
-export function updateDocument(docId: string, input: DocInput, actor: Actor = {}) {
-  return tx(() => {
-    const doc = getDocument(input.orgId, docId);
+export async function updateDocument(docId: string, input: DocInput, actor: Actor = {}) {
+  return await tx(async () => {
+    const doc = await getDocument(input.orgId, docId);
     if (!doc) throw new PostingError('Unknown document.');
     // A posted document is immutable. Correcting one means a credit note or a
     // reversal, which leaves both the original and the correction on record
     // (plan section 44).
     if (doc.state !== 'draft') throw new PostingError('A posted document cannot be edited. Reverse it or raise a credit note.');
-    run(
+    await run(
       `UPDATE documents SET partner_id=?, journal_id=?, booking_id=?, analytic_id=?,
               doc_date=?, due_date=?, payment_terms_id=?, supplier_ref=?, currency=?, rate_e6=?, note=?
          WHERE id=? AND org_id=?`,
       input.partnerId, input.journalId, input.bookingId ?? null, input.analyticId ?? null,
-      input.docDate, input.dueDate ?? deriveDueDate(input), input.paymentTermsId ?? null,
+      input.docDate, input.dueDate ?? await deriveDueDate(input), input.paymentTermsId ?? null,
       input.supplierRef ?? null, input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
       input.note ?? null, docId, input.orgId,
     );
-    replaceLines(input.orgId, docId, input.lines, input.analyticId ?? null);
-    recomputeTotals(input.orgId, docId, input.withholdingTaxId ?? null);
-    audit(input.orgId, actor, 'modified', 'document', docId, 'Draft edited');
+    await replaceLines(input.orgId, docId, input.lines, input.analyticId ?? null);
+    await recomputeTotals(input.orgId, docId, input.withholdingTaxId ?? null);
+    await audit(input.orgId, actor, 'modified', 'document', docId, 'Draft edited');
   });
 }
 
-function deriveDueDate(input: DocInput): string {
+async function deriveDueDate(input: DocInput): Promise<string> {
   if (input.dueDate) return input.dueDate;
   if (input.paymentTermsId) {
-    const t = one<{ days: number }>('SELECT days FROM payment_terms WHERE id = ?', input.paymentTermsId);
+    const t = await one<{ days: number }>('SELECT days FROM payment_terms WHERE id = ?', input.paymentTermsId);
     if (t) return addDays(input.docDate, t.days);
   }
   return input.docDate;
 }
 
-function replaceLines(orgId: string, docId: string, lines: DocLineInput[], docAnalytic: string | null) {
-  run('DELETE FROM document_lines WHERE document_id = ?', docId);
-  lines.forEach((l, i) => {
-    const amounts = computeLine(orgId, l);
-    run(
+async function replaceLines(orgId: string, docId: string, lines: DocLineInput[], docAnalytic: string | null) {
+  await run('DELETE FROM document_lines WHERE document_id = ?', docId);
+  // Sequential, not Promise.all: these inserts share the posting transaction's
+  // one connection, and `seq` must land in the order the accountant typed.
+  for (const [i, l] of lines.entries()) {
+    const amounts = await computeLine(orgId, l);
+    await run(
       `INSERT INTO document_lines
          (id, org_id, document_id, seq, product_id, name, qty_milli, unit_price,
           discount_bps, tax_id, account_id, analytic_id, subtotal, tax_amount, total)
@@ -145,7 +147,7 @@ function replaceLines(orgId: string, docId: string, lines: DocLineInput[], docAn
       l.qtyMilli, l.unitPrice, l.discountBps ?? 0, l.taxId ?? null, l.accountId,
       l.analyticId ?? docAnalytic, amounts.subtotal, amounts.taxAmount, amounts.total,
     );
-  });
+  }
 }
 
 /**
@@ -155,43 +157,43 @@ function replaceLines(orgId: string, docId: string, lines: DocLineInput[], docAn
  * A customer checking the invoice adds the column they can see, and the ledger
  * has to agree with the paper.
  */
-export function recomputeTotals(orgId: string, docId: string, withholdingTaxId: string | null = null) {
-  const rows = all<{ subtotal: number; tax_amount: number; total: number }>(
+export async function recomputeTotals(orgId: string, docId: string, withholdingTaxId: string | null = null) {
+  const rows = await all<{ subtotal: number; tax_amount: number; total: number }>(
     'SELECT subtotal, tax_amount, total FROM document_lines WHERE document_id = ?', docId,
   );
   const untaxed = rows.reduce((s, r) => s + r.subtotal, 0);
   const taxTotal = rows.reduce((s, r) => s + r.tax_amount, 0);
   const total = untaxed + taxTotal;
 
-  const doc = one<{ doc_type: string; withheld_tax: number }>(
+  const doc = await one<{ doc_type: string; withheld_tax: number }>(
     'SELECT doc_type, withheld_tax FROM documents WHERE id = ?', docId,
   );
   let withheld = doc?.withheld_tax ?? 0;
   if (withholdingTaxId !== null) {
     withheld = doc?.doc_type.startsWith('in_')
-      ? computeWithholding(orgId, withholdingTaxId, untaxed).amount
+      ? (await computeWithholding(orgId, withholdingTaxId, untaxed)).amount
       : 0;
   }
 
-  run(
+  await run(
     'UPDATE documents SET untaxed=?, tax_total=?, total=?, withheld_tax=? WHERE id=? AND org_id=?',
     untaxed, taxTotal, total, withheld, docId, orgId,
   );
-  refreshResidual(orgId, docId);
+  await refreshResidual(orgId, docId);
 }
 
 // ---------------------------------------------------------------------------
 // Posting
 // ---------------------------------------------------------------------------
 
-export function postDocument(orgId: string, docId: string, actor: Actor = {}): string {
-  return tx(() => {
-    const doc = getDocument(orgId, docId);
+export async function postDocument(orgId: string, docId: string, actor: Actor = {}): Promise<string> {
+  return await tx(async () => {
+    const doc = await getDocument(orgId, docId);
     if (!doc) throw new PostingError('Unknown document.');
     if (doc.state === 'posted') throw new PostingError('This document is already posted.');
     if (doc.state === 'cancelled') throw new PostingError('A cancelled document cannot be posted.');
 
-    const lines = all<{
+    const lines = await all<{
       id: string; name: string; account_id: string; analytic_id: string | null;
       subtotal: number; tax_amount: number; tax_id: string | null;
     }>(`SELECT id, name, account_id, analytic_id, subtotal, tax_amount, tax_id
@@ -202,7 +204,7 @@ export function postDocument(orgId: string, docId: string, actor: Actor = {}): s
     // Take the number BEFORE the lines are built: the partner line is labelled
     // with it, and assigning it afterwards left every posted invoice's
     // receivable line reading "Customer Invoice" instead of "INV-0006".
-    const number = doc.number ?? takeDocumentNumber(orgId, doc);
+    const number = doc.number ?? await takeDocumentNumber(orgId, doc);
     const isSale = meta.side === 'customer';
     // A credit note is the same entry with the sides swapped. One flag, not a
     // second code path.
@@ -212,7 +214,7 @@ export function postDocument(orgId: string, docId: string, actor: Actor = {}): s
 
     // --- the income or expense side, one line per document line -------------
     for (const l of lines) {
-      const amounts = computeLine(orgId, {
+      const amounts = await computeLine(orgId, {
         qtyMilli: 1000, unitPrice: l.subtotal, discountBps: 0, taxId: l.tax_id,
       });
       const base: PostingLine = {
@@ -244,8 +246,8 @@ export function postDocument(orgId: string, docId: string, actor: Actor = {}): s
 
     // --- the partner side ---------------------------------------------------
     const partnerAccount = isSale
-      ? receivableAccount(orgId, doc.partner_id)
-      : payableAccount(orgId, doc.partner_id);
+      ? await receivableAccount(orgId, doc.partner_id)
+      : await payableAccount(orgId, doc.partner_id);
     const payable = doc.total - doc.withheld_tax;
 
     postings.push({
@@ -261,14 +263,14 @@ export function postDocument(orgId: string, docId: string, actor: Actor = {}): s
     // splits off the payable rather than reducing the expense.
     if (doc.withheld_tax > 0 && !isSale) {
       postings.push({
-        accountId: requireSetting(orgId, 'account.tds_payable'),
+        accountId: await requireSetting(orgId, 'account.tds_payable'),
         partnerId: doc.partner_id,
         label: 'TDS withheld',
         ...(flip ? { debit: doc.withheld_tax } : { credit: doc.withheld_tax }),
       });
     }
 
-    const entryId = postEntry({
+    const entryId = await postEntry({
       orgId,
       journalId: doc.journal_id,
       date: doc.doc_date,
@@ -280,34 +282,34 @@ export function postDocument(orgId: string, docId: string, actor: Actor = {}): s
       lines: postings,
     }, actor);
 
-    run(
+    await run(
       `UPDATE documents SET state='posted', number=?, entry_id=?, posted_by=?, posted_at=?
          WHERE id=? AND org_id=?`,
       number, entryId, actor.id ?? null, nowIso(), docId, orgId,
     );
-    refreshResidual(orgId, docId);
-    audit(orgId, actor, 'posted', 'document', docId, `${meta.label} ${number} posted`);
+    await refreshResidual(orgId, docId);
+    await audit(orgId, actor, 'posted', 'document', docId, `${meta.label} ${number} posted`);
     return entryId;
   });
 }
 
-function takeDocumentNumber(orgId: string, doc: DocRow): string {
-  const journal = one<{ sequence_code: string; code: string }>(
+async function takeDocumentNumber(orgId: string, doc: DocRow): Promise<string> {
+  const journal = await one<{ sequence_code: string; code: string }>(
     'SELECT sequence_code, code FROM journals WHERE id = ?', doc.journal_id,
   );
   const seqCode = `doc_${journal?.sequence_code ?? DOC_TYPES[doc.doc_type].seq}`;
   const prefix = doc.doc_type === 'out_invoice' ? 'INV'
     : doc.doc_type === 'out_refund' ? 'CN'
       : doc.doc_type === 'in_invoice' ? 'BILL' : 'DN';
-  const existing = one<{ next_no: number }>(
-    'SELECT next_no FROM sequences WHERE org_id = ? AND code = ?', orgId, seqCode,
+  const existing = await one<{ next_no: number }>(
+    'SELECT next_no FROM sequences WHERE org_id = ? AND code = ? FOR UPDATE', orgId, seqCode,
   );
   if (!existing) {
-    run('INSERT INTO sequences (org_id, code, prefix, padding, next_no) VALUES (?,?,?,?,?)',
+    await run('INSERT INTO sequences (org_id, code, prefix, padding, next_no) VALUES (?,?,?,?,?)',
       orgId, seqCode, prefix, 4, 2);
     return `${prefix}-0001`;
   }
-  run('UPDATE sequences SET next_no = next_no + 1 WHERE org_id = ? AND code = ?', orgId, seqCode);
+  await run('UPDATE sequences SET next_no = next_no + 1 WHERE org_id = ? AND code = ?', orgId, seqCode);
   return `${prefix}-${String(existing.next_no).padStart(4, '0')}`;
 }
 
@@ -318,14 +320,14 @@ function takeDocumentNumber(orgId: string, doc: DocRow): string {
  * marked cancelled and both halves stay visible — which is what lets an auditor
  * see what was corrected and when.
  */
-export function reverseDocument(orgId: string, docId: string, date: string, actor: Actor = {}, reason?: string) {
-  return tx(() => {
-    const doc = getDocument(orgId, docId);
+export async function reverseDocument(orgId: string, docId: string, date: string, actor: Actor = {}, reason?: string) {
+  return await tx(async () => {
+    const doc = await getDocument(orgId, docId);
     if (!doc) throw new PostingError('Unknown document.');
     if (doc.state !== 'posted') throw new PostingError('Only a posted document can be reversed.');
-    if (doc.entry_id) reverseEntry(orgId, doc.entry_id, date, actor, reason);
-    run(`UPDATE documents SET state='cancelled', payment_state='reversed' WHERE id=? AND org_id=?`, docId, orgId);
-    audit(orgId, actor, 'reversed', 'document', docId, reason ?? 'Reversed');
+    if (doc.entry_id) await reverseEntry(orgId, doc.entry_id, date, actor, reason);
+    await run(`UPDATE documents SET state='cancelled', payment_state='reversed' WHERE id=? AND org_id=?`, docId, orgId);
+    await audit(orgId, actor, 'reversed', 'document', docId, reason ?? 'Reversed');
   });
 }
 
@@ -336,26 +338,26 @@ export function reverseDocument(orgId: string, docId: string, date: string, acto
  * which is what a cancellation charge is: "you get 20% back" is a 2000 bps
  * credit note, not a hand-typed set of lines that no longer tie to the invoice.
  */
-export function createCreditNote(
+export async function createCreditNote(
   orgId: string,
   sourceDocId: string,
   opts: { date: string; bps?: number; reason?: string; journalId?: string },
   actor: Actor = {},
-): string {
-  return tx(() => {
-    const doc = getDocument(orgId, sourceDocId);
+): Promise<string> {
+  return await tx(async () => {
+    const doc = await getDocument(orgId, sourceDocId);
     if (!doc) throw new PostingError('Unknown document.');
     if (doc.state !== 'posted') throw new PostingError('Credit notes are raised against posted documents.');
     const bps = opts.bps ?? 10000;
 
-    const lines = all<{
+    const lines = await all<{
       name: string; account_id: string; analytic_id: string | null;
       subtotal: number; tax_id: string | null; product_id: string | null;
     }>(`SELECT name, account_id, analytic_id, subtotal, tax_id, product_id
           FROM document_lines WHERE document_id = ? ORDER BY seq`, sourceDocId);
 
     const creditType: DocType = doc.doc_type === 'out_invoice' ? 'out_refund' : 'in_refund';
-    const noteId = createDocument({
+    const noteId = await createDocument({
       orgId,
       docType: creditType,
       partnerId: doc.partner_id,
@@ -378,9 +380,9 @@ export function createCreditNote(
       })),
     }, actor);
 
-    run('UPDATE documents SET reversal_of=? WHERE id=?', sourceDocId, noteId);
-    run('UPDATE documents SET reversed_by=? WHERE id=?', noteId, sourceDocId);
-    audit(orgId, actor, 'credit_note', 'document', sourceDocId,
+    await run('UPDATE documents SET reversal_of=? WHERE id=?', sourceDocId, noteId);
+    await run('UPDATE documents SET reversed_by=? WHERE id=?', noteId, sourceDocId);
+    await audit(orgId, actor, 'credit_note', 'document', sourceDocId,
       `Credit note drafted for ${(bps / 100).toFixed(0)}% — ${opts.reason ?? ''}`.trim());
     return noteId;
   });
@@ -398,12 +400,12 @@ export function createCreditNote(
  * time — which is the test in plan section 56 that customer balances reconcile
  * to AR.
  */
-export function refreshResidual(orgId: string, docId: string) {
-  const doc = one<{ total: number; withheld_tax: number; state: string; doc_type: string }>(
+export async function refreshResidual(orgId: string, docId: string) {
+  const doc = await one<{ total: number; withheld_tax: number; state: string; doc_type: string }>(
     'SELECT total, withheld_tax, state, doc_type FROM documents WHERE id = ? AND org_id = ?', docId, orgId,
   );
   if (!doc) return;
-  const allocated = scalar(
+  const allocated = await scalar(
     'SELECT COALESCE(SUM(amount),0) FROM payment_allocations WHERE document_id = ?', docId,
   );
   const payable = doc.total - (doc.doc_type.startsWith('in_') ? doc.withheld_tax : 0);
@@ -414,15 +416,15 @@ export function refreshResidual(orgId: string, docId: string) {
   else if (residual === 0 && payable !== 0) state = 'paid';
   else if (allocated > 0) state = 'partial';
 
-  run('UPDATE documents SET residual=?, payment_state=? WHERE id=?', residual, state, docId);
+  await run('UPDATE documents SET residual=?, payment_state=? WHERE id=?', residual, state, docId);
 }
 
 // ---------------------------------------------------------------------------
 // Reads
 // ---------------------------------------------------------------------------
 
-export function getDocument(orgId: string, docId: string): DocRow | null {
-  return one<DocRow>(
+export async function getDocument(orgId: string, docId: string): Promise<DocRow | null> {
+  return await one<DocRow>(
     `SELECT d.*, p.name AS partner_name, b.ref AS booking_ref
        FROM documents d
        LEFT JOIN partners p ON p.id = d.partner_id
@@ -431,8 +433,8 @@ export function getDocument(orgId: string, docId: string): DocRow | null {
   );
 }
 
-export function documentLines(docId: string) {
-  return all<{
+export async function documentLines(docId: string) {
+  return await all<{
     id: string; seq: number; name: string; product_id: string | null;
     qty_milli: number; unit_price: number; discount_bps: number;
     tax_id: string | null; tax_name: string | null; account_id: string;
@@ -462,7 +464,7 @@ export interface DocFilter {
   limit?: number;
 }
 
-export function listDocuments(orgId: string, f: DocFilter = {}): DocRow[] {
+export async function listDocuments(orgId: string, f: DocFilter = {}): Promise<DocRow[]> {
   const types = f.docType ? (Array.isArray(f.docType) ? f.docType : [f.docType]) : null;
   const clauses: string[] = ['d.org_id = ?'];
   const params: Array<string | number> = [orgId];
@@ -488,7 +490,7 @@ export function listDocuments(orgId: string, f: DocFilter = {}): DocRow[] {
   }
 
   const limit = f.limit ?? 200;
-  return all<DocRow>(
+  return await all<DocRow>(
     `SELECT d.*, p.name AS partner_name, b.ref AS booking_ref
        FROM documents d
        LEFT JOIN partners p ON p.id = d.partner_id

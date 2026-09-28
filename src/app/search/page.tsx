@@ -18,8 +18,8 @@ export const dynamic = 'force-dynamic';
  * more impressive and would answer none of those faster.
  */
 export default async function SearchPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const q = (one(await searchParams, 'q') ?? '').trim();
+  const s = await ctx();
+  const q = (await one(await searchParams, 'q') ?? '').trim();
 
   if (!q) {
     return (
@@ -30,9 +30,9 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
     );
   }
 
-  const documents = listDocuments(s.orgId, { search: q, limit: 30 });
-  const partners = listPartners(s.orgId, { search: q, limit: 20 });
-  const bookings = listBookings(s.orgId, { search: q, limit: 20 });
+  const documents = await listDocuments(s.orgId, { search: q, limit: 30 });
+  const partners = await listPartners(s.orgId, { search: q, limit: 20 });
+  const bookings = await listBookings(s.orgId, { search: q, limit: 20 });
   const nothing = !documents.length && !partners.length && !bookings.length;
 
   return (

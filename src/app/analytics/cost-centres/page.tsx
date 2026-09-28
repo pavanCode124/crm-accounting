@@ -18,15 +18,33 @@ export const dynamic = 'force-dynamic';
  * Marketing spend against Hyderabad's contribution.
  */
 export default async function CostCentresPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
   const range = resolveRange(
-    { range: one(params, 'range'), from: one(params, 'from'), to: one(params, 'to') }, s.fyStartMonth,
+    { range: await one(params, 'range'), from: await one(params, 'from'), to: await one(params, 'to') }, s.fyStartMonth,
   );
 
-  const plans = all<{ id: string; code: string; name: string }>(
+  const plans = await all<{ id: string; code: string; name: string }>(
     "SELECT id, code, name FROM analytic_plans WHERE org_id = ? AND code <> 'TRIPS' ORDER BY name", s.orgId,
   );
+
+  /*
+   * Each plan's figures are fetched here rather than inside the JSX below.
+   * A server component awaits at its own top level; a `.map()` callback is a
+   * different function and cannot, so the read has to be hoisted out of the
+   * render. Sequential rather than Promise.all — these are a handful of
+   * indexed aggregates, and one connection serves them in order anyway.
+   */
+  const sections = [];
+  for (const plan of plans) {
+    const rows = await analyticProfitability(s.orgId, { planCode: plan.code, ...range });
+    sections.push({
+      plan,
+      rows,
+      revenue: rows.reduce((sum, r) => sum + r.revenue, 0),
+      cost: rows.reduce((sum, r) => sum + r.cost, 0),
+    });
+  }
 
   return (
     <>
@@ -38,11 +56,7 @@ export default async function CostCentresPage({ searchParams }: { searchParams: 
       <RangeBar action="/analytics/cost-centres" range={range} />
 
       <div className="space-y-5">
-        {plans.map((plan) => {
-          const rows = analyticProfitability(s.orgId, { planCode: plan.code, ...range });
-          const revenue = rows.reduce((sum, r) => sum + r.revenue, 0);
-          const cost = rows.reduce((sum, r) => sum + r.cost, 0);
-          return (
+        {sections.map(({ plan, rows, revenue, cost }) => (
             <Card key={plan.id} title={plan.name} padded={false}
               subtitle={`Plan code ${plan.code}`}>
               {rows.length === 0 ? (
@@ -86,8 +100,7 @@ export default async function CostCentresPage({ searchParams }: { searchParams: 
                 </Table>
               )}
             </Card>
-          );
-        })}
+        ))}
       </div>
     </>
   );

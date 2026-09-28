@@ -17,9 +17,9 @@ export const dynamic = 'force-dynamic';
  * gap in one series is a question an auditor asks.
  */
 export default async function JournalsPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
-  const journals = listJournals(s.orgId);
+  const s = await ctx();
+  const m = await msg(await searchParams);
+  const journals = await listJournals(s.orgId);
 
   return (
     <>

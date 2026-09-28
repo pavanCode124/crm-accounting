@@ -11,11 +11,11 @@ import { Card, Table, Th, Td, Money, EmptyState, StatTile, Bar } from './ui';
  * subtracts. The point of ageing is one number per customer that says how bad
  * it is; two columns to reconcile defeats it.
  */
-export function AgeingReport({ orgId, side, basePath }: {
+export async function AgeingReport({ orgId, side, basePath }: {
   orgId: string; side: 'customer' | 'supplier'; basePath: string;
 }) {
   const asOf = isoDate();
-  const { rows, totals } = ageing(orgId, side, asOf);
+  const { rows, totals } = await ageing(orgId, side, asOf);
   const overdue = totals.total - totals.current;
   const worst = Math.max(1, ...rows.map((r) => Math.abs(r.total)));
 

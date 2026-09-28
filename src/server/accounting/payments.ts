@@ -77,14 +77,14 @@ export interface PaymentRow {
  * "Receive payment" on screen posts, because the person clicking it is the
  * person deciding. An import leaves the draft for that decision to be made.
  */
-export function createPayment(input: PaymentInput, actor: Actor = {}): string {
-  return tx(() => {
+export async function createPayment(input: PaymentInput, actor: Actor = {}): Promise<string> {
+  return await tx(async () => {
     if (input.amount <= 0) throw new PostingError('A payment must be for a positive amount.');
 
     const paymentId = id('pay');
-    const number = nextPaymentNumber(input.orgId, input.direction);
+    const number = await nextPaymentNumber(input.orgId, input.direction);
     const side = input.side ?? (input.direction === 'inbound' ? 'customer' : 'supplier');
-    run(
+    await run(
       `INSERT INTO payments
          (id, org_id, number, direction, side, partner_id, journal_id, bank_account_id, booking_id,
           pay_date, amount, currency, rate_e6, method, reference, is_advance, state,
@@ -102,37 +102,37 @@ export function createPayment(input: PaymentInput, actor: Actor = {}): string {
     // debtors list that disagrees with the ledger behind it.
     if (input.post === false) return paymentId;
 
-    postPayment(input.orgId, paymentId, actor);
+    await postPayment(input.orgId, paymentId, actor);
 
     for (const a of input.allocations ?? []) {
-      allocate(input.orgId, paymentId, a.documentId, a.amount, actor);
+      await allocate(input.orgId, paymentId, a.documentId, a.amount, actor);
     }
     return paymentId;
   });
 }
 
-function nextPaymentNumber(orgId: string, direction: string): string {
+async function nextPaymentNumber(orgId: string, direction: string): Promise<string> {
   const code = direction === 'inbound' ? 'pay_in' : 'pay_out';
   const prefix = direction === 'inbound' ? 'RCPT' : 'PAY';
-  const seq = one<{ next_no: number }>(
-    'SELECT next_no FROM sequences WHERE org_id = ? AND code = ?', orgId, code,
+  const seq = await one<{ next_no: number }>(
+    'SELECT next_no FROM sequences WHERE org_id = ? AND code = ? FOR UPDATE', orgId, code,
   );
   if (!seq) {
-    run('INSERT INTO sequences (org_id, code, prefix, padding, next_no) VALUES (?,?,?,?,?)',
+    await run('INSERT INTO sequences (org_id, code, prefix, padding, next_no) VALUES (?,?,?,?,?)',
       orgId, code, prefix, 4, 2);
     return `${prefix}-0001`;
   }
-  run('UPDATE sequences SET next_no = next_no + 1 WHERE org_id = ? AND code = ?', orgId, code);
+  await run('UPDATE sequences SET next_no = next_no + 1 WHERE org_id = ? AND code = ?', orgId, code);
   return `${prefix}-${String(seq.next_no).padStart(4, '0')}`;
 }
 
-export function postPayment(orgId: string, paymentId: string, actor: Actor = {}): string {
-  return tx(() => {
-    const p = one<PaymentRow>('SELECT * FROM payments WHERE id = ? AND org_id = ?', paymentId, orgId);
+export async function postPayment(orgId: string, paymentId: string, actor: Actor = {}): Promise<string> {
+  return await tx(async () => {
+    const p = await one<PaymentRow>('SELECT * FROM payments WHERE id = ? AND org_id = ?', paymentId, orgId);
     if (!p) throw new PostingError('Unknown payment.');
     if (p.state !== 'draft') throw new PostingError('This payment is already posted.');
 
-    const bank = bankGlAccount(orgId, p);
+    const bank = await bankGlAccount(orgId, p);
     const inbound = p.direction === 'inbound';
     const customerSide = p.side !== 'supplier';
 
@@ -140,13 +140,13 @@ export function postPayment(orgId: string, paymentId: string, actor: Actor = {})
     // SIDE, not the direction: a customer refund is money out of the bank and
     // out of receivables.
     const counterAccount = p.is_advance
-      ? requireSetting(orgId, customerSide ? 'account.customer_advance' : 'account.supplier_advance')
+      ? await requireSetting(orgId, customerSide ? 'account.customer_advance' : 'account.supplier_advance')
       : customerSide
-        ? receivableAccount(orgId, p.partner_id)
-        : payableAccount(orgId, p.partner_id);
+        ? await receivableAccount(orgId, p.partner_id)
+        : await payableAccount(orgId, p.partner_id);
 
     const label = `${p.number} · ${p.method}${p.reference ? ` · ${p.reference}` : ''}`;
-    const entryId = postEntry({
+    const entryId = await postEntry({
       orgId,
       journalId: p.journal_id,
       date: p.pay_date,
@@ -168,21 +168,21 @@ export function postPayment(orgId: string, paymentId: string, actor: Actor = {})
         ],
     }, actor);
 
-    run(`UPDATE payments SET state='posted', entry_id=?, posted_by=?, posted_at=? WHERE id=?`,
+    await run(`UPDATE payments SET state='posted', entry_id=?, posted_by=?, posted_at=? WHERE id=?`,
       entryId, actor.id ?? null, nowIso(), paymentId);
-    audit(orgId, actor, 'posted', 'payment', paymentId, `${p.number} posted`);
+    await audit(orgId, actor, 'posted', 'payment', paymentId, `${p.number} posted`);
     return entryId;
   });
 }
 
-function bankGlAccount(orgId: string, p: PaymentRow): string {
+async function bankGlAccount(orgId: string, p: PaymentRow): Promise<string> {
   if (p.bank_account_id) {
-    const ba = one<{ account_id: string }>(
+    const ba = await one<{ account_id: string }>(
       'SELECT account_id FROM bank_accounts WHERE id = ? AND org_id = ?', p.bank_account_id, orgId,
     );
     if (ba) return ba.account_id;
   }
-  const j = one<{ default_account_id: string | null }>(
+  const j = await one<{ default_account_id: string | null }>(
     'SELECT default_account_id FROM journals WHERE id = ?', p.journal_id,
   );
   if (!j?.default_account_id) {
@@ -204,13 +204,13 @@ function bankGlAccount(orgId: string, p: PaymentRow): string {
  * already debited bank and credited AR when it posted, so allocating it is
  * matching, not posting.
  */
-export function allocate(orgId: string, paymentId: string, documentId: string, amount: number, actor: Actor = {}) {
-  return tx(() => {
-    const p = one<PaymentRow>('SELECT * FROM payments WHERE id = ? AND org_id = ?', paymentId, orgId);
+export async function allocate(orgId: string, paymentId: string, documentId: string, amount: number, actor: Actor = {}) {
+  return await tx(async () => {
+    const p = await one<PaymentRow>('SELECT * FROM payments WHERE id = ? AND org_id = ?', paymentId, orgId);
     if (!p) throw new PostingError('Unknown payment.');
     if (p.state === 'draft') throw new PostingError('Post the payment before allocating it.');
 
-    const doc = getDocument(orgId, documentId);
+    const doc = await getDocument(orgId, documentId);
     if (!doc) throw new PostingError('Unknown document.');
     if (doc.state !== 'posted') throw new PostingError('Only a posted document can be settled.');
 
@@ -228,9 +228,9 @@ export function allocate(orgId: string, paymentId: string, documentId: string, a
      * last week and forgot to switch on.
      */
     const controlId = doc.doc_type.startsWith('out_')
-      ? receivableAccount(orgId, doc.partner_id)
-      : payableAccount(orgId, doc.partner_id);
-    const control = one<{ code: string; name: string; reconcilable: number }>(
+      ? await receivableAccount(orgId, doc.partner_id)
+      : await payableAccount(orgId, doc.partner_id);
+    const control = await one<{ code: string; name: string; reconcilable: number }>(
       'SELECT code, name, reconcilable FROM accounts WHERE id = ?', controlId,
     );
     if (control && !control.reconcilable) {
@@ -240,7 +240,7 @@ export function allocate(orgId: string, paymentId: string, documentId: string, a
       );
     }
 
-    const unallocated = paymentUnallocated(orgId, paymentId);
+    const unallocated = await paymentUnallocated(orgId, paymentId);
     if (amount <= 0) throw new PostingError('Allocate a positive amount.');
     if (amount > unallocated) {
       throw new PostingError(`Only ${(unallocated / 100).toFixed(2)} of this payment is unallocated.`);
@@ -254,13 +254,13 @@ export function allocate(orgId: string, paymentId: string, documentId: string, a
       // advance always clears the liability against receivables, whichever way
       // the cash originally moved.
       const customerSide = p.side !== 'supplier';
-      const advance = requireSetting(orgId, customerSide ? 'account.customer_advance' : 'account.supplier_advance');
+      const advance = await requireSetting(orgId, customerSide ? 'account.customer_advance' : 'account.supplier_advance');
       const partnerAccount = customerSide
-        ? receivableAccount(orgId, p.partner_id)
-        : payableAccount(orgId, p.partner_id);
-      postEntry({
+        ? await receivableAccount(orgId, p.partner_id)
+        : await payableAccount(orgId, p.partner_id);
+      await postEntry({
         orgId,
-        journalId: requireSetting(orgId, 'journal.general'),
+        journalId: await requireSetting(orgId, 'journal.general'),
         date: doc.doc_date > p.pay_date ? doc.doc_date : p.pay_date,
         reference: `${p.number} → ${doc.number}`,
         narration: `Advance applied to ${doc.number}`,
@@ -278,23 +278,23 @@ export function allocate(orgId: string, paymentId: string, documentId: string, a
       }, actor);
     }
 
-    run(
+    await run(
       `INSERT INTO payment_allocations (org_id, payment_id, document_id, amount, at, by_user)
        VALUES (?,?,?,?,?,?)`,
       orgId, paymentId, documentId, amount, nowIso(), actor.id ?? null,
     );
-    run('UPDATE payments SET unallocated = ? WHERE id = ?', unallocated - amount, paymentId);
-    if (unallocated - amount === 0) run(`UPDATE payments SET state='reconciled' WHERE id=?`, paymentId);
-    refreshResidual(orgId, documentId);
-    audit(orgId, actor, 'allocated', 'payment', paymentId,
+    await run('UPDATE payments SET unallocated = ? WHERE id = ?', unallocated - amount, paymentId);
+    if (unallocated - amount === 0) await run(`UPDATE payments SET state='reconciled' WHERE id=?`, paymentId);
+    await refreshResidual(orgId, documentId);
+    await audit(orgId, actor, 'allocated', 'payment', paymentId,
       `${(amount / 100).toFixed(2)} allocated to ${doc.number}`);
   });
 }
 
-export function paymentUnallocated(orgId: string, paymentId: string): number {
-  const p = one<{ amount: number }>('SELECT amount FROM payments WHERE id = ? AND org_id = ?', paymentId, orgId);
+export async function paymentUnallocated(orgId: string, paymentId: string): Promise<number> {
+  const p = await one<{ amount: number }>('SELECT amount FROM payments WHERE id = ? AND org_id = ?', paymentId, orgId);
   if (!p) return 0;
-  const used = scalar('SELECT COALESCE(SUM(amount),0) FROM payment_allocations WHERE payment_id = ?', paymentId);
+  const used = await scalar('SELECT COALESCE(SUM(amount),0) FROM payment_allocations WHERE payment_id = ?', paymentId);
   return p.amount - used;
 }
 
@@ -305,10 +305,10 @@ export function paymentUnallocated(orgId: string, paymentId: string): number {
  * signs, so the ledger needs nothing further — this records WHICH invoice the
  * note settled, so the ageing report and the customer statement agree.
  */
-export function applyCreditNote(orgId: string, creditDocId: string, invoiceDocId: string, amount: number, actor: Actor = {}) {
-  return tx(() => {
-    const credit = getDocument(orgId, creditDocId);
-    const invoice = getDocument(orgId, invoiceDocId);
+export async function applyCreditNote(orgId: string, creditDocId: string, invoiceDocId: string, amount: number, actor: Actor = {}) {
+  return await tx(async () => {
+    const credit = await getDocument(orgId, creditDocId);
+    const invoice = await getDocument(orgId, invoiceDocId);
     if (!credit || !invoice) throw new PostingError('Unknown document.');
     if (credit.state !== 'posted' || invoice.state !== 'posted') {
       throw new PostingError('Both documents must be posted.');
@@ -317,47 +317,47 @@ export function applyCreditNote(orgId: string, creditDocId: string, invoiceDocId
     if (amount > invoice.residual) throw new PostingError('The invoice does not owe that much.');
 
     const at = nowIso();
-    run(`INSERT INTO payment_allocations (org_id, credit_doc_id, document_id, amount, at, by_user)
+    await run(`INSERT INTO payment_allocations (org_id, credit_doc_id, document_id, amount, at, by_user)
          VALUES (?,?,?,?,?,?)`, orgId, creditDocId, invoiceDocId, amount, at, actor.id ?? null);
     // The note is consumed by the same mechanism, so its own residual falls.
-    run(`INSERT INTO payment_allocations (org_id, credit_doc_id, document_id, amount, at, by_user)
+    await run(`INSERT INTO payment_allocations (org_id, credit_doc_id, document_id, amount, at, by_user)
          VALUES (?,?,?,?,?,?)`, orgId, invoiceDocId, creditDocId, amount, at, actor.id ?? null);
-    refreshResidual(orgId, invoiceDocId);
-    refreshResidual(orgId, creditDocId);
-    audit(orgId, actor, 'allocated', 'document', creditDocId,
+    await refreshResidual(orgId, invoiceDocId);
+    await refreshResidual(orgId, creditDocId);
+    await audit(orgId, actor, 'allocated', 'document', creditDocId,
       `${(amount / 100).toFixed(2)} applied to ${invoice.number}`);
   });
 }
 
 /** Undo one allocation — the payment was matched to the wrong invoice. */
-export function unallocate(orgId: string, allocationId: number, actor: Actor = {}) {
-  return tx(() => {
-    const a = one<{ payment_id: string | null; document_id: string; amount: number }>(
+export async function unallocate(orgId: string, allocationId: number, actor: Actor = {}) {
+  return await tx(async () => {
+    const a = await one<{ payment_id: string | null; document_id: string; amount: number }>(
       'SELECT payment_id, document_id, amount FROM payment_allocations WHERE id = ? AND org_id = ?',
       allocationId, orgId,
     );
     if (!a) throw new PostingError('Unknown allocation.');
-    run('DELETE FROM payment_allocations WHERE id = ?', allocationId);
+    await run('DELETE FROM payment_allocations WHERE id = ?', allocationId);
     if (a.payment_id) {
-      run(`UPDATE payments SET unallocated = ?, state = 'posted' WHERE id = ?`,
-        paymentUnallocated(orgId, a.payment_id), a.payment_id);
+      await run(`UPDATE payments SET unallocated = ?, state = 'posted' WHERE id = ?`,
+        await paymentUnallocated(orgId, a.payment_id), a.payment_id);
     }
-    refreshResidual(orgId, a.document_id);
-    audit(orgId, actor, 'unallocated', 'document', a.document_id, 'Allocation removed');
+    await refreshResidual(orgId, a.document_id);
+    await audit(orgId, actor, 'unallocated', 'document', a.document_id, 'Allocation removed');
   });
 }
 
-export function reversePayment(orgId: string, paymentId: string, date: string, actor: Actor = {}, reason?: string) {
-  return tx(() => {
-    const p = one<PaymentRow>('SELECT * FROM payments WHERE id = ? AND org_id = ?', paymentId, orgId);
+export async function reversePayment(orgId: string, paymentId: string, date: string, actor: Actor = {}, reason?: string) {
+  return await tx(async () => {
+    const p = await one<PaymentRow>('SELECT * FROM payments WHERE id = ? AND org_id = ?', paymentId, orgId);
     if (!p) throw new PostingError('Unknown payment.');
     if (p.state === 'cancelled') throw new PostingError('Already cancelled.');
-    for (const a of all<{ id: number }>('SELECT id FROM payment_allocations WHERE payment_id = ?', paymentId)) {
-      unallocate(orgId, a.id, actor);
+    for (const a of await all<{ id: number }>('SELECT id FROM payment_allocations WHERE payment_id = ?', paymentId)) {
+      await unallocate(orgId, a.id, actor);
     }
-    if (p.entry_id) reverseEntry(orgId, p.entry_id, date, actor, reason);
-    run(`UPDATE payments SET state='cancelled' WHERE id=?`, paymentId);
-    audit(orgId, actor, 'reversed', 'payment', paymentId, reason ?? 'Payment reversed');
+    if (p.entry_id) await reverseEntry(orgId, p.entry_id, date, actor, reason);
+    await run(`UPDATE payments SET state='cancelled' WHERE id=?`, paymentId);
+    await audit(orgId, actor, 'reversed', 'payment', paymentId, reason ?? 'Payment reversed');
   });
 }
 
@@ -365,22 +365,22 @@ export function reversePayment(orgId: string, paymentId: string, date: string, a
 // Reads
 // ---------------------------------------------------------------------------
 
-export function getPayment(orgId: string, paymentId: string): PaymentRow | null {
-  return one<PaymentRow>(
+export async function getPayment(orgId: string, paymentId: string): Promise<PaymentRow | null> {
+  return await one<PaymentRow>(
     `SELECT p.*, pt.name AS partner_name FROM payments p
        LEFT JOIN partners pt ON pt.id = p.partner_id
       WHERE p.id = ? AND p.org_id = ?`, paymentId, orgId,
   );
 }
 
-export function listPayments(orgId: string, f: {
+export async function listPayments(orgId: string, f: {
   direction?: 'inbound' | 'outbound';
   /** Prefer this over `direction` on the two payment screens: a customer
    *  refund is outbound money that still belongs on the Sales side. */
   side?: 'customer' | 'supplier';
   partnerId?: string; from?: string; to?: string;
   state?: string; unallocatedOnly?: boolean; limit?: number;
-} = {}): PaymentRow[] {
+} = {}): Promise<PaymentRow[]> {
   const clauses = ['p.org_id = ?'];
   const params: Array<string | number> = [orgId];
   if (f.direction) { clauses.push('p.direction = ?'); params.push(f.direction); }
@@ -390,7 +390,7 @@ export function listPayments(orgId: string, f: {
   if (f.from) { clauses.push('p.pay_date >= ?'); params.push(f.from); }
   if (f.to) { clauses.push('p.pay_date <= ?'); params.push(f.to); }
   if (f.unallocatedOnly) clauses.push("p.unallocated > 0 AND p.state <> 'cancelled'");
-  return all<PaymentRow>(
+  return await all<PaymentRow>(
     `SELECT p.*, pt.name AS partner_name FROM payments p
        LEFT JOIN partners pt ON pt.id = p.partner_id
       WHERE ${clauses.join(' AND ')}
@@ -399,8 +399,8 @@ export function listPayments(orgId: string, f: {
   );
 }
 
-export function allocationsFor(documentId: string) {
-  return all<{
+export async function allocationsFor(documentId: string) {
+  return await all<{
     id: number; amount: number; at: string; payment_id: string | null;
     payment_number: string | null; pay_date: string | null; method: string | null;
     credit_doc_id: string | null; credit_number: string | null;
@@ -414,8 +414,8 @@ export function allocationsFor(documentId: string) {
   );
 }
 
-export function allocationsOfPayment(paymentId: string) {
-  return all<{ id: number; amount: number; document_id: string; number: string | null; doc_date: string }>(
+export async function allocationsOfPayment(paymentId: string) {
+  return await all<{ id: number; amount: number; document_id: string; number: string | null; doc_date: string }>(
     `SELECT a.id, a.amount, a.document_id, d.number, d.doc_date
        FROM payment_allocations a JOIN documents d ON d.id = a.document_id
       WHERE a.payment_id = ? ORDER BY a.id`, paymentId,

@@ -19,7 +19,7 @@ export const dynamic = 'force-dynamic';
  * naming the CONTRA account on the other side of each entry. That column is
  * what makes a ledger readable — "By Sales A/c", "To Bank A/c" — and it cannot
  * come from the line itself, it has to be derived from the line's siblings in
- * the same entry. See ledgerAccount() in server/accounting/books.ts.
+ * the same entry. See await ledgerAccount() in server/accounting/books.ts.
  *
  * Two presentations of the same rows are offered, because accountants want
  * both and for different jobs:
@@ -30,16 +30,16 @@ export const dynamic = 'force-dynamic';
  *     arithmetic of "balance c/d" visible.
  */
 export default async function LedgerAccountPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
   const range = resolveRange(
-    { range: one(params, 'range'), from: one(params, 'from'), to: one(params, 'to') }, s.fyStartMonth,
+    { range: await one(params, 'range'), from: await one(params, 'from'), to: await one(params, 'to') }, s.fyStartMonth,
   );
-  const accountId = one(params, 'account');
-  const form = one(params, 'form') === 't' ? 't' : 'statement';
+  const accountId = await one(params, 'account');
+  const form = await one(params, 'form') === 't' ? 't' : 'statement';
 
-  const accounts = listAccounts(s.orgId, { activeOnly: false });
-  const report = accountId ? ledgerAccount(s.orgId, accountId, range) : null;
+  const accounts = await listAccounts(s.orgId, { activeOnly: false });
+  const report = accountId ? await ledgerAccount(s.orgId, accountId, range) : null;
 
   return (
     <>

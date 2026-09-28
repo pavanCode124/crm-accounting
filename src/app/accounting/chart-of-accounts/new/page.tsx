@@ -21,8 +21,8 @@ export const dynamic = 'force-dynamic';
  * That is the pattern now, here and on every other master-data screen.
  */
 export default async function NewAccountPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  ctx();
-  const m = msg(await searchParams);
+  await ctx();
+  const m = await msg(await searchParams);
 
   // Grouped by statement group, because that is the decision the person filling
   // this in is actually making — an "expense" that lands on the balance sheet

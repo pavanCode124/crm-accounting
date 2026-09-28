@@ -8,9 +8,9 @@ import { PageHeader, Card, Banner, Field, inputClass, btn, LinkButton } from '@/
 export const dynamic = 'force-dynamic';
 
 export default async function NewJournalPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
-  const accounts = accountOptions(s.orgId, ['asset_cash']);
+  const s = await ctx();
+  const m = await msg(await searchParams);
+  const accounts = await accountOptions(s.orgId, ['asset_cash']);
 
   return (
     <>

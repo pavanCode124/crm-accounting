@@ -19,9 +19,9 @@ export const dynamic = 'force-dynamic';
  * reconciled against something outside the system.
  */
 export default async function BankingPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
-  const accounts = listBankAccounts(s.orgId);
+  const s = await ctx();
+  const m = await msg(await searchParams);
+  const accounts = await listBankAccounts(s.orgId);
   const total = accounts.reduce((sum, a) => sum + (a.balance ?? 0), 0);
   const pending = accounts.reduce((sum, a) => sum + (a.unreconciled ?? 0), 0);
   const today = isoDate();

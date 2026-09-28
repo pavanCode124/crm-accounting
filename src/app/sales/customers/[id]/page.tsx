@@ -9,18 +9,18 @@ export const dynamic = 'force-dynamic';
 export default async function Page({ params, searchParams }: {
   params: Promise<{ id: string }>; searchParams: Promise<SearchParams>;
 }) {
-  const s = ctx();
+  const s = await ctx();
   const { id } = await params;
   const sp = await searchParams;
-  const m = msg(sp);
-  const partner = getPartner(s.orgId, id);
+  const m = await msg(sp);
+  const partner = await getPartner(s.orgId, id);
   return (
     <>
       <PageHeader title={partner?.name ?? 'Unknown'} subtitle="Customer account" accent="var(--color-sec-sales)" />
       {m.error && <Banner tone="error">{m.error}</Banner>}
       {m.ok && <Banner tone="ok">{m.ok}</Banner>}
       <PartnerDetail orgId={s.orgId} partnerId={id} side="customer" basePath="/sales/customers"
-        tab={one(sp, 'tab') ?? 'overview'} />
+        tab={await one(sp, 'tab') ?? 'overview'} />
     </>
   );
 }

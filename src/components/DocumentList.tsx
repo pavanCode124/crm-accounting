@@ -11,10 +11,10 @@ import { Card, Table, Th, Td, Money, Chip, EmptyState, RefLink, inputClass, btn 
  * scans are the same in every case: number, who, when, how much, how much is
  * left, and what state it is in.
  */
-export function DocumentList({ orgId, docType, basePath, filter, emptyHint }: {
+export async function DocumentList({ orgId, docType, basePath, filter, emptyHint }: {
   orgId: string; docType: DocType; basePath: string; filter: DocFilter; emptyHint?: string;
 }) {
-  const docs = listDocuments(orgId, { ...filter, docType });
+  const docs = await listDocuments(orgId, { ...filter, docType });
   const today = isoDate();
   const isBill = docType.startsWith('in_');
 

@@ -17,12 +17,12 @@ export const dynamic = 'force-dynamic';
  * ₹38,000 once.
  */
 export default async function PackagesPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
   const range = resolveRange(
-    { range: one(params, 'range'), from: one(params, 'from'), to: one(params, 'to') }, s.fyStartMonth,
+    { range: await one(params, 'range'), from: await one(params, 'from'), to: await one(params, 'to') }, s.fyStartMonth,
   );
-  const rows = packageProfitability(s.orgId, range);
+  const rows = await packageProfitability(s.orgId, range);
   const revenue = rows.reduce((sum, r) => sum + r.revenue, 0);
   const profit = rows.reduce((sum, r) => sum + r.profit, 0);
   const peak = Math.max(1, ...rows.map((r) => r.revenue));

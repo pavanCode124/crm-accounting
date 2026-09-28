@@ -13,12 +13,12 @@ const CATEGORIES = [
 ];
 
 export default async function NewProductPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
-  const income = accountOptions(s.orgId, ['income', 'income_other']);
-  const expense = accountOptions(s.orgId, ['expense_direct', 'expense_operating']);
-  const saleTaxes = listTaxes(s.orgId, 'sale');
-  const purchaseTaxes = listTaxes(s.orgId, 'purchase');
+  const s = await ctx();
+  const m = await msg(await searchParams);
+  const income = await accountOptions(s.orgId, ['income', 'income_other']);
+  const expense = await accountOptions(s.orgId, ['expense_direct', 'expense_operating']);
+  const saleTaxes = await listTaxes(s.orgId, 'sale');
+  const purchaseTaxes = await listTaxes(s.orgId, 'purchase');
 
   return (
     <>

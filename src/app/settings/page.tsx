@@ -21,12 +21,12 @@ export const dynamic = 'force-dynamic';
  * changes a dropdown here rather than a constant in a posting routine.
  */
 export default async function SettingsPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
-  const current = allSettings(s.orgId);
-  const accounts = accountOptions(s.orgId);
-  const journals = journalOptions(s.orgId);
-  const users = listUsers(s.orgId);
+  const s = await ctx();
+  const m = await msg(await searchParams);
+  const current = await allSettings(s.orgId);
+  const accounts = await accountOptions(s.orgId);
+  const journals = await journalOptions(s.orgId);
+  const users = await listUsers(s.orgId);
   const mayConfigure = can(s.role, 'coa.configure');
 
   const accountKeys: Array<[string, string, string]> = [

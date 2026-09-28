@@ -7,7 +7,7 @@ export const dynamic = 'force-dynamic';
 export default async function Page({ params, searchParams }: {
   params: Promise<{ id: string }>; searchParams: Promise<SearchParams>;
 }) {
-  const s = ctx();
+  const s = await ctx();
   const { id } = await params;
   return (
     <DocumentDetail
@@ -15,7 +15,7 @@ export default async function Page({ params, searchParams }: {
       docId={id}
       basePath="/purchases/debit-notes"
       role={s.role}
-      message={msg(await searchParams)}
+      message={await msg(await searchParams)}
     />
   );
 }

@@ -52,11 +52,11 @@ export interface DayBookEntry {
  * flat result would repeat the entry header once per line and still need
  * grouping in JS, and the second query is an indexed lookup on `entry_id`.
  */
-export function dayBook(
+export async function dayBook(
   orgId: string,
   p: Period,
   opts: { journalId?: string; state?: string; limit?: number } = {},
-): DayBookEntry[] {
+): Promise<DayBookEntry[]> {
   const clauses = ['e.org_id = ?', 'e.entry_date BETWEEN ? AND ?'];
   const params: Array<string | number> = [orgId, p.from, p.to];
   if (opts.journalId) { clauses.push('e.journal_id = ?'); params.push(opts.journalId); }
@@ -65,7 +65,7 @@ export function dayBook(
   clauses.push(opts.state ? 'e.state = ?' : "e.state <> 'draft'");
   if (opts.state) params.push(opts.state);
 
-  const entries = all<Omit<DayBookEntry, 'lines' | 'debit' | 'credit'>>(
+  const entries = await all<Omit<DayBookEntry, 'lines' | 'debit' | 'credit'>>(
     `SELECT e.id, e.entry_no, e.entry_date, e.reference, e.narration, e.state,
             j.code AS journal_code, j.name AS journal_name, j.type AS journal_type,
             e.source_model, e.source_id
@@ -78,7 +78,7 @@ export function dayBook(
   if (entries.length === 0) return [];
 
   const ids = entries.map((e) => e.id);
-  const lines = all<BookLine & { entry_id: string }>(
+  const lines = await all<BookLine & { entry_id: string }>(
     `SELECT l.id, l.entry_id, l.account_id, a.code AS account_code, a.name AS account_name,
             p.name AS partner_name, l.label, l.debit, l.credit
        FROM journal_entry_lines l
@@ -140,23 +140,23 @@ export interface LedgerAccountReport {
  * several, so they are joined — a ledger that silently showed only the first
  * would be quietly wrong on exactly the entries worth reading closely.
  */
-export function ledgerAccount(
+export async function ledgerAccount(
   orgId: string, accountId: string, p: Period, limit = 1000,
-): LedgerAccountReport {
-  const account = all<{ id: string; code: string; name: string; kind: string }>(
+): Promise<LedgerAccountReport> {
+  const account = (await all<{ id: string; code: string; name: string; kind: string }>(
     'SELECT id, code, name, kind FROM accounts WHERE id = ? AND org_id = ?', accountId, orgId,
-  )[0] ?? null;
+  ))[0] ?? null;
   if (!account) {
     return { account: null, opening: 0, closing: 0, debit: 0, credit: 0, rows: [], truncated: false };
   }
 
-  const opening = scalar(
+  const opening = await scalar(
     `SELECT COALESCE(SUM(debit - credit),0) FROM journal_entry_lines
       WHERE org_id = ? AND account_id = ? AND state='posted' AND entry_date < ?`,
     orgId, accountId, p.from,
   );
 
-  const own = all<Omit<LedgerRow, 'particulars' | 'running'>>(
+  const own = await all<Omit<LedgerRow, 'particulars' | 'running'>>(
     `SELECT l.id, l.entry_id, e.entry_no, l.entry_date, j.code AS journal_code,
             l.label, pt.name AS partner_name, e.reference,
             e.source_model, e.source_id, l.debit, l.credit
@@ -177,7 +177,7 @@ export function ledgerAccount(
   const contra = new Map<string, Array<{ account_name: string; debit: number; credit: number }>>();
   if (rows0.length) {
     const entryIds = [...new Set(rows0.map((r) => r.entry_id))];
-    const siblings = all<{ entry_id: string; account_id: string; account_name: string; debit: number; credit: number }>(
+    const siblings = await all<{ entry_id: string; account_id: string; account_name: string; debit: number; credit: number }>(
       `SELECT l.entry_id, l.account_id, a.name AS account_name, l.debit, l.credit
          FROM journal_entry_lines l JOIN accounts a ON a.id = l.account_id
         WHERE l.entry_id IN (${entryIds.map(() => '?').join(',')}) AND l.account_id <> ?`,
@@ -234,8 +234,8 @@ export interface CashBookAccount {
  * and its current account want separate books even though they are the same
  * kind of thing to the trial balance.
  */
-export function cashBookAccounts(orgId: string, p: Period, isCash: boolean): CashBookAccount[] {
-  return all<CashBookAccount>(
+export async function cashBookAccounts(orgId: string, p: Period, isCash: boolean): Promise<CashBookAccount[]> {
+  return (await all<CashBookAccount>(
     `SELECT b.id AS bank_account_id, b.account_id,
             b.name AS label, b.bank_name, b.account_no,
             COALESCE((SELECT SUM(l.debit - l.credit) FROM journal_entry_lines l
@@ -251,5 +251,5 @@ export function cashBookAccounts(orgId: string, p: Period, isCash: boolean): Cas
       WHERE b.org_id = ? AND b.is_cash = ? AND b.active = 1
       ORDER BY b.name`,
     p.from, p.from, p.to, p.from, p.to, orgId, isCash ? 1 : 0,
-  ).map((a) => ({ ...a, closing: a.opening + a.receipts - a.payments }));
+  )).map((a) => ({ ...a, closing: a.opening + a.receipts - a.payments }));
 }

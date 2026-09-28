@@ -18,12 +18,12 @@ export const dynamic = 'force-dynamic';
  * other report on this site.
  */
 export default async function TrialBalancePage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
   const range = resolveRange(
-    { range: one(params, 'range'), from: one(params, 'from'), to: one(params, 'to') }, s.fyStartMonth,
+    { range: await one(params, 'range'), from: await one(params, 'from'), to: await one(params, 'to') }, s.fyStartMonth,
   );
-  const tb = trialBalance(s.orgId, range);
+  const tb = await trialBalance(s.orgId, range);
 
   // Opening and closing are stored signed; a trial balance prints them as two
   // columns each. Totalling the split columns rather than the signed figure is

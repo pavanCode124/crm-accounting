@@ -8,8 +8,8 @@ import { JournalEntryForm } from '@/components/JournalEntryForm';
 export const dynamic = 'force-dynamic';
 
 export default async function NewEntryPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
+  const s = await ctx();
+  const m = await msg(await searchParams);
   return (
     <>
       <PageHeader
@@ -19,10 +19,10 @@ export default async function NewEntryPage({ searchParams }: { searchParams: Pro
       />
       {m.error && <Banner tone="error">{m.error}</Banner>}
       <JournalEntryForm
-        journals={journalOptions(s.orgId)}
-        accounts={accountOptions(s.orgId)}
-        partners={partnerOptions(s.orgId)}
-        analytics={analyticOptions(s.orgId)}
+        journals={await journalOptions(s.orgId)}
+        accounts={await accountOptions(s.orgId)}
+        partners={await partnerOptions(s.orgId)}
+        analytics={await analyticOptions(s.orgId)}
         canPost={can(s.role, 'journal.post')}
       />
     </>

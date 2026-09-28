@@ -1,7 +1,7 @@
 -- ---------------------------------------------------------------------------
 -- TripzoCRM Finance — schema
 -- ---------------------------------------------------------------------------
--- MONEY IS NEVER A FLOAT. Every amount in this file is an INTEGER in minor
+-- MONEY IS NEVER A FLOAT. Every amount in this file is an BIGINT in minor
 -- units (paise for INR). A ledger that stores 0.1 + 0.2 as a double will fail
 -- its own trial balance eventually, and an accounting system that cannot prove
 -- debits = credits is not an accounting system. Formatting back to rupees is a
@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS organizations (
   country       TEXT NOT NULL DEFAULT 'IN',
   gstin         TEXT,
   pan           TEXT,
-  fy_start_month INTEGER NOT NULL DEFAULT 4,   -- April, the Indian fiscal year
+  fy_start_month BIGINT NOT NULL DEFAULT 4,   -- April, the Indian fiscal year
   address       TEXT,
   created_at    TEXT NOT NULL
 );
@@ -31,12 +31,12 @@ CREATE TABLE IF NOT EXISTS users (
   -- Mirrors the CRM's roles (src/lib/capabilities.ts there):
   -- member | admin | accountant | developer | service-role
   role       TEXT NOT NULL DEFAULT 'member',
-  active     INTEGER NOT NULL DEFAULT 1
+  active     BIGINT NOT NULL DEFAULT 1
 );
 
 -- Every financial action, append-only. Section 45 of the plan.
 CREATE TABLE IF NOT EXISTS audit_log (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  id          BIGSERIAL PRIMARY KEY,
   org_id      TEXT NOT NULL,
   at          TEXT NOT NULL,
   user_id     TEXT,
@@ -55,8 +55,8 @@ CREATE TABLE IF NOT EXISTS sequences (
   org_id   TEXT NOT NULL,
   code     TEXT NOT NULL,
   prefix   TEXT NOT NULL,
-  padding  INTEGER NOT NULL DEFAULT 5,
-  next_no  INTEGER NOT NULL DEFAULT 1,
+  padding  BIGINT NOT NULL DEFAULT 5,
+  next_no  BIGINT NOT NULL DEFAULT 1,
   PRIMARY KEY (org_id, code)
 );
 
@@ -65,17 +65,17 @@ CREATE TABLE IF NOT EXISTS currencies (
   code     TEXT PRIMARY KEY,
   name     TEXT NOT NULL,
   symbol   TEXT NOT NULL,
-  decimals INTEGER NOT NULL DEFAULT 2
+  decimals BIGINT NOT NULL DEFAULT 2
 );
 
 -- Rate = how many units of company currency one unit of `code` buys, scaled by
 -- 1e6, so 84.25 INR/USD is stored exactly as 84250000.
 CREATE TABLE IF NOT EXISTS exchange_rates (
-  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  id       BIGSERIAL PRIMARY KEY,
   org_id   TEXT NOT NULL,
   code     TEXT NOT NULL,
   on_date  TEXT NOT NULL,
-  rate_e6  INTEGER NOT NULL,
+  rate_e6  BIGINT NOT NULL,
   UNIQUE (org_id, code, on_date)
 );
 
@@ -93,9 +93,9 @@ CREATE TABLE IF NOT EXISTS accounts (
   -- A reconcilable account is one whose lines are matched off against each
   -- other: receivables, payables, advances. Bank/cash are reconciled against
   -- the statement instead, which is a different mechanism.
-  reconcilable  INTEGER NOT NULL DEFAULT 0,
+  reconcilable  BIGINT NOT NULL DEFAULT 0,
   -- Locking an account stops new postings without destroying its history.
-  active        INTEGER NOT NULL DEFAULT 1,
+  active        BIGINT NOT NULL DEFAULT 1,
   description   TEXT,
   UNIQUE (org_id, code)
 );
@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS journals (
   -- Bank/cash journals own a bank account; that is what makes them payable from.
   bank_account_id    TEXT,
   sequence_code      TEXT NOT NULL,
-  active             INTEGER NOT NULL DEFAULT 1,
+  active             BIGINT NOT NULL DEFAULT 1,
   UNIQUE (org_id, code)
 );
 
@@ -175,22 +175,22 @@ CREATE TABLE IF NOT EXISTS journal_entry_lines (
   -- Exactly one of these is non-zero on any given line. Storing both rather
   -- than one signed column is what makes the trial balance a straight SUM and
   -- keeps a printed ledger readable without a sign convention to remember.
-  debit          INTEGER NOT NULL DEFAULT 0,
-  credit         INTEGER NOT NULL DEFAULT 0,
+  debit          BIGINT NOT NULL DEFAULT 0,
+  credit         BIGINT NOT NULL DEFAULT 0,
   -- Foreign-currency face value of the same line, kept for audit (section 30).
   currency       TEXT,
-  amount_currency INTEGER NOT NULL DEFAULT 0,
-  rate_e6        INTEGER,
+  amount_currency BIGINT NOT NULL DEFAULT 0,
+  rate_e6        BIGINT,
   tax_id         TEXT,
   -- Set on a tax line: the taxable value it was computed from, so tax reports
   -- can show the base beside the tax.
-  tax_base       INTEGER NOT NULL DEFAULT 0,
+  tax_base       BIGINT NOT NULL DEFAULT 0,
   booking_id     TEXT,
   entry_date     TEXT NOT NULL,   -- denormalised from the entry: every report filters on it
   state          TEXT NOT NULL DEFAULT 'draft',
   -- Matching: reconciled receivable/payable lines share a match id.
   match_id       TEXT,
-  reconciled     INTEGER NOT NULL DEFAULT 0
+  reconciled     BIGINT NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_jel_account ON journal_entry_lines(org_id, account_id, entry_date);
 CREATE INDEX IF NOT EXISTS ix_jel_partner ON journal_entry_lines(org_id, partner_id);
@@ -216,19 +216,19 @@ CREATE TABLE IF NOT EXISTS analytic_accounts (
   -- When the analytic account IS a trip, this points at the CRM booking.
   booking_id TEXT,
   partner_id TEXT,
-  active     INTEGER NOT NULL DEFAULT 1
+  active     BIGINT NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS ix_aa_plan ON analytic_accounts(org_id, plan_id);
 
 CREATE TABLE IF NOT EXISTS analytic_distributions (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  id           BIGSERIAL PRIMARY KEY,
   org_id       TEXT NOT NULL,
   line_id      TEXT NOT NULL REFERENCES journal_entry_lines(id) ON DELETE CASCADE,
   analytic_id  TEXT NOT NULL REFERENCES analytic_accounts(id),
   -- Percent in basis points: 10000 = 100%. One GL line can be split across
   -- several trips or departments.
-  bps          INTEGER NOT NULL DEFAULT 10000,
-  amount       INTEGER NOT NULL,  -- signed: +cost / -revenue, in company currency
+  bps          BIGINT NOT NULL DEFAULT 10000,
+  amount       BIGINT NOT NULL,  -- signed: +cost / -revenue, in company currency
   entry_date   TEXT NOT NULL,
   account_id   TEXT NOT NULL,
   state        TEXT NOT NULL DEFAULT 'draft'
@@ -243,8 +243,8 @@ CREATE TABLE IF NOT EXISTS partners (
   id               TEXT PRIMARY KEY,
   org_id           TEXT NOT NULL,
   name             TEXT NOT NULL,
-  is_customer      INTEGER NOT NULL DEFAULT 0,
-  is_supplier      INTEGER NOT NULL DEFAULT 0,
+  is_customer      BIGINT NOT NULL DEFAULT 0,
+  is_supplier      BIGINT NOT NULL DEFAULT 0,
   partner_type     TEXT NOT NULL DEFAULT 'b2c',  -- b2c | b2b | agency | reseller | employee
   crm_lead_id      TEXT,          -- back-reference into the CRM
   email            TEXT,
@@ -255,13 +255,13 @@ CREATE TABLE IF NOT EXISTS partners (
   country          TEXT DEFAULT 'IN',
   currency         TEXT,
   payment_terms_id TEXT,
-  credit_limit     INTEGER NOT NULL DEFAULT 0,
+  credit_limit     BIGINT NOT NULL DEFAULT 0,
   -- Overrides of the org defaults; NULL falls back to the default AR/AP account.
   receivable_account_id TEXT,
   payable_account_id    TEXT,
   -- TDS section applicable when we PAY this supplier (194C, 194H, 194J...).
   tds_section      TEXT,
-  active           INTEGER NOT NULL DEFAULT 1,
+  active           BIGINT NOT NULL DEFAULT 1,
   created_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_partners_name ON partners(org_id, name);
@@ -270,7 +270,7 @@ CREATE TABLE IF NOT EXISTS payment_terms (
   id        TEXT PRIMARY KEY,
   org_id    TEXT NOT NULL,
   name      TEXT NOT NULL,
-  days      INTEGER NOT NULL DEFAULT 0,
+  days      BIGINT NOT NULL DEFAULT 0,
   note      TEXT
 );
 
@@ -282,16 +282,16 @@ CREATE TABLE IF NOT EXISTS taxes (
   org_id         TEXT NOT NULL,
   name           TEXT NOT NULL,
   computation    TEXT NOT NULL DEFAULT 'percent',  -- percent | fixed
-  rate_bps       INTEGER NOT NULL,                 -- 1800 = 18%
+  rate_bps       BIGINT NOT NULL,                 -- 1800 = 18%
   scope          TEXT NOT NULL DEFAULT 'sale',     -- sale | purchase | none
   tax_group      TEXT NOT NULL DEFAULT 'gst',      -- gst | igst | cgst_sgst | tcs | tds | vat | none
-  price_included INTEGER NOT NULL DEFAULT 0,
+  price_included BIGINT NOT NULL DEFAULT 0,
   account_id     TEXT REFERENCES accounts(id),     -- where the tax is booked
   refund_account_id TEXT REFERENCES accounts(id),
   -- TDS/TCS only: the annual threshold below which no tax is withheld.
-  threshold      INTEGER NOT NULL DEFAULT 0,
+  threshold      BIGINT NOT NULL DEFAULT 0,
   effective_from TEXT,
-  active         INTEGER NOT NULL DEFAULT 1
+  active         BIGINT NOT NULL DEFAULT 1
 );
 
 -- A CGST+SGST pair is modelled as one parent with two children, so an invoice
@@ -310,13 +310,13 @@ CREATE TABLE IF NOT EXISTS products (
   code           TEXT,
   -- package | hotel | flight | visa | transport | sightseeing | guide | fee | other
   category       TEXT NOT NULL DEFAULT 'other',
-  sale_price     INTEGER NOT NULL DEFAULT 0,
-  cost_price     INTEGER NOT NULL DEFAULT 0,
+  sale_price     BIGINT NOT NULL DEFAULT 0,
+  cost_price     BIGINT NOT NULL DEFAULT 0,
   income_account_id  TEXT REFERENCES accounts(id),
   expense_account_id TEXT REFERENCES accounts(id),
   sale_tax_id      TEXT REFERENCES taxes(id),
   purchase_tax_id  TEXT REFERENCES taxes(id),
-  active         INTEGER NOT NULL DEFAULT 1
+  active         BIGINT NOT NULL DEFAULT 1
 );
 
 -- ----------------------------------------------------------------- bookings
@@ -334,10 +334,10 @@ CREATE TABLE IF NOT EXISTS bookings (
   agent_id       TEXT,
   agent_name     TEXT,
   branch         TEXT,
-  pax            INTEGER NOT NULL DEFAULT 1,
+  pax            BIGINT NOT NULL DEFAULT 1,
   start_date     TEXT,
   end_date       TEXT,
-  sell_value     INTEGER NOT NULL DEFAULT 0,   -- quoted value; the invoice is the truth
+  sell_value     BIGINT NOT NULL DEFAULT 0,   -- quoted value; the invoice is the truth
   status         TEXT NOT NULL DEFAULT 'confirmed', -- confirmed | travelling | completed | cancelled
   analytic_id    TEXT REFERENCES analytic_accounts(id),
   created_at     TEXT NOT NULL,
@@ -364,17 +364,17 @@ CREATE TABLE IF NOT EXISTS documents (
   payment_terms_id TEXT,
   supplier_ref   TEXT,                     -- the vendor's own bill number
   currency       TEXT NOT NULL DEFAULT 'INR',
-  rate_e6        INTEGER NOT NULL DEFAULT 1000000,
+  rate_e6        BIGINT NOT NULL DEFAULT 1000000,
   state          TEXT NOT NULL DEFAULT 'draft',      -- draft | posted | cancelled
   -- not_paid | partial | paid | reversed -- derived, refreshed on every payment
   payment_state  TEXT NOT NULL DEFAULT 'not_paid',
-  untaxed        INTEGER NOT NULL DEFAULT 0,
-  tax_total      INTEGER NOT NULL DEFAULT 0,
-  total          INTEGER NOT NULL DEFAULT 0,
+  untaxed        BIGINT NOT NULL DEFAULT 0,
+  tax_total      BIGINT NOT NULL DEFAULT 0,
+  total          BIGINT NOT NULL DEFAULT 0,
   -- What is still owed. Cached for list speed, but recomputed from allocations
   -- on every change and never edited by hand.
-  residual       INTEGER NOT NULL DEFAULT 0,
-  withheld_tax   INTEGER NOT NULL DEFAULT 0,   -- TDS withheld on a vendor bill
+  residual       BIGINT NOT NULL DEFAULT 0,
+  withheld_tax   BIGINT NOT NULL DEFAULT 0,   -- TDS withheld on a vendor bill
   entry_id       TEXT REFERENCES journal_entries(id),
   reversed_by    TEXT,
   reversal_of    TEXT,
@@ -390,18 +390,18 @@ CREATE TABLE IF NOT EXISTS document_lines (
   id          TEXT PRIMARY KEY,
   org_id      TEXT NOT NULL,
   document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-  seq         INTEGER NOT NULL DEFAULT 0,
+  seq         BIGINT NOT NULL DEFAULT 0,
   product_id  TEXT REFERENCES products(id),
   name        TEXT NOT NULL,
-  qty_milli   INTEGER NOT NULL DEFAULT 1000,   -- quantity x1000, so 2.5 nights is exact
-  unit_price  INTEGER NOT NULL DEFAULT 0,
-  discount_bps INTEGER NOT NULL DEFAULT 0,
+  qty_milli   BIGINT NOT NULL DEFAULT 1000,   -- quantity x1000, so 2.5 nights is exact
+  unit_price  BIGINT NOT NULL DEFAULT 0,
+  discount_bps BIGINT NOT NULL DEFAULT 0,
   tax_id      TEXT REFERENCES taxes(id),
   account_id  TEXT NOT NULL REFERENCES accounts(id),
   analytic_id TEXT REFERENCES analytic_accounts(id),
-  subtotal    INTEGER NOT NULL DEFAULT 0,
-  tax_amount  INTEGER NOT NULL DEFAULT 0,
-  total       INTEGER NOT NULL DEFAULT 0
+  subtotal    BIGINT NOT NULL DEFAULT 0,
+  tax_amount  BIGINT NOT NULL DEFAULT 0,
+  total       BIGINT NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_dl_doc ON document_lines(document_id);
 
@@ -423,16 +423,16 @@ CREATE TABLE IF NOT EXISTS payments (
   bank_account_id TEXT,
   booking_id    TEXT REFERENCES bookings(id),
   pay_date      TEXT NOT NULL,
-  amount        INTEGER NOT NULL,
+  amount        BIGINT NOT NULL,
   currency      TEXT NOT NULL DEFAULT 'INR',
-  rate_e6       INTEGER NOT NULL DEFAULT 1000000,
+  rate_e6       BIGINT NOT NULL DEFAULT 1000000,
   method        TEXT NOT NULL DEFAULT 'bank',  -- cash | bank | upi | card | cheque | neft | other
   reference     TEXT,
   -- An advance is money with no invoice behind it yet: it lands on a LIABILITY
   -- (customer advance) or ASSET (supplier advance) account, not on AR/AP.
-  is_advance    INTEGER NOT NULL DEFAULT 0,
+  is_advance    BIGINT NOT NULL DEFAULT 0,
   state         TEXT NOT NULL DEFAULT 'draft',  -- draft | posted | reconciled | cancelled
-  unallocated   INTEGER NOT NULL DEFAULT 0,
+  unallocated   BIGINT NOT NULL DEFAULT 0,
   entry_id      TEXT REFERENCES journal_entries(id),
   note          TEXT,
   created_by TEXT, created_at TEXT NOT NULL,
@@ -443,13 +443,13 @@ CREATE INDEX IF NOT EXISTS ix_pay_partner ON payments(org_id, partner_id);
 -- One payment can settle many documents (section 16), and one document can be
 -- settled by many payments. Hence a join table rather than a column on either.
 CREATE TABLE IF NOT EXISTS payment_allocations (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  id          BIGSERIAL PRIMARY KEY,
   org_id      TEXT NOT NULL,
   payment_id  TEXT REFERENCES payments(id) ON DELETE CASCADE,
   -- A credit note can also be applied to an invoice, with no payment involved.
   credit_doc_id TEXT REFERENCES documents(id),
   document_id TEXT NOT NULL REFERENCES documents(id),
-  amount      INTEGER NOT NULL,
+  amount      BIGINT NOT NULL,
   at          TEXT NOT NULL,
   by_user     TEXT
 );
@@ -465,10 +465,10 @@ CREATE TABLE IF NOT EXISTS bank_accounts (
   ifsc        TEXT,
   currency    TEXT NOT NULL DEFAULT 'INR',
   -- cash accounts live here too, so the Banking screen is one list
-  is_cash     INTEGER NOT NULL DEFAULT 0,
+  is_cash     BIGINT NOT NULL DEFAULT 0,
   account_id  TEXT NOT NULL REFERENCES accounts(id),
   journal_id  TEXT REFERENCES journals(id),
-  active      INTEGER NOT NULL DEFAULT 1
+  active      BIGINT NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS bank_transactions (
@@ -481,8 +481,8 @@ CREATE TABLE IF NOT EXISTS bank_transactions (
   -- Signed: a credit on the statement is positive, a debit negative. A bank
   -- statement is written from the BANK's point of view, so this is the one
   -- place in the schema where a signed amount is the honest representation.
-  amount       INTEGER NOT NULL,
-  balance      INTEGER,
+  amount       BIGINT NOT NULL,
+  balance      BIGINT,
   partner_id   TEXT,
   state        TEXT NOT NULL DEFAULT 'unreconciled', -- unreconciled | reconciled
   matched_payment_id TEXT REFERENCES payments(id),
@@ -509,7 +509,7 @@ CREATE TABLE IF NOT EXISTS budget_lines (
   budget_id   TEXT NOT NULL REFERENCES budgets(id) ON DELETE CASCADE,
   account_id  TEXT REFERENCES accounts(id),
   analytic_id TEXT REFERENCES analytic_accounts(id),
-  planned     INTEGER NOT NULL DEFAULT 0
+  planned     BIGINT NOT NULL DEFAULT 0
 );
 
 -- ----------------------------------------------------------------- expenses
@@ -521,9 +521,9 @@ CREATE TABLE IF NOT EXISTS expenses (
   employee_name TEXT,
   description  TEXT NOT NULL,
   expense_date TEXT NOT NULL,
-  amount       INTEGER NOT NULL,
+  amount       BIGINT NOT NULL,
   tax_id       TEXT REFERENCES taxes(id),
-  tax_amount   INTEGER NOT NULL DEFAULT 0,
+  tax_amount   BIGINT NOT NULL DEFAULT 0,
   account_id   TEXT NOT NULL REFERENCES accounts(id),
   analytic_id  TEXT REFERENCES analytic_accounts(id),
   booking_id   TEXT,
@@ -547,11 +547,11 @@ CREATE TABLE IF NOT EXISTS assets (
   expense_account_id TEXT NOT NULL REFERENCES accounts(id),      -- depreciation expense
   journal_id      TEXT REFERENCES journals(id),
   purchase_date   TEXT NOT NULL,
-  purchase_value  INTEGER NOT NULL,
-  salvage_value   INTEGER NOT NULL DEFAULT 0,
+  purchase_value  BIGINT NOT NULL,
+  salvage_value   BIGINT NOT NULL DEFAULT 0,
   method          TEXT NOT NULL DEFAULT 'straight_line',  -- straight_line | declining
-  life_months     INTEGER NOT NULL DEFAULT 36,
-  declining_bps   INTEGER NOT NULL DEFAULT 0,
+  life_months     BIGINT NOT NULL DEFAULT 36,
+  declining_bps   BIGINT NOT NULL DEFAULT 0,
   state           TEXT NOT NULL DEFAULT 'draft',  -- draft | running | disposed
   analytic_id     TEXT,
   created_at      TEXT NOT NULL
@@ -561,11 +561,11 @@ CREATE TABLE IF NOT EXISTS asset_lines (
   id         TEXT PRIMARY KEY,
   org_id     TEXT NOT NULL,
   asset_id   TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
-  seq        INTEGER NOT NULL,
+  seq        BIGINT NOT NULL,
   due_date   TEXT NOT NULL,
-  amount     INTEGER NOT NULL,
-  cumulative INTEGER NOT NULL,
-  remaining  INTEGER NOT NULL,
+  amount     BIGINT NOT NULL,
+  cumulative BIGINT NOT NULL,
+  remaining  BIGINT NOT NULL,
   state      TEXT NOT NULL DEFAULT 'pending',  -- pending | posted
   entry_id   TEXT REFERENCES journal_entries(id)
 );
@@ -580,9 +580,9 @@ CREATE TABLE IF NOT EXISTS deferrals (
   balance_account_id TEXT NOT NULL REFERENCES accounts(id),  -- prepaid / deferred revenue
   recognition_account_id TEXT NOT NULL REFERENCES accounts(id),
   journal_id    TEXT REFERENCES journals(id),
-  amount        INTEGER NOT NULL,
+  amount        BIGINT NOT NULL,
   date_from     TEXT NOT NULL,
-  months        INTEGER NOT NULL,
+  months        BIGINT NOT NULL,
   analytic_id   TEXT,
   state         TEXT NOT NULL DEFAULT 'draft',
   created_at    TEXT NOT NULL
@@ -592,9 +592,9 @@ CREATE TABLE IF NOT EXISTS deferral_lines (
   id         TEXT PRIMARY KEY,
   org_id     TEXT NOT NULL,
   deferral_id TEXT NOT NULL REFERENCES deferrals(id) ON DELETE CASCADE,
-  seq        INTEGER NOT NULL,
+  seq        BIGINT NOT NULL,
   due_date   TEXT NOT NULL,
-  amount     INTEGER NOT NULL,
+  amount     BIGINT NOT NULL,
   state      TEXT NOT NULL DEFAULT 'pending',
   entry_id   TEXT REFERENCES journal_entries(id)
 );
@@ -608,10 +608,10 @@ CREATE TABLE IF NOT EXISTS commissions (
   booking_id   TEXT REFERENCES bookings(id),
   -- revenue | margin -- commission on the sale, or on what the trip actually made
   basis        TEXT NOT NULL DEFAULT 'revenue',
-  rate_bps     INTEGER NOT NULL DEFAULT 0,
-  fixed_amount INTEGER NOT NULL DEFAULT 0,
-  base_amount  INTEGER NOT NULL DEFAULT 0,
-  amount       INTEGER NOT NULL DEFAULT 0,
+  rate_bps     BIGINT NOT NULL DEFAULT 0,
+  fixed_amount BIGINT NOT NULL DEFAULT 0,
+  base_amount  BIGINT NOT NULL DEFAULT 0,
+  amount       BIGINT NOT NULL DEFAULT 0,
   due_date     TEXT,
   state        TEXT NOT NULL DEFAULT 'draft',  -- draft | posted | paid | reversed
   entry_id     TEXT REFERENCES journal_entries(id),
@@ -641,7 +641,7 @@ CREATE TABLE IF NOT EXISTS crm_connection (
   email         TEXT NOT NULL,
   access_token  TEXT NOT NULL,
   refresh_token TEXT,
-  expires_at    INTEGER NOT NULL,       -- epoch ms
+  expires_at    BIGINT NOT NULL,       -- epoch ms
   crm_org_id    TEXT,
   crm_org_name  TEXT,
   last_sync_at  TEXT,

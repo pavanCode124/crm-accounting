@@ -20,14 +20,14 @@ export const dynamic = 'force-dynamic';
  * button below.
  */
 export default async function ExpensesPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
-  const expenses = listExpenses(s.orgId);
+  const s = await ctx();
+  const m = await msg(await searchParams);
+  const expenses = await listExpenses(s.orgId);
   const mayApprove = can(s.role, 'payment.approve');
   // Only what the REIMBURSE button on a row needs. The claim form's options
   // moved to /expenses/new with it.
   const today = isoDate();
-  const cashJournals = journalOptions(s.orgId, ['bank', 'cash']);
+  const cashJournals = await journalOptions(s.orgId, ['bank', 'cash']);
 
   const pending = expenses.filter((e) => e.state === 'submitted');
   const owed = expenses.filter((e) => e.state === 'posted')

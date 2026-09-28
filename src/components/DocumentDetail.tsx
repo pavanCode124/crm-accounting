@@ -25,14 +25,14 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
   orgId: string; docId: string; basePath: string; role: string;
   message?: { ok?: string; error?: string };
 }) {
-  const doc = getDocument(orgId, docId);
+  const doc = await getDocument(orgId, docId);
   if (!doc) return <Banner tone="error">That document no longer exists.</Banner>;
 
   const meta = DOC_TYPES[doc.doc_type];
-  const lines = documentLines(docId);
-  const allocations = allocationsFor(docId);
-  const trail = auditFor('document', docId);
-  const entry = doc.entry_id ? journalEntry(orgId, doc.entry_id) : null;
+  const lines = await documentLines(docId);
+  const allocations = await allocationsFor(docId);
+  const trail = await auditFor('document', docId);
+  const entry = doc.entry_id ? await journalEntry(orgId, doc.entry_id) : null;
   const isBill = meta.side === 'supplier';
   const today = isoDate();
   // Settling a document is not always money in for a customer: a credit note
@@ -218,11 +218,11 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
                 </Field>
                 <Field label="Paid into / from">
                   <select name="bank_account_id" className={inputClass}>
-                    {bankAccountOptions(orgId).map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+                    {(await bankAccountOptions(orgId)).map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
                   </select>
                 </Field>
                 <input type="hidden" name="journal_id"
-                  value={journalOptions(orgId, ['bank', 'cash'])[0]?.id ?? ''} />
+                  value={(await journalOptions(orgId, ['bank', 'cash']))[0]?.id ?? ''} />
                 <Field label="Method">
                   <select name="method" className={inputClass} defaultValue="neft">
                     {['bank', 'neft', 'upi', 'card', 'cheque', 'cash', 'other'].map((m) =>

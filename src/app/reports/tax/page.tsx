@@ -16,12 +16,12 @@ export const dynamic = 'force-dynamic';
  * ledger actually posted.
  */
 export default async function TaxReportPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
   const range = resolveRange(
-    { range: one(params, 'range'), from: one(params, 'from'), to: one(params, 'to') }, s.fyStartMonth,
+    { range: await one(params, 'range'), from: await one(params, 'from'), to: await one(params, 'to') }, s.fyStartMonth,
   );
-  const tax = taxReport(s.orgId, range);
+  const tax = await taxReport(s.orgId, range);
 
   return (
     <>

@@ -18,9 +18,9 @@ export const dynamic = 'force-dynamic';
  * meant.
  */
 export default async function ProductsPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
-  const products = listProducts(s.orgId);
+  const s = await ctx();
+  const m = await msg(await searchParams);
+  const products = await listProducts(s.orgId);
 
   return (
     <>

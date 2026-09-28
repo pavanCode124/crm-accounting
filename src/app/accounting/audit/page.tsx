@@ -24,15 +24,15 @@ export const dynamic = 'force-dynamic';
  * columns.
  */
 export default async function AuditTrailPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
-  const model = one(params, 'model');
+  const model = await one(params, 'model');
 
-  const rows = auditRecent(s.orgId, 300)
+  const rows = (await auditRecent(s.orgId, 300))
     .filter((r) => !model || r.model === model);
 
   // The models actually present, so the filter never offers an empty result.
-  const models = [...new Set(auditRecent(s.orgId, 300).map((r) => r.model))].sort();
+  const models = [...new Set((await auditRecent(s.orgId, 300)).map((r) => r.model))].sort();
 
   return (
     <>

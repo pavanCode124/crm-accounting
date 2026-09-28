@@ -13,13 +13,13 @@ export const dynamic = 'force-dynamic';
  * reconciliation itself.
  */
 export default async function BankBookPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
   const range = resolveRange(
-    { range: one(params, 'range'), from: one(params, 'from'), to: one(params, 'to') }, s.fyStartMonth,
+    { range: await one(params, 'range'), from: await one(params, 'from'), to: await one(params, 'to') }, s.fyStartMonth,
   );
   return (
     <CashBookView orgId={s.orgId} range={range} isCash={false}
-      selected={one(params, 'account')} basePath="/reports/bank-book" />
+      selected={await one(params, 'account')} basePath="/reports/bank-book" />
   );
 }

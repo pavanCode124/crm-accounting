@@ -36,22 +36,22 @@ export const dynamic = 'force-dynamic';
  * glance: the totals, the trend, what is overdue, and what is due next.
  */
 export default async function OverviewPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
   const range = resolveRange(
-    { range: one(params, 'range'), from: one(params, 'from'), to: one(params, 'to') },
+    { range: await one(params, 'range'), from: await one(params, 'from'), to: await one(params, 'to') },
     s.fyStartMonth,
   );
 
-  const kpi = dashboard(s.orgId, range);
-  const series = monthlySeries(s.orgId, range);
+  const kpi = await dashboard(s.orgId, range);
+  const series = await monthlySeries(s.orgId, range);
   const today = isoDate();
-  const overdue = listDocs(s.orgId, { docType: 'out_invoice', overdueOn: today, limit: 6 });
-  const duePayables = listDocs(s.orgId, { docType: 'in_invoice', state: 'posted', limit: 40 })
+  const overdue = await listDocs(s.orgId, { docType: 'out_invoice', overdueOn: today, limit: 6 });
+  const duePayables = (await listDocs(s.orgId, { docType: 'in_invoice', state: 'posted', limit: 40 }))
     .filter((d) => d.residual > 0)
     .sort((a, b) => (a.due_date ?? '').localeCompare(b.due_date ?? ''))
     .slice(0, 6);
-  const proof = ledgerTotals(s.orgId);
+  const proof = await ledgerTotals(s.orgId);
 
   const peak = Math.max(1, ...series.map((m) => Math.max(m.revenue, m.expense)));
 

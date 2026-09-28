@@ -1,5 +1,5 @@
 import 'server-only';
-import { db, all, one, run, scalar, tx, id, nowIso } from './db';
+import { exec, all, one, run, scalar, tx, id, nowIso } from './db';
 import { isoDate, addDays, fiscalYearOf } from '@/lib/accounting';
 import { setSetting } from './accounting/settings';
 import { createFiscalYear, postOpeningBalances } from './accounting/periods';
@@ -30,50 +30,79 @@ import { allocate } from './accounting/payments';
 
 const DEMO = process.env.TRIPZO_SEED_DEMO !== '0';
 
-export function isSeeded(): boolean {
-  return scalar('SELECT COUNT(*) FROM organizations') > 0;
+export async function isSeeded(): Promise<boolean> {
+  return await scalar('SELECT COUNT(*) FROM organizations') > 0;
 }
 
-export function ensureSeeded() {
-  if (!isSeeded()) seed();
+declare global {
+  // eslint-disable-next-line no-var
+  var __tripzoSeeding: Promise<void> | undefined;
 }
 
-export function resetAndSeed() {
+/**
+ * Seed once, however many callers ask at once.
+ *
+ * ONE REQUEST ASKS TWICE. The root layout resolves `ctx()` for the masthead and
+ * the page resolves it for its own data, and React renders them concurrently —
+ * so on a cold start both reached `isSeeded()` before either had written
+ * anything, both saw an empty ledger, and the second `seed()` died on a
+ * duplicate `organizations` row. The whole first page load 500s, and only the
+ * first one, which is exactly the kind of failure that gets waved off as a
+ * fluke. Memoising the PROMISE — not the result — makes the second caller wait
+ * for the first instead of repeating it.
+ *
+ * This covers concurrency inside one process, which is where the bug was. Two
+ * server instances cold-starting against the same empty schema would still
+ * race; the loser fails its first request and succeeds on the retry, because
+ * the insert conflicts rather than duplicating. A shared advisory lock is the
+ * fix if that ever stops being acceptable.
+ */
+export async function ensureSeeded() {
+  return (globalThis.__tripzoSeeding ??= (async () => {
+    if (!await isSeeded()) await seed();
+  })().catch((err) => {
+    // A failed seed must not be remembered as done, or every later request in
+    // this process reports missing data instead of the real cause.
+    globalThis.__tripzoSeeding = undefined;
+    throw err;
+  }));
+}
+
+export async function resetAndSeed() {
   /*
-   * Foreign keys are turned OFF for the wipe and back on straight afterwards.
+   * One TRUNCATE over every table at once.
    *
-   * The tables are deleted in whatever order sqlite_master lists them, which
-   * is almost never a valid topological order — clearing `accounts` while
+   * The tables come back from the catalog in no particular order, which is
+   * almost never a valid topological order — clearing `accounts` while
    * `journal_entry_lines` still references it fails the constraint and leaves
-   * the database half-wiped. Ordering the deletes by hand would be a second
-   * copy of the schema's dependency graph to keep in step, so the constraint
-   * is suspended for the one operation whose whole point is to leave nothing
-   * behind for it to protect.
+   * the database half-wiped. Naming them all in a single statement makes the
+   * order irrelevant, and CASCADE covers anything reached from them; RESTART
+   * IDENTITY resets the audit log's sequence so a reset set of books does not
+   * start at row 4,000.
    *
-   * The pragma cannot change inside a transaction, hence the toggle outside it.
+   * SCOPED TO OUR SCHEMA, deliberately and non-negotiably. This database also
+   * holds the CRM's own tables, and a wipe that reached them would destroy the
+   * agency's leads and invoices. `table_schema = current_schema()` is what
+   * keeps this button survivable — see the schema note in db.ts.
    */
-  db.exec('PRAGMA foreign_keys = OFF');
-  try {
-    tx(() => {
-      for (const t of all<{ name: string }>(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-      )) {
-        db.exec(`DELETE FROM ${t.name}`);
-      }
-    });
-  } finally {
-    db.exec('PRAGMA foreign_keys = ON');
+  const tables = await all<{ table_name: string }>(
+    `SELECT table_name FROM information_schema.tables
+      WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'`,
+  );
+  if (tables.length) {
+    const list = tables.map((t) => `"${t.table_name.replace(/"/g, '""')}"`).join(', ');
+    await exec(`TRUNCATE TABLE ${list} RESTART IDENTITY CASCADE`);
   }
-  seed();
+  await seed();
 }
 
-export function seed() {
+export async function seed() {
   const orgId = 'org_wander';
   const today = isoDate();
 
-  tx(() => {
+  await tx(async () => {
     // ----------------------------------------------------------- the agency
-    run(
+    await run(
       `INSERT INTO organizations (id, name, currency, country, gstin, pan, fy_start_month, address, created_at)
        VALUES (?,?,?,?,?,?,?,?,?)`,
       orgId, 'Wander Travels', 'INR', 'IN', '36AABCW1234F1Z5', 'AABCW1234F', 4,
@@ -87,7 +116,7 @@ export function seed() {
       ['usr_dev', 'Dev', 'dev@tripzo.cloud', 'developer'],
     ];
     for (const [uid, name, email, role] of users) {
-      run('INSERT INTO users (id, org_id, name, email, role, active) VALUES (?,?,?,?,?,1)',
+      await run('INSERT INTO users (id, org_id, name, email, role, active) VALUES (?,?,?,?,?,1)',
         uid, orgId, name, email, role);
     }
 
@@ -95,12 +124,12 @@ export function seed() {
       ['INR', 'Indian Rupee', '₹'], ['USD', 'US Dollar', '$'],
       ['AED', 'UAE Dirham', 'د.إ'], ['EUR', 'Euro', '€'], ['THB', 'Thai Baht', '฿'],
     ]) {
-      run('INSERT OR IGNORE INTO currencies (code, name, symbol, decimals) VALUES (?,?,?,2)', code, name, symbol);
+      await run('INSERT INTO currencies (code, name, symbol, decimals) VALUES (?,?,?,2) ON CONFLICT DO NOTHING', code, name, symbol);
     }
     // Rates as at today. A real deployment refreshes these daily; what matters
     // architecturally is that a rate is a DATED row, not a constant.
     for (const [code, rate] of [['USD', 84.25], ['AED', 22.94], ['EUR', 91.10], ['THB', 2.42]] as const) {
-      run('INSERT OR IGNORE INTO exchange_rates (org_id, code, on_date, rate_e6) VALUES (?,?,?,?)',
+      await run('INSERT INTO exchange_rates (org_id, code, on_date, rate_e6) VALUES (?,?,?,?) ON CONFLICT DO NOTHING',
         orgId, code, today, Math.round(rate * 1_000_000));
     }
 
@@ -173,7 +202,7 @@ export function seed() {
       ['609000', 'Depreciation', 'expense_depreciation'],
     ];
     for (const [code, name, kind, reconcilable] of chart) {
-      acc[code] = upsertAccount(orgId, { code, name, kind, reconcilable });
+      acc[code] = await upsertAccount(orgId, { code, name, kind, reconcilable });
     }
 
     // ---------------------------------------------------------- journals
@@ -190,7 +219,7 @@ export function seed() {
       ['MSC', 'Miscellaneous', 'general', null],
     ];
     for (const [code, name, type, account] of journals) {
-      jrn[code] = upsertJournal(orgId, { code, name, type, defaultAccountId: account });
+      jrn[code] = await upsertJournal(orgId, { code, name, type, defaultAccountId: account });
     }
 
     // Bank accounts, which are what the Banking screen actually lists.
@@ -200,16 +229,16 @@ export function seed() {
       ['bnk_cash', 'Petty Cash', '', '', acc['100000'], 1],
     ];
     for (const [bid, name, bank, no, accountId, isCash] of bankAccounts) {
-      run(
+      await run(
         `INSERT INTO bank_accounts (id, org_id, name, bank_name, account_no, ifsc, currency, is_cash, account_id, journal_id, active)
          VALUES (?,?,?,?,?,?, 'INR', ?,?,?,1)`,
         bid, orgId, name, bank || null, no || null, bank ? 'HDFC0000123' : null,
         isCash, accountId, isCash ? jrn.CSH : bid === 'bnk_hdfc' ? jrn.BNK : jrn.COL,
       );
     }
-    run('UPDATE journals SET bank_account_id=? WHERE id=?', 'bnk_hdfc', jrn.BNK);
-    run('UPDATE journals SET bank_account_id=? WHERE id=?', 'bnk_icici', jrn.COL);
-    run('UPDATE journals SET bank_account_id=? WHERE id=?', 'bnk_cash', jrn.CSH);
+    await run('UPDATE journals SET bank_account_id=? WHERE id=?', 'bnk_hdfc', jrn.BNK);
+    await run('UPDATE journals SET bank_account_id=? WHERE id=?', 'bnk_icici', jrn.COL);
+    await run('UPDATE journals SET bank_account_id=? WHERE id=?', 'bnk_cash', jrn.CSH);
 
     // ------------------------------------------------------- payment terms
     const terms: Array<[string, string, number]> = [
@@ -220,7 +249,7 @@ export function seed() {
       ['pt_45', '45 days', 45],
     ];
     for (const [tid, name, days] of terms) {
-      run('INSERT INTO payment_terms (id, org_id, name, days) VALUES (?,?,?,?)', tid, orgId, name, days);
+      await run('INSERT INTO payment_terms (id, org_id, name, days) VALUES (?,?,?,?)', tid, orgId, name, days);
     }
 
     // --------------------------------------------------------------- taxes
@@ -235,7 +264,7 @@ export function seed() {
     for (const [name, bps, scope] of gstPairs) {
       const parentId = id('tax');
       const sale = scope === 'sale';
-      run(
+      await run(
         `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
                             price_included, account_id, active)
          VALUES (?,?,?,'percent',?,?,'cgst_sgst',0,NULL,1)`,
@@ -246,20 +275,20 @@ export function seed() {
         ['SGST', sale ? acc['210100'] : acc['170100']],
       ] as const) {
         const childId = id('tax');
-        run(
+        await run(
           `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
                               price_included, account_id, active)
            VALUES (?,?,?,'percent',?,?,'gst',0,?,1)`,
           childId, orgId, `${half} ${(bps / 200).toFixed(bps % 200 ? 1 : 0)}%`, bps / 2, scope, account,
         );
-        run('INSERT INTO tax_children (parent_id, child_id) VALUES (?,?)', parentId, childId);
+        await run('INSERT INTO tax_children (parent_id, child_id) VALUES (?,?)', parentId, childId);
       }
       tax[`${scope}_${bps}`] = parentId;
     }
     // Interstate and overseas supply: one 18% IGST line, no split.
     for (const scope of ['sale', 'purchase'] as const) {
       const igstId = id('tax');
-      run(
+      await run(
         `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
                             price_included, account_id, active)
          VALUES (?,?,?,'percent',1800,?,'igst',0,?,1)`,
@@ -277,7 +306,7 @@ export function seed() {
     ];
     for (const [name, bps, threshold] of tdsRows) {
       const tid = id('tax');
-      run(
+      await run(
         `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
                             price_included, account_id, threshold, active)
          VALUES (?,?,?,'percent',?,'purchase','tds',0,?,?,1)`,
@@ -295,13 +324,13 @@ export function seed() {
     ];
     for (const [code, name, members] of plans) {
       const planId = id('plan');
-      run('INSERT INTO analytic_plans (id, org_id, name, code) VALUES (?,?,?,?)', planId, orgId, name, code);
-      members.forEach((m, i) => {
-        run(
+      await run('INSERT INTO analytic_plans (id, org_id, name, code) VALUES (?,?,?,?)', planId, orgId, name, code);
+      for (const [i, m] of members.entries()) {
+        await run(
           'INSERT INTO analytic_accounts (id, org_id, plan_id, code, name, active) VALUES (?,?,?,?,?,1)',
           id('ana'), orgId, planId, `${code}-${i + 1}`, m,
         );
-      });
+      }
     }
 
     // ---------------------------------------------------- default accounts
@@ -336,7 +365,7 @@ export function seed() {
       ['journal.expense', jrn.EXP],
       ['journal.asset', jrn.MSC],
     ];
-    for (const [key, value] of settings) setSetting(orgId, key, value);
+    for (const [key, value] of settings) await setSetting(orgId, key, value);
 
     // ------------------------------------------------------------ products
     const products: Array<[string, string, number, number, string, string]> = [
@@ -351,7 +380,7 @@ export function seed() {
       ['Service Fee', 'fee', 2_500_00, 0, acc['406000'], acc['505000']],
     ];
     for (const [name, category, sale, cost, income, expense] of products) {
-      upsertProduct(orgId, {
+      await upsertProduct(orgId, {
         name, category, salePrice: sale, costPrice: cost,
         incomeAccountId: income, expenseAccountId: expense,
         saleTaxId: tax.sale_500, purchaseTaxId: tax.purchase_1800,
@@ -360,10 +389,10 @@ export function seed() {
 
     // ------------------------------------------------------- fiscal periods
     const fy = fiscalYearOf(today, 4);
-    createFiscalYear(orgId, fy.from);
+    await createFiscalYear(orgId, fy.from);
   });
 
-  if (DEMO) seedDemo(orgId);
+  if (DEMO) await seedDemo(orgId);
 }
 
 /**
@@ -374,34 +403,34 @@ export function seed() {
  * advance, invoice, partial payment, supplier bill with TDS, cancellation and
  * credit note, employee expense, depreciation, commission, FX purchase.
  */
-function seedDemo(orgId: string) {
+async function seedDemo(orgId: string) {
   const actor = { id: 'usr_admin', name: 'Admin User', role: 'admin' };
   const today = isoDate();
-  const acc = (code: string) =>
-    one<{ id: string }>('SELECT id FROM accounts WHERE org_id=? AND code=?', orgId, code)!.id;
-  const jrn = (code: string) =>
-    one<{ id: string }>('SELECT id FROM journals WHERE org_id=? AND code=?', orgId, code)!.id;
+  const acc = async (code: string) =>
+    (await one<{ id: string }>('SELECT id FROM accounts WHERE org_id=? AND code=?', orgId, code))!.id;
+  const jrn = async (code: string) =>
+    (await one<{ id: string }>('SELECT id FROM journals WHERE org_id=? AND code=?', orgId, code))!.id;
   // Taxes are looked up by the name the seed gave them. Matching on the name
   // rather than on a hard-coded id keeps the demo readable and survives an
   // agency renaming its own tax rows.
-  const taxId = (name: string) =>
-    one<{ id: string }>(
+  const taxId = async (name: string) =>
+    (await one<{ id: string }>(
       `SELECT id FROM taxes WHERE org_id=? AND name LIKE ?
          AND id NOT IN (SELECT child_id FROM tax_children)`,
       orgId, name,
-    )?.id ?? null;
+    ))?.id ?? null;
   const fy = fiscalYearOf(today, 4);
   const d = (offset: number) => addDays(today, offset);
 
   // ------------------------------------------------------- opening balances
-  postOpeningBalances(orgId, {
+  await postOpeningBalances(orgId, {
     date: fy.from,
     lines: [
-      { accountId: acc('101000'), debit: 18_50_000_00, credit: 0, label: 'HDFC opening' },
-      { accountId: acc('100000'), debit: 45_000_00, credit: 0, label: 'Cash opening' },
-      { accountId: acc('150000'), debit: 4_20_000_00, credit: 0, label: 'Office equipment' },
-      { accountId: acc('300000'), debit: 0, credit: 20_00_000_00, label: 'Owner capital' },
-      { accountId: acc('310000'), debit: 0, credit: 3_15_000_00, label: 'Retained earnings' },
+      { accountId: await acc('101000'), debit: 18_50_000_00, credit: 0, label: 'HDFC opening' },
+      { accountId: await acc('100000'), debit: 45_000_00, credit: 0, label: 'Cash opening' },
+      { accountId: await acc('150000'), debit: 4_20_000_00, credit: 0, label: 'Office equipment' },
+      { accountId: await acc('300000'), debit: 0, credit: 20_00_000_00, label: 'Owner capital' },
+      { accountId: await acc('310000'), debit: 0, credit: 3_15_000_00, label: 'Retained earnings' },
     ],
   }, actor);
 
@@ -415,7 +444,7 @@ function seedDemo(orgId: string) {
   ];
   const cust: Record<string, string> = {};
   for (const [name, type, email, phone, limit] of customers) {
-    cust[name] = upsertPartner(orgId, {
+    cust[name] = await upsertPartner(orgId, {
       name, isCustomer: true, partnerType: type, email, phone,
       creditLimit: limit, paymentTermsId: limit ? 'pt_30' : 'pt_imm',
       gstin: type === 'b2b' ? '29AAACI1681G1ZR' : null,
@@ -432,7 +461,7 @@ function seedDemo(orgId: string) {
   ];
   const supp: Record<string, string> = {};
   for (const [name, note, tds] of suppliers) {
-    supp[name] = upsertPartner(orgId, {
+    supp[name] = await upsertPartner(orgId, {
       name, isSupplier: true, partnerType: 'b2b', address: note,
       tdsSection: tds, paymentTermsId: 'pt_15',
     }, actor);
@@ -448,81 +477,81 @@ function seedDemo(orgId: string) {
   ];
   const bkg: Record<string, string> = {};
   for (const [ref, title, dest, pkg, customer, agent, pax, offset, value] of bookings) {
-    bkg[ref] = createBooking(orgId, {
+    bkg[ref] = await createBooking(orgId, {
       ref, title, destination: dest, packageName: pkg,
       partnerId: cust[customer], agentName: agent, branch: 'Hyderabad',
       pax, startDate: d(offset), endDate: d(offset + 5), sellValue: value,
     }, actor);
   }
-  const analyticOf = (bookingId: string) =>
-    one<{ analytic_id: string }>('SELECT analytic_id FROM bookings WHERE id=?', bookingId)!.analytic_id;
+  const analyticOf = async (bookingId: string) =>
+    (await one<{ analytic_id: string }>('SELECT analytic_id FROM bookings WHERE id=?', bookingId))!.analytic_id;
 
-  const gstSale5 = taxId('GST 5% (Sales)');
-  const gstSale18 = taxId('GST 18% (Sales)');
-  const gstPur18 = taxId('GST 18% (Purchase)');
-  const gstPur5 = taxId('GST 5% (Purchase)');
-  const tds194c = taxId('TDS 194C%');
+  const gstSale5 = await taxId('GST 5% (Sales)');
+  const gstSale18 = await taxId('GST 18% (Sales)');
+  const gstPur18 = await taxId('GST 18% (Purchase)');
+  const gstPur5 = await taxId('GST 5% (Purchase)');
+  const tds194c = await taxId('TDS 194C%');
 
   // ------------------------------------------------ BK-1023: the full cycle
   // Advance first, as travel actually works: money before the invoice exists.
-  const advance = createPayment({
+  const advance = await createPayment({
     orgId, direction: 'inbound', partnerId: cust['Rahul Mehta'],
-    journalId: jrn('COL'), bankAccountId: 'bnk_icici', bookingId: bkg['BK-1023'],
+    journalId: await jrn('COL'), bankAccountId: 'bnk_icici', bookingId: bkg['BK-1023'],
     payDate: d(-160), amount: 50_000_00, method: 'upi', reference: 'UPI/4412093',
     isAdvance: true,
   }, actor);
 
-  const inv1023 = createDocument({
+  const inv1023 = await createDocument({
     orgId, docType: 'out_invoice', partnerId: cust['Rahul Mehta'],
-    journalId: jrn('SAL'), bookingId: bkg['BK-1023'], analyticId: analyticOf(bkg['BK-1023']),
+    journalId: await jrn('SAL'), bookingId: bkg['BK-1023'], analyticId: await analyticOf(bkg['BK-1023']),
     docDate: d(-150), paymentTermsId: 'pt_15',
     lines: [
-      { name: 'Bali 5D/4N Package — 2 pax', qtyMilli: 1000, unitPrice: 1_50_000_00, accountId: acc('400000'), taxId: gstSale5 },
-      { name: 'Visa Services', qtyMilli: 2000, unitPrice: 5_000_00, accountId: acc('403000'), taxId: gstSale18 },
-      { name: 'Airport Transfer', qtyMilli: 1000, unitPrice: 5_000_00, accountId: acc('404000'), taxId: gstSale5 },
+      { name: 'Bali 5D/4N Package — 2 pax', qtyMilli: 1000, unitPrice: 1_50_000_00, accountId: await acc('400000'), taxId: gstSale5 },
+      { name: 'Visa Services', qtyMilli: 2000, unitPrice: 5_000_00, accountId: await acc('403000'), taxId: gstSale18 },
+      { name: 'Airport Transfer', qtyMilli: 1000, unitPrice: 5_000_00, accountId: await acc('404000'), taxId: gstSale5 },
     ],
   }, actor);
-  postDocument(orgId, inv1023, actor);
+  await postDocument(orgId, inv1023, actor);
 
   // The advance is applied, then the balance arrives in two instalments.
-  const invTotal = one<{ total: number }>('SELECT total FROM documents WHERE id=?', inv1023)!.total;
-  applyAdvance(orgId, advance, inv1023, 50_000_00, actor);
-  createPayment({
-    orgId, direction: 'inbound', partnerId: cust['Rahul Mehta'], journalId: jrn('BNK'),
+  const invTotal = (await one<{ total: number }>('SELECT total FROM documents WHERE id=?', inv1023))!.total;
+  await applyAdvance(orgId, advance, inv1023, 50_000_00, actor);
+  await createPayment({
+    orgId, direction: 'inbound', partnerId: cust['Rahul Mehta'], journalId: await jrn('BNK'),
     bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1023'], payDate: d(-140),
     amount: 90_000_00, method: 'neft', reference: 'NEFT/HDFC/88231',
     allocations: [{ documentId: inv1023, amount: 90_000_00 }],
   }, actor);
-  createPayment({
-    orgId, direction: 'inbound', partnerId: cust['Rahul Mehta'], journalId: jrn('BNK'),
+  await createPayment({
+    orgId, direction: 'inbound', partnerId: cust['Rahul Mehta'], journalId: await jrn('BNK'),
     bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1023'], payDate: d(-132),
     amount: Math.min(40_000_00, invTotal - 1_40_000_00), method: 'upi', reference: 'UPI/5590231',
     allocations: [{ documentId: inv1023, amount: Math.min(40_000_00, invTotal - 1_40_000_00) }],
   }, actor);
 
   // Supplier side of the same trip.
-  const billHotel = createDocument({
+  const billHotel = await createDocument({
     orgId, docType: 'in_invoice', partnerId: supp['Taj Resorts Bali'],
-    journalId: jrn('PUR'), bookingId: bkg['BK-1023'], analyticId: analyticOf(bkg['BK-1023']),
+    journalId: await jrn('PUR'), bookingId: bkg['BK-1023'], analyticId: await analyticOf(bkg['BK-1023']),
     docDate: d(-148), supplierRef: 'TRB/2026/4471', paymentTermsId: 'pt_15',
-    lines: [{ name: 'Bali — 4 nights, deluxe twin', qtyMilli: 1000, unitPrice: 80_000_00, accountId: acc('500000') }],
+    lines: [{ name: 'Bali — 4 nights, deluxe twin', qtyMilli: 1000, unitPrice: 80_000_00, accountId: await acc('500000') }],
   }, actor);
-  postDocument(orgId, billHotel, actor);
+  await postDocument(orgId, billHotel, actor);
 
-  const billFlight = createDocument({
+  const billFlight = await createDocument({
     orgId, docType: 'in_invoice', partnerId: supp['SkyWings Air Consolidator'],
-    journalId: jrn('PUR'), bookingId: bkg['BK-1023'], analyticId: analyticOf(bkg['BK-1023']),
+    journalId: await jrn('PUR'), bookingId: bkg['BK-1023'], analyticId: await analyticOf(bkg['BK-1023']),
     docDate: d(-147), supplierRef: 'SW-99211', paymentTermsId: 'pt_7',
     withholdingTaxId: tds194c,
-    lines: [{ name: 'HYD–DPS return, 2 pax', qtyMilli: 1000, unitPrice: 60_000_00, accountId: acc('501000') }],
+    lines: [{ name: 'HYD–DPS return, 2 pax', qtyMilli: 1000, unitPrice: 60_000_00, accountId: await acc('501000') }],
   }, actor);
-  postDocument(orgId, billFlight, actor);
+  await postDocument(orgId, billFlight, actor);
 
   for (const [billId, amount, date] of [[billHotel, 80_000_00, d(-135)], [billFlight, 58_800_00, d(-140)]] as const) {
-    const residual = one<{ residual: number }>('SELECT residual FROM documents WHERE id=?', billId)!.residual;
-    const partner = one<{ partner_id: string }>('SELECT partner_id FROM documents WHERE id=?', billId)!.partner_id;
-    createPayment({
-      orgId, direction: 'outbound', partnerId: partner, journalId: jrn('BNK'),
+    const residual = (await one<{ residual: number }>('SELECT residual FROM documents WHERE id=?', billId))!.residual;
+    const partner = (await one<{ partner_id: string }>('SELECT partner_id FROM documents WHERE id=?', billId))!.partner_id;
+    await createPayment({
+      orgId, direction: 'outbound', partnerId: partner, journalId: await jrn('BNK'),
       bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1023'], payDate: date,
       amount: Math.min(amount, residual), method: 'neft',
       allocations: [{ documentId: billId, amount: Math.min(amount, residual) }],
@@ -530,72 +559,72 @@ function seedDemo(orgId: string) {
   }
 
   // Trip extras that never see a vendor bill: a guide paid in cash.
-  const guideExpense = createExpense({
+  const guideExpense = await createExpense({
     orgId, employeeName: 'Sai Kiran', description: 'Local guide — Bali day 3',
-    expenseDate: d(-138), amount: 10_000_00, accountId: acc('506000'),
-    analyticId: analyticOf(bkg['BK-1023']), bookingId: bkg['BK-1023'],
-    paidBy: 'employee', journalId: jrn('EXP'),
+    expenseDate: d(-138), amount: 10_000_00, accountId: await acc('506000'),
+    analyticId: await analyticOf(bkg['BK-1023']), bookingId: bkg['BK-1023'],
+    paidBy: 'employee', journalId: await jrn('EXP'),
   }, actor);
-  approveExpense(orgId, guideExpense, actor);
+  await approveExpense(orgId, guideExpense, actor);
 
   // ---------------------------------------------- BK-1024: Goa, cancelled
-  const inv1024 = createDocument({
+  const inv1024 = await createDocument({
     orgId, docType: 'out_invoice', partnerId: cust['Sneha Reddy'],
-    journalId: jrn('SAL'), bookingId: bkg['BK-1024'], analyticId: analyticOf(bkg['BK-1024']),
+    journalId: await jrn('SAL'), bookingId: bkg['BK-1024'], analyticId: await analyticOf(bkg['BK-1024']),
     docDate: d(-100), paymentTermsId: 'pt_imm',
     lines: [
-      { name: 'Goa Weekend — 4 pax', qtyMilli: 4000, unitPrice: 32_000_00, accountId: acc('400000'), taxId: gstSale5 },
+      { name: 'Goa Weekend — 4 pax', qtyMilli: 4000, unitPrice: 32_000_00, accountId: await acc('400000'), taxId: gstSale5 },
     ],
   }, actor);
-  postDocument(orgId, inv1024, actor);
-  createPayment({
-    orgId, direction: 'inbound', partnerId: cust['Sneha Reddy'], journalId: jrn('COL'),
+  await postDocument(orgId, inv1024, actor);
+  await createPayment({
+    orgId, direction: 'inbound', partnerId: cust['Sneha Reddy'], journalId: await jrn('COL'),
     bankAccountId: 'bnk_icici', bookingId: bkg['BK-1024'], payDate: d(-99),
     amount: 1_34_400_00, method: 'card', reference: 'CARD/4411',
     allocations: [{ documentId: inv1024, amount: 1_34_400_00 }],
   }, actor);
-  const billCabs = createDocument({
+  const billCabs = await createDocument({
     orgId, docType: 'in_invoice', partnerId: supp['Coastal Cabs Goa'],
-    journalId: jrn('PUR'), bookingId: bkg['BK-1024'], analyticId: analyticOf(bkg['BK-1024']),
+    journalId: await jrn('PUR'), bookingId: bkg['BK-1024'], analyticId: await analyticOf(bkg['BK-1024']),
     docDate: d(-98), supplierRef: 'CC-3321',
-    lines: [{ name: 'Airport transfers + sightseeing', qtyMilli: 1000, unitPrice: 18_000_00, accountId: acc('502000'), taxId: gstPur5 }],
+    lines: [{ name: 'Airport transfers + sightseeing', qtyMilli: 1000, unitPrice: 18_000_00, accountId: await acc('502000'), taxId: gstPur5 }],
   }, actor);
-  postDocument(orgId, billCabs, actor);
+  await postDocument(orgId, billCabs, actor);
 
   // Cancelled trip: 70% retained as a cancellation charge, 30% credited back.
-  const cn = createCreditNote(orgId, inv1024, {
+  const cn = await createCreditNote(orgId, inv1024, {
     date: d(-90), bps: 3000, reason: 'Customer cancellation — 70% retained',
   }, actor);
-  postDocument(orgId, cn, actor);
-  const cnResidual = one<{ residual: number }>('SELECT residual FROM documents WHERE id=?', cn)!.residual;
-  const invResidual = one<{ residual: number }>('SELECT residual FROM documents WHERE id=?', inv1024)!.residual;
+  await postDocument(orgId, cn, actor);
+  const cnResidual = (await one<{ residual: number }>('SELECT residual FROM documents WHERE id=?', cn))!.residual;
+  const invResidual = (await one<{ residual: number }>('SELECT residual FROM documents WHERE id=?', inv1024))!.residual;
   if (cnResidual > 0 && invResidual > 0) {
-    applyCreditNote(orgId, cn, inv1024, Math.min(cnResidual, invResidual), actor);
+    await applyCreditNote(orgId, cn, inv1024, Math.min(cnResidual, invResidual), actor);
   } else if (cnResidual > 0) {
     // Already fully paid, so the credit is refunded rather than netted off.
-    createPayment({
+    await createPayment({
       orgId, direction: 'outbound', side: 'customer',
-      partnerId: cust['Sneha Reddy'], journalId: jrn('COL'),
+      partnerId: cust['Sneha Reddy'], journalId: await jrn('COL'),
       bankAccountId: 'bnk_icici', bookingId: bkg['BK-1024'], payDate: d(-88),
       amount: cnResidual, method: 'neft', reference: 'Refund — cancellation',
       allocations: [{ documentId: cn, amount: cnResidual }],
     }, actor);
   }
-  run("UPDATE bookings SET status='cancelled' WHERE id=?", bkg['BK-1024']);
+  await run("UPDATE bookings SET status='cancelled' WHERE id=?", bkg['BK-1024']);
 
   // ------------------------------------- BK-1025: corporate, part paid, FX
-  const inv1025 = createDocument({
+  const inv1025 = await createDocument({
     orgId, docType: 'out_invoice', partnerId: cust['Infosys Travel Desk'],
-    journalId: jrn('SAL'), bookingId: bkg['BK-1025'], analyticId: analyticOf(bkg['BK-1025']),
+    journalId: await jrn('SAL'), bookingId: bkg['BK-1025'], analyticId: await analyticOf(bkg['BK-1025']),
     docDate: d(-58), paymentTermsId: 'pt_30',
     lines: [
-      { name: 'Dubai 4D/3N — 12 pax', qtyMilli: 12000, unitPrice: 95_000_00, accountId: acc('400000'), taxId: gstSale5 },
-      { name: 'Corporate service fee', qtyMilli: 1000, unitPrice: 25_000_00, accountId: acc('406000'), taxId: gstSale18 },
+      { name: 'Dubai 4D/3N — 12 pax', qtyMilli: 12000, unitPrice: 95_000_00, accountId: await acc('400000'), taxId: gstSale5 },
+      { name: 'Corporate service fee', qtyMilli: 1000, unitPrice: 25_000_00, accountId: await acc('406000'), taxId: gstSale18 },
     ],
   }, actor);
-  postDocument(orgId, inv1025, actor);
-  createPayment({
-    orgId, direction: 'inbound', partnerId: cust['Infosys Travel Desk'], journalId: jrn('BNK'),
+  await postDocument(orgId, inv1025, actor);
+  await createPayment({
+    orgId, direction: 'inbound', partnerId: cust['Infosys Travel Desk'], journalId: await jrn('BNK'),
     bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1025'], payDate: d(-40),
     amount: 8_00_000_00, method: 'neft', reference: 'INFY/PO/88213',
     allocations: [{ documentId: inv1025, amount: 8_00_000_00 }],
@@ -603,48 +632,48 @@ function seedDemo(orgId: string) {
 
   // A foreign-currency purchase: AED 30,000 for the ground handler, booked in
   // rupees at the day's rate with the face value kept for the audit trail.
-  const billDmc = createDocument({
+  const billDmc = await createDocument({
     orgId, docType: 'in_invoice', partnerId: supp['Dubai DMC Services'],
-    journalId: jrn('PUR'), bookingId: bkg['BK-1025'], analyticId: analyticOf(bkg['BK-1025']),
+    journalId: await jrn('PUR'), bookingId: bkg['BK-1025'], analyticId: await analyticOf(bkg['BK-1025']),
     docDate: d(-55), supplierRef: 'DMC/26/1187', currency: 'AED', rateE6: 22_940_000,
-    lines: [{ name: 'Dubai ground handling — 12 pax (AED 30,000)', qtyMilli: 1000, unitPrice: 6_88_200_00, accountId: acc('505000') }],
+    lines: [{ name: 'Dubai ground handling — 12 pax (AED 30,000)', qtyMilli: 1000, unitPrice: 6_88_200_00, accountId: await acc('505000') }],
   }, actor);
-  postDocument(orgId, billDmc, actor);
-  createPayment({
-    orgId, direction: 'outbound', partnerId: supp['Dubai DMC Services'], journalId: jrn('BNK'),
+  await postDocument(orgId, billDmc, actor);
+  await createPayment({
+    orgId, direction: 'outbound', partnerId: supp['Dubai DMC Services'], journalId: await jrn('BNK'),
     bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1025'], payDate: d(-45),
     amount: 4_00_000_00, method: 'neft', reference: 'SWIFT/AED',
     allocations: [{ documentId: billDmc, amount: 4_00_000_00 }],
   }, actor);
 
   // --------------------------------------------- BK-1026: awaiting payment
-  const inv1026 = createDocument({
+  const inv1026 = await createDocument({
     orgId, docType: 'out_invoice', partnerId: cust['Arun Prakash'],
-    journalId: jrn('SAL'), bookingId: bkg['BK-1026'], analyticId: analyticOf(bkg['BK-1026']),
+    journalId: await jrn('SAL'), bookingId: bkg['BK-1026'], analyticId: await analyticOf(bkg['BK-1026']),
     docDate: d(-30), paymentTermsId: 'pt_15',
     lines: [
-      { name: 'Singapore 6D — 3 pax', qtyMilli: 3000, unitPrice: 1_05_000_00, accountId: acc('400000'), taxId: gstSale5 },
-      { name: 'Visa Processing — 3 pax', qtyMilli: 3000, unitPrice: 5_000_00, accountId: acc('403000'), taxId: gstSale18 },
+      { name: 'Singapore 6D — 3 pax', qtyMilli: 3000, unitPrice: 1_05_000_00, accountId: await acc('400000'), taxId: gstSale5 },
+      { name: 'Visa Processing — 3 pax', qtyMilli: 3000, unitPrice: 5_000_00, accountId: await acc('403000'), taxId: gstSale18 },
     ],
   }, actor);
-  postDocument(orgId, inv1026, actor);
-  const billVisa = createDocument({
+  await postDocument(orgId, inv1026, actor);
+  const billVisa = await createDocument({
     orgId, docType: 'in_invoice', partnerId: supp['VisaExpress Pvt Ltd'],
-    journalId: jrn('PUR'), bookingId: bkg['BK-1026'], analyticId: analyticOf(bkg['BK-1026']),
-    docDate: d(-28), supplierRef: 'VE-7781', withholdingTaxId: taxId('TDS 194J%'),
-    lines: [{ name: 'Singapore visas — 3 pax', qtyMilli: 3000, unitPrice: 3_500_00, accountId: acc('503000'), taxId: gstPur18 }],
+    journalId: await jrn('PUR'), bookingId: bkg['BK-1026'], analyticId: await analyticOf(bkg['BK-1026']),
+    docDate: d(-28), supplierRef: 'VE-7781', withholdingTaxId: await taxId('TDS 194J%'),
+    lines: [{ name: 'Singapore visas — 3 pax', qtyMilli: 3000, unitPrice: 3_500_00, accountId: await acc('503000'), taxId: gstPur18 }],
   }, actor);
-  postDocument(orgId, billVisa, actor);
+  await postDocument(orgId, billVisa, actor);
 
   // ------------------------------------------- BK-1027: upcoming, advance
-  createPayment({
+  await createPayment({
     orgId, direction: 'inbound', partnerId: cust['Skyline Holidays (Reseller)'],
-    journalId: jrn('BNK'), bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1027'],
+    journalId: await jrn('BNK'), bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1027'],
     payDate: d(-10), amount: 3_00_000_00, method: 'neft', reference: 'SKY/ADV/2211',
     isAdvance: true,
   }, actor);
-  createPayment({
-    orgId, direction: 'outbound', partnerId: supp['Taj Resorts Bali'], journalId: jrn('BNK'),
+  await createPayment({
+    orgId, direction: 'outbound', partnerId: supp['Taj Resorts Bali'], journalId: await jrn('BNK'),
     bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1027'], payDate: d(-8),
     amount: 1_50_000_00, method: 'neft', reference: 'Advance — Bali Oct block',
     isAdvance: true,
@@ -665,70 +694,70 @@ function seedDemo(orgId: string) {
     ['606000', 'Bank charges', 2_360_00, -15, null],
   ];
   for (const [code, label, amount, offset] of overheads) {
-    postSimple(orgId, {
-      journalId: jrn('BNK'), date: d(offset), label,
-      debitAccount: acc(code), creditAccount: acc('101000'), amount,
+    await postSimple(orgId, {
+      journalId: await jrn('BNK'), date: d(offset), label,
+      debitAccount: await acc(code), creditAccount: await acc('101000'), amount,
     }, actor);
   }
-  const marketingBill = createDocument({
+  const marketingBill = await createDocument({
     orgId, docType: 'in_invoice', partnerId: supp['Bright Media Agency'],
-    journalId: jrn('PUR'), docDate: d(-35), supplierRef: 'BM-2211',
-    withholdingTaxId: taxId('TDS 194J%'),
-    lines: [{ name: 'Instagram campaign — September', qtyMilli: 1000, unitPrice: 1_20_000_00, accountId: acc('602000'), taxId: gstPur18 }],
+    journalId: await jrn('PUR'), docDate: d(-35), supplierRef: 'BM-2211',
+    withholdingTaxId: await taxId('TDS 194J%'),
+    lines: [{ name: 'Instagram campaign — September', qtyMilli: 1000, unitPrice: 1_20_000_00, accountId: await acc('602000'), taxId: gstPur18 }],
   }, actor);
-  postDocument(orgId, marketingBill, actor);
+  await postDocument(orgId, marketingBill, actor);
 
   // --------------------------------------------- assets and deferrals
-  const laptops = createAsset({
+  const laptops = await createAsset({
     orgId, name: 'MacBook Air M4 × 3',
-    assetAccountId: acc('150000'), depreciationAccountId: acc('155000'),
-    expenseAccountId: acc('609000'), journalId: jrn('MSC'),
+    assetAccountId: await acc('150000'), depreciationAccountId: await acc('155000'),
+    expenseAccountId: await acc('609000'), journalId: await jrn('MSC'),
     purchaseDate: fy.from, purchaseValue: 3_60_000_00, salvageValue: 30_000_00,
     method: 'straight_line', lifeMonths: 36,
   }, actor);
-  confirmAsset(orgId, laptops, actor);
-  runDepreciation(orgId, today, actor);
+  await confirmAsset(orgId, laptops, actor);
+  await runDepreciation(orgId, today, actor);
 
-  const insurance = createDeferral({
+  const insurance = await createDeferral({
     orgId, name: 'Office & travel insurance — annual',
-    kind: 'expense', balanceAccountId: acc('140000'), recognitionAccountId: acc('605000'),
-    journalId: jrn('MSC'), amount: 1_20_000_00, dateFrom: fy.from, months: 12,
+    kind: 'expense', balanceAccountId: await acc('140000'), recognitionAccountId: await acc('605000'),
+    journalId: await jrn('MSC'), amount: 1_20_000_00, dateFrom: fy.from, months: 12,
   }, actor);
   // The premium was paid up front, which is what puts it on the prepaid account
   // in the first place.
-  postSimple(orgId, {
-    journalId: jrn('BNK'), date: fy.from, label: 'Annual insurance premium',
-    debitAccount: acc('140000'), creditAccount: acc('101000'), amount: 1_20_000_00,
+  await postSimple(orgId, {
+    journalId: await jrn('BNK'), date: fy.from, label: 'Annual insurance premium',
+    debitAccount: await acc('140000'), creditAccount: await acc('101000'), amount: 1_20_000_00,
   }, actor);
-  runDeferrals(orgId, today, actor);
+  await runDeferrals(orgId, today, actor);
   void insurance;
 
   // ------------------------------------------------------- commissions
   for (const [ref, agent, bps] of [['BK-1023', 'Sai Kiran', 500], ['BK-1025', 'Sai Kiran', 300], ['BK-1026', 'Arjun Das', 500]] as const) {
-    const commissionId = createCommission(orgId, {
+    const commissionId = await createCommission(orgId, {
       agentName: agent, bookingId: bkg[ref], basis: 'revenue', rateBps: bps,
     }, actor);
-    const amount = one<{ amount: number }>('SELECT amount FROM commissions WHERE id=?', commissionId)!.amount;
-    if (amount > 0) postCommission(orgId, commissionId, d(-5), actor);
+    const amount = (await one<{ amount: number }>('SELECT amount FROM commissions WHERE id=?', commissionId))!.amount;
+    if (amount > 0) await postCommission(orgId, commissionId, d(-5), actor);
   }
 
   // ------------------------------------------------------------ budgets
-  createBudget(orgId, {
+  await createBudget(orgId, {
     name: 'FY operating budget', owner: 'Priya Nair',
     dateFrom: fy.from, dateTo: fy.to,
     lines: [
-      { accountId: acc('600000'), planned: 28_00_000_00 },
-      { accountId: acc('601000'), planned: 6_60_000_00 },
-      { accountId: acc('602000'), planned: 8_00_000_00 },
-      { accountId: acc('603000'), planned: 1_80_000_00 },
-      { accountId: acc('607000'), planned: 2_40_000_00 },
+      { accountId: await acc('600000'), planned: 28_00_000_00 },
+      { accountId: await acc('601000'), planned: 6_60_000_00 },
+      { accountId: await acc('602000'), planned: 8_00_000_00 },
+      { accountId: await acc('603000'), planned: 1_80_000_00 },
+      { accountId: await acc('607000'), planned: 2_40_000_00 },
     ],
   }, actor);
 
   // ------------------------------------------- an unreconciled statement
   // Left deliberately unmatched, so the Reconciliation screen has real work in
   // it on a fresh install — including one line that is not a customer receipt.
-  importStatement(orgId, 'bnk_hdfc', [
+  await importStatement(orgId, 'bnk_hdfc', [
     { date: d(-4), description: 'UPI/ARUN PRAKASH/SINGAPORE TRIP', reference: 'UPI/77120', amount: 1_00_000_00 },
     { date: d(-3), description: 'NEFT INFOSYS LTD BALANCE PO 88213', reference: 'NEFT/99120', amount: 2_00_000_00 },
     { date: d(-3), description: 'BANK CHARGES QTR', reference: 'CHG/0926', amount: -1_180_00 },
@@ -741,11 +770,11 @@ function seedDemo(orgId: string) {
  * Two-line helper for the many "paid X from the bank" entries the demo needs.
  * Kept private to the seed: real screens route through a service, never here.
  */
-function postSimple(orgId: string, o: {
+async function postSimple(orgId: string, o: {
   journalId: string; date: string; label: string;
   debitAccount: string; creditAccount: string; amount: number;
 }, actor: { id?: string; name?: string }) {
-  return postEntry({
+  return await postEntry({
     orgId, journalId: o.journalId, date: o.date, reference: o.label, narration: o.label,
     sourceModel: 'manual',
     lines: [
@@ -756,6 +785,6 @@ function postSimple(orgId: string, o: {
 }
 
 /** Apply a posted advance to a posted invoice. Thin wrapper for readability. */
-function applyAdvance(orgId: string, paymentId: string, documentId: string, amount: number, actor: { id?: string; name?: string }) {
-  allocate(orgId, paymentId, documentId, amount, actor);
+async function applyAdvance(orgId: string, paymentId: string, documentId: string, amount: number, actor: { id?: string; name?: string }) {
+  await allocate(orgId, paymentId, documentId, amount, actor);
 }

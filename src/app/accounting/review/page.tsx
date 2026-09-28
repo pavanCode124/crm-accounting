@@ -37,13 +37,13 @@ export const dynamic = 'force-dynamic';
  * prevent.
  */
 export default async function ReviewPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
+  const s = await ctx();
+  const m = await msg(await searchParams);
 
-  const docs = listDocuments(s.orgId, { state: 'draft', limit: 300 });
-  const payments = listPayments(s.orgId, { state: 'draft', limit: 300 });
-  const expenses = listExpenses(s.orgId, { state: 'submitted', limit: 300 });
-  const entries = all<{
+  const docs = await listDocuments(s.orgId, { state: 'draft', limit: 300 });
+  const payments = await listPayments(s.orgId, { state: 'draft', limit: 300 });
+  const expenses = await listExpenses(s.orgId, { state: 'submitted', limit: 300 });
+  const entries = await all<{
     id: string; entry_date: string; reference: string | null; narration: string | null;
     journal_code: string; debit: number; credit: number;
   }>(

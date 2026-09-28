@@ -15,11 +15,11 @@ import { audit } from './audit';
  * everything passes through rather than in each screen.
  */
 
-export function createFiscalYear(orgId: string, startDate: string, actor: Actor = {}) {
-  return tx(() => {
+export async function createFiscalYear(orgId: string, startDate: string, actor: Actor = {}) {
+  return await tx(async () => {
     const fy = fiscalYearOf(startDate, Number(startDate.slice(5, 7)));
     const yearId = id('fy');
-    run(
+    await run(
       'INSERT INTO fiscal_years (id, org_id, name, date_from, date_to, state) VALUES (?,?,?,?,?,?)',
       yearId, orgId, fy.name, fy.from, fy.to, 'open',
     );
@@ -32,19 +32,19 @@ export function createFiscalYear(orgId: string, startDate: string, actor: Actor 
       const label = new Date(`${from}T00:00:00Z`).toLocaleDateString('en-IN', {
         month: 'short', year: 'numeric', timeZone: 'UTC',
       });
-      run(
+      await run(
         `INSERT INTO accounting_periods (id, org_id, fiscal_year_id, name, date_from, date_to, state)
          VALUES (?,?,?,?,?,?,'open')`,
         id('per'), orgId, yearId, label, from, to,
       );
     }
-    audit(orgId, actor, 'created', 'fiscal_year', yearId, fy.name);
+    await audit(orgId, actor, 'created', 'fiscal_year', yearId, fy.name);
     return yearId;
   });
 }
 
-export function listPeriods(orgId: string) {
-  return all<{
+export async function listPeriods(orgId: string) {
+  return await all<{
     id: string; name: string; date_from: string; date_to: string; state: string;
     fy_name: string; fy_state: string; entries: number; total: number;
   }>(
@@ -61,13 +61,13 @@ export function listPeriods(orgId: string) {
   );
 }
 
-export function setPeriodState(orgId: string, periodId: string, state: 'open' | 'locked' | 'closed', actor: Actor = {}) {
-  const p = one<{ name: string; state: string }>(
+export async function setPeriodState(orgId: string, periodId: string, state: 'open' | 'locked' | 'closed', actor: Actor = {}) {
+  const p = await one<{ name: string; state: string }>(
     'SELECT name, state FROM accounting_periods WHERE id=? AND org_id=?', periodId, orgId,
   );
   if (!p) throw new PostingError('Unknown period.');
-  run('UPDATE accounting_periods SET state=? WHERE id=? AND org_id=?', state, periodId, orgId);
-  audit(orgId, actor, state === 'open' ? 'reopened' : state, 'accounting_period', periodId,
+  await run('UPDATE accounting_periods SET state=? WHERE id=? AND org_id=?', state, periodId, orgId);
+  await audit(orgId, actor, state === 'open' ? 'reopened' : state, 'accounting_period', periodId,
     `${p.name}: ${p.state} → ${state}`);
 }
 
@@ -90,10 +90,10 @@ export interface OpeningLine { accountId: string; debit: number; credit: number;
  * only knows its assets and liabilities and wants the remainder booked to
  * capital, as an explicit, visible choice.
  */
-export function postOpeningBalances(orgId: string, opts: {
+export async function postOpeningBalances(orgId: string, opts: {
   date: string; lines: OpeningLine[]; balancingAccountId?: string | null;
 }, actor: Actor = {}) {
-  return tx(() => {
+  return await tx(async () => {
     const lines: PostingLine[] = opts.lines
       .filter((l) => l.debit !== 0 || l.credit !== 0)
       .map((l) => ({ accountId: l.accountId, debit: l.debit, credit: l.credit, label: l.label ?? 'Opening balance' }));
@@ -116,16 +116,16 @@ export function postOpeningBalances(orgId: string, opts: {
       });
     }
 
-    const entryId = postEntry({
+    const entryId = await postEntry({
       orgId,
-      journalId: requireSetting(orgId, 'journal.general'),
+      journalId: await requireSetting(orgId, 'journal.general'),
       date: opts.date,
       reference: 'Opening balances',
       narration: 'Opening balances carried in from the previous system',
       sourceModel: 'opening',
       lines,
     }, actor);
-    audit(orgId, actor, 'posted', 'opening_balance', entryId,
+    await audit(orgId, actor, 'posted', 'opening_balance', entryId,
       `${lines.length} account(s) as at ${opts.date}`);
     return entryId;
   });
@@ -143,26 +143,26 @@ export function postOpeningBalances(orgId: string, opts: {
  * The entry is dated the last day of the year and every period in the year is
  * then locked, which is what makes the closed figures stable.
  */
-export function closeFiscalYear(orgId: string, fiscalYearId: string, actor: Actor = {}) {
-  return tx(() => {
-    const fy = one<{ id: string; name: string; date_from: string; date_to: string; state: string }>(
+export async function closeFiscalYear(orgId: string, fiscalYearId: string, actor: Actor = {}) {
+  return await tx(async () => {
+    const fy = await one<{ id: string; name: string; date_from: string; date_to: string; state: string }>(
       'SELECT * FROM fiscal_years WHERE id=? AND org_id=?', fiscalYearId, orgId,
     );
     if (!fy) throw new PostingError('Unknown fiscal year.');
     if (fy.state === 'closed') throw new PostingError('This year is already closed.');
 
-    const balances = all<{ account_id: string; code: string; net: number }>(
+    const balances = await all<{ account_id: string; code: string; net: number }>(
       `SELECT l.account_id, a.code, COALESCE(SUM(l.debit - l.credit),0) AS net
          FROM journal_entry_lines l JOIN accounts a ON a.id = l.account_id
         WHERE l.org_id=? AND l.state='posted' AND l.entry_date BETWEEN ? AND ?
           AND a.kind IN ('income','income_other','expense_direct','expense_operating','expense_depreciation')
-        GROUP BY l.account_id HAVING net <> 0`,
+        GROUP BY l.account_id, a.code HAVING COALESCE(SUM(l.debit - l.credit),0) <> 0`,
       orgId, fy.date_from, fy.date_to,
     );
     if (!balances.length) throw new PostingError('This year has no profit and loss activity to close.');
 
-    const retained = requireSetting(orgId, 'account.retained_earnings');
-    const profit = profitForPeriod(orgId, fy.date_from, fy.date_to);
+    const retained = await requireSetting(orgId, 'account.retained_earnings');
+    const profit = await profitForPeriod(orgId, fy.date_from, fy.date_to);
 
     const lines: PostingLine[] = balances.map((b) => ({
       accountId: b.account_id,
@@ -176,9 +176,9 @@ export function closeFiscalYear(orgId: string, fiscalYearId: string, actor: Acto
       label: `Profit for ${fy.name}`,
     });
 
-    const entryId = postEntry({
+    const entryId = await postEntry({
       orgId,
-      journalId: requireSetting(orgId, 'journal.general'),
+      journalId: await requireSetting(orgId, 'journal.general'),
       date: fy.date_to,
       reference: `Close ${fy.name}`,
       narration: `Year-end closing entry for ${fy.name}`,
@@ -187,23 +187,23 @@ export function closeFiscalYear(orgId: string, fiscalYearId: string, actor: Acto
       lines,
     }, actor);
 
-    run(`UPDATE fiscal_years SET state='closed' WHERE id=?`, fiscalYearId);
-    run(`UPDATE accounting_periods SET state='closed' WHERE fiscal_year_id=?`, fiscalYearId);
-    audit(orgId, actor, 'closed', 'fiscal_year', fiscalYearId,
+    await run(`UPDATE fiscal_years SET state='closed' WHERE id=?`, fiscalYearId);
+    await run(`UPDATE accounting_periods SET state='closed' WHERE fiscal_year_id=?`, fiscalYearId);
+    await audit(orgId, actor, 'closed', 'fiscal_year', fiscalYearId,
       `${fy.name} closed — profit ${(profit / 100).toFixed(2)} to retained earnings`);
     return entryId;
   });
 }
 
-export function listFiscalYears(orgId: string) {
-  return all<{ id: string; name: string; date_from: string; date_to: string; state: string }>(
+export async function listFiscalYears(orgId: string) {
+  return await all<{ id: string; name: string; date_from: string; date_to: string; state: string }>(
     'SELECT * FROM fiscal_years WHERE org_id=? ORDER BY date_from DESC', orgId,
   );
 }
 
 /** The period a date falls in, if one is defined. Used to warn before posting. */
-export function periodFor(orgId: string, date = isoDate()) {
-  return one<{ id: string; name: string; state: string }>(
+export async function periodFor(orgId: string, date = isoDate()) {
+  return await one<{ id: string; name: string; state: string }>(
     'SELECT id, name, state FROM accounting_periods WHERE org_id=? AND date_from<=? AND date_to>=?',
     orgId, date, date,
   );

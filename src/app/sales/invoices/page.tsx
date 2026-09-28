@@ -6,15 +6,15 @@ import { DocumentList, DocumentFilters } from '@/components/DocumentList';
 export const dynamic = 'force-dynamic';
 
 export default async function InvoicesPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
-  const m = msg(params);
+  const m = await msg(params);
   const filter = {
-    search: one(params, 'q'),
-    state: one(params, 'state'),
-    paymentState: one(params, 'payment'),
-    from: one(params, 'from'),
-    to: one(params, 'to'),
+    search: await one(params, 'q'),
+    state: await one(params, 'state'),
+    paymentState: await one(params, 'payment'),
+    from: await one(params, 'from'),
+    to: await one(params, 'to'),
   };
 
   return (

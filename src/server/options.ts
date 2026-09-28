@@ -14,7 +14,7 @@ import type { DocType } from '@/lib/accounting';
  * and tax lists are therefore filtered BY WHAT THE DOCUMENT IS, here, rather
  * than left to each page to remember.
  */
-export function documentFormOptions(orgId: string, docType: DocType, canPost: boolean): DocFormProps {
+export async function documentFormOptions(orgId: string, docType: DocType, canPost: boolean): Promise<DocFormProps> {
   const isBill = docType.startsWith('in_');
 
   /*
@@ -32,56 +32,56 @@ export function documentFormOptions(orgId: string, docType: DocType, canPost: bo
   return {
     docType,
     canPost,
-    partners: listPartners(orgId, { side: isBill ? 'supplier' : 'customer' })
+    partners: (await listPartners(orgId, { side: isBill ? 'supplier' : 'customer' }))
       .map((p) => ({ id: p.id, label: p.name })),
-    journals: listJournals(orgId, isBill ? 'purchase' : 'sale')
+    journals: (await listJournals(orgId, isBill ? 'purchase' : 'sale'))
       .map((j) => ({ id: j.id, label: `${j.code} — ${j.name}` })),
-    accounts: [...listAccounts(orgId, { kinds: primaryKinds }), ...listAccounts(orgId, { kinds: secondaryKinds })]
+    accounts: [...await listAccounts(orgId, { kinds: primaryKinds }), ...await listAccounts(orgId, { kinds: secondaryKinds })]
       .map((a) => ({ id: a.id, label: `${a.code} ${a.name}` })),
-    taxes: listTaxes(orgId, isBill ? 'purchase' : 'sale')
+    taxes: (await listTaxes(orgId, isBill ? 'purchase' : 'sale'))
       .map((t) => ({ id: t.id, label: t.name, rateBps: t.rate_bps, priceIncluded: !!t.price_included })),
-    withholdingTaxes: listWithholdingTaxes(orgId)
+    withholdingTaxes: (await listWithholdingTaxes(orgId))
       .map((t) => ({ id: t.id, label: t.name, rateBps: t.rate_bps, priceIncluded: false })),
-    analytics: listAnalyticAccounts(orgId)
+    analytics: (await listAnalyticAccounts(orgId))
       .map((a) => ({ id: a.id, label: `${a.plan_name}: ${a.name}` })),
     // `hint` carries the booking's analytic account, so picking a trip on the
     // form tags the lines without a second round trip.
-    bookings: listBookings(orgId, { limit: 100 })
+    bookings: (await listBookings(orgId, { limit: 100 }))
       .map((b) => ({ id: b.id, label: `${b.ref} — ${b.title}`, hint: b.analytic_id ?? '' })),
-    paymentTerms: listPaymentTerms(orgId).map((t) => ({ id: t.id, label: t.name })),
-    products: listProducts(orgId).map((p) => ({
+    paymentTerms: (await listPaymentTerms(orgId)).map((t) => ({ id: t.id, label: t.name })),
+    products: (await listProducts(orgId)).map((p) => ({
       id: p.id, name: p.name, price: p.sale_price,
       accountId: p.income_account_id, taxId: p.sale_tax_id,
     })),
   };
 }
 
-export function bankAccountOptions(orgId: string) {
-  return all<{ id: string; name: string; journal_id: string | null }>(
+export async function bankAccountOptions(orgId: string) {
+  return await all<{ id: string; name: string; journal_id: string | null }>(
     'SELECT id, name, journal_id FROM bank_accounts WHERE org_id=? AND active=1 ORDER BY is_cash, name', orgId,
   );
 }
 
-export function journalOptions(orgId: string, types?: string[]) {
-  const rows = listJournals(orgId);
+export async function journalOptions(orgId: string, types?: string[]) {
+  const rows = await listJournals(orgId);
   return (types ? rows.filter((j) => types.includes(j.type)) : rows)
     .map((j) => ({ id: j.id, label: `${j.code} — ${j.name}`, type: j.type }));
 }
 
-export function accountOptions(orgId: string, kinds?: string[]) {
-  return listAccounts(orgId, { kinds }).map((a) => ({ id: a.id, label: `${a.code} ${a.name}`, kind: a.kind }));
+export async function accountOptions(orgId: string, kinds?: string[]) {
+  return (await listAccounts(orgId, { kinds })).map((a) => ({ id: a.id, label: `${a.code} ${a.name}`, kind: a.kind }));
 }
 
-export function analyticOptions(orgId: string, planCode?: string) {
-  return listAnalyticAccounts(orgId, planCode)
+export async function analyticOptions(orgId: string, planCode?: string) {
+  return (await listAnalyticAccounts(orgId, planCode))
     .map((a) => ({ id: a.id, label: `${a.plan_name}: ${a.name}` }));
 }
 
-export function bookingOptions(orgId: string) {
-  return listBookings(orgId, { limit: 200 })
+export async function bookingOptions(orgId: string) {
+  return (await listBookings(orgId, { limit: 200 }))
     .map((b) => ({ id: b.id, label: `${b.ref} — ${b.title}`, analyticId: b.analytic_id }));
 }
 
-export function partnerOptions(orgId: string, side?: 'customer' | 'supplier') {
-  return listPartners(orgId, { side }).map((p) => ({ id: p.id, label: p.name }));
+export async function partnerOptions(orgId: string, side?: 'customer' | 'supplier') {
+  return (await listPartners(orgId, { side })).map((p) => ({ id: p.id, label: p.name }));
 }

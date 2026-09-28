@@ -34,10 +34,10 @@ export interface CashBookProps {
   basePath: string;
 }
 
-export function CashBookView({ orgId, range, isCash, selected, basePath }: CashBookProps) {
-  const accounts = cashBookAccounts(orgId, range, isCash);
+export async function CashBookView({ orgId, range, isCash, selected, basePath }: CashBookProps) {
+  const accounts = await cashBookAccounts(orgId, range, isCash);
   const current = selected ? accounts.find((a) => a.bank_account_id === selected) : undefined;
-  const book = current ? ledgerAccount(orgId, current.account_id, range) : null;
+  const book = current ? await ledgerAccount(orgId, current.account_id, range) : null;
 
   const noun = isCash ? 'cash' : 'bank';
   const opening = accounts.reduce((s, a) => s + a.opening, 0);
@@ -156,7 +156,7 @@ export function CashBookView({ orgId, range, isCash, selected, basePath }: CashB
  * the difference between a page a cashier can use and one they cannot.
  */
 function TwoSidedBook({ book, label, range, isCash }: {
-  book: NonNullable<ReturnType<typeof ledgerAccount>>;
+  book: NonNullable<Awaited<ReturnType<typeof ledgerAccount>>>;
   label: string;
   range: { from: string; to: string };
   isCash: boolean;

@@ -8,9 +8,9 @@ import { PageHeader, Card, Banner, Field, inputClass, btn, LinkButton } from '@/
 export const dynamic = 'force-dynamic';
 
 export default async function NewBookingPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
-  const customers = partnerOptions(s.orgId, 'customer');
+  const s = await ctx();
+  const m = await msg(await searchParams);
+  const customers = await partnerOptions(s.orgId, 'customer');
   const today = isoDate();
 
   return (

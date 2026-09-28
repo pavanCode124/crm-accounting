@@ -23,12 +23,12 @@ export const dynamic = 'force-dynamic';
  * up as the compiler running out of memory on this one file.
  */
 export default async function AssetsPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
-  const m = msg(params);
-  const tab = one(params, 'tab') ?? 'assets';
-  const assets = listAssets(s.orgId);
-  const deferrals = listDeferrals(s.orgId);
+  const m = await msg(params);
+  const tab = await one(params, 'tab') ?? 'assets';
+  const assets = await listAssets(s.orgId);
+  const deferrals = await listDeferrals(s.orgId);
   const today = isoDate();
 
   const gross = assets.reduce((sum, a) => sum + a.purchase_value, 0);
@@ -72,10 +72,10 @@ export default async function AssetsPage({ searchParams }: { searchParams: Promi
   );
 }
 
-type AssetRow = ReturnType<typeof listAssets>[number];
-type DeferralRow = ReturnType<typeof listDeferrals>[number];
+type AssetRow = Awaited<ReturnType<typeof listAssets>>[number];
+type DeferralRow = Awaited<ReturnType<typeof listDeferrals>>[number];
 
-function AssetsTab({ orgId, assets, today }: { orgId: string; assets: AssetRow[]; today: string }) {
+async function AssetsTab({ orgId, assets, today }: { orgId: string; assets: AssetRow[]; today: string }) {
   const running = assets.filter((a) => a.state === 'running').slice(0, 2);
 
   return (
@@ -125,7 +125,7 @@ function AssetsTab({ orgId, assets, today }: { orgId: string; assets: AssetRow[]
           )}
         </Card>
 
-        {running.map((a) => (
+        {running.map(async (a) => (
           <Card key={a.id} title={`Schedule — ${a.name}`} padded={false}
             subtitle="Posted slices cannot be changed; pending ones move if the schedule is regenerated.">
             <Table>
@@ -136,7 +136,7 @@ function AssetsTab({ orgId, assets, today }: { orgId: string; assets: AssetRow[]
                 </tr>
               </thead>
               <tbody>
-                {assetSchedule(a.id).slice(0, 14).map((l) => (
+                {(await assetSchedule(a.id)).slice(0, 14).map((l) => (
                   <tr key={l.id}>
                     <Td><span className="num !text-left">{l.seq}</span></Td>
                     <Td>{fmtDate(l.due_date)}</Td>

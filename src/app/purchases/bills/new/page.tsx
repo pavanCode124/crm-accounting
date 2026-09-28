@@ -8,10 +8,10 @@ import { DocumentForm } from '@/components/DocumentForm';
 export const dynamic = 'force-dynamic';
 
 export default async function NewBillPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
-  const m = msg(params);
-  const options = documentFormOptions(s.orgId, 'in_invoice', can(s.role, 'bill.post'));
+  const m = await msg(params);
+  const options = await documentFormOptions(s.orgId, 'in_invoice', can(s.role, 'bill.post'));
 
   return (
     <>
@@ -24,8 +24,8 @@ export default async function NewBillPage({ searchParams }: { searchParams: Prom
       <DocumentForm
         {...options}
         defaults={{
-          partnerId: one(params, 'partner'),
-          bookingId: one(params, 'booking'),
+          partnerId: await one(params, 'partner'),
+          bookingId: await one(params, 'booking'),
           journalId: options.journals[0]?.id,
         }}
       />

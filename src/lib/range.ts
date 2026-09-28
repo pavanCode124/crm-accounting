@@ -70,12 +70,12 @@ export function priorYear(r: Range): Range {
 /** Next.js 15 hands searchParams in as a promise; this is the shape they take. */
 export type SearchParams = Record<string, string | string[] | undefined>;
 
-export function one(params: SearchParams, key: string): string | undefined {
+export async function one(params: SearchParams, key: string): Promise<string | undefined> {
   const v = params[key];
   return Array.isArray(v) ? v[0] : v;
 }
 
 /** The `?ok=` / `?error=` banner a server action redirects back with. */
-export function msg(params: SearchParams): { ok?: string; error?: string } {
-  return { ok: one(params, 'ok'), error: one(params, 'error') };
+export async function msg(params: SearchParams): Promise<{ ok?: string; error?: string }> {
+  return { ok: await one(params, 'ok'), error: await one(params, 'error') };
 }

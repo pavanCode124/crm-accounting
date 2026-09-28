@@ -20,10 +20,10 @@ import {
  * hotel rooms — appears in both with one balance sheet position each.
  */
 
-export function PartnerList({ orgId, side, basePath, search }: {
+export async function PartnerList({ orgId, side, basePath, search }: {
   orgId: string; side: 'customer' | 'supplier'; basePath: string; search?: string;
 }) {
-  const partners = listPartners(orgId, { side, search });
+  const partners = await listPartners(orgId, { side, search });
   const isCustomer = side === 'customer';
   const total = partners.reduce((s, p) => s + (isCustomer ? (p.receivable ?? 0) : (p.payable ?? 0)), 0);
 
@@ -92,7 +92,7 @@ export function PartnerList({ orgId, side, basePath, search }: {
           <Field label="Payment terms">
             <select name="payment_terms_id" className={inputClass} defaultValue="">
               <option value="">—</option>
-              {listPaymentTerms(orgId).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+              {(await listPaymentTerms(orgId)).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
             </select>
           </Field>
           {isCustomer ? (
@@ -118,19 +118,19 @@ export function PartnerList({ orgId, side, basePath, search }: {
 // Detail
 // ---------------------------------------------------------------------------
 
-export function PartnerDetail({ orgId, partnerId, side, basePath, tab = 'overview' }: {
+export async function PartnerDetail({ orgId, partnerId, side, basePath, tab = 'overview' }: {
   orgId: string; partnerId: string; side: 'customer' | 'supplier'; basePath: string; tab?: string;
 }) {
-  const p = getPartner(orgId, partnerId);
+  const p = await getPartner(orgId, partnerId);
   if (!p) return <EmptyState title="That partner no longer exists." />;
 
   const isCustomer = side === 'customer';
-  const bal = partnerBalance(orgId, partnerId);
+  const bal = await partnerBalance(orgId, partnerId);
   const docTypes = isCustomer ? (['out_invoice', 'out_refund'] as const) : (['in_invoice', 'in_refund'] as const);
-  const docs = listDocuments(orgId, { partnerId, docType: [...docTypes] });
-  const payments = listPayments(orgId, { partnerId, limit: 100 });
-  const bookings = isCustomer ? listBookings(orgId).filter((b) => b.partner_name === p.name) : [];
-  const ledger = partnerLedger(orgId, partnerId, { from: '1900-01-01', to: isoDate() });
+  const docs = await listDocuments(orgId, { partnerId, docType: [...docTypes] });
+  const payments = await listPayments(orgId, { partnerId, limit: 100 });
+  const bookings = isCustomer ? (await listBookings(orgId)).filter((b) => b.partner_name === p.name) : [];
+  const ledger = await partnerLedger(orgId, partnerId, { from: '1900-01-01', to: isoDate() });
 
   const base = `${basePath}/${partnerId}`;
   const tabs = [

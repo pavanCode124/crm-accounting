@@ -13,9 +13,9 @@ export const dynamic = 'force-dynamic';
  * happens — every back-link points here and this looks it up once.
  */
 export default async function ResolveDocument({ params }: { params: Promise<{ id: string }> }) {
-  const s = ctx();
+  const s = await ctx();
   const { id } = await params;
-  const doc = getDocument(s.orgId, id);
+  const doc = await getDocument(s.orgId, id);
   if (!doc) redirect('/sales/invoices');
   redirect(`${{
     out_invoice: '/sales/invoices',

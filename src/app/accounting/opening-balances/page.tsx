@@ -18,11 +18,11 @@ export const dynamic = 'force-dynamic';
  * difference into a suspense account that then haunts every report.
  */
 export default async function OpeningBalancesPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
+  const s = await ctx();
+  const m = await msg(await searchParams);
   const fy = fiscalYearOf(isoDate(), s.fyStartMonth);
-  const accounts = accountOptions(s.orgId);
-  const posted = accountsWithBalances(s.orgId, fy.from).filter((a) => a.balance !== 0);
+  const accounts = await accountOptions(s.orgId);
+  const posted = (await accountsWithBalances(s.orgId, fy.from)).filter((a) => a.balance !== 0);
 
   return (
     <>

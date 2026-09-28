@@ -9,9 +9,9 @@ export const dynamic = 'force-dynamic';
 const TAX_GROUPS = ['gst', 'igst', 'cgst_sgst', 'tds', 'tcs', 'vat', 'none'];
 
 export default async function NewTaxPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
-  const m = msg(await searchParams);
-  const accounts = accountOptions(s.orgId, ['liability_tax', 'asset_current']);
+  const s = await ctx();
+  const m = await msg(await searchParams);
+  const accounts = await accountOptions(s.orgId, ['liability_tax', 'asset_current']);
 
   return (
     <>

@@ -25,18 +25,18 @@ export const dynamic = 'force-dynamic';
 export default async function BookingPage({ params, searchParams }: {
   params: Promise<{ id: string }>; searchParams: Promise<SearchParams>;
 }) {
-  const s = ctx();
+  const s = await ctx();
   const { id } = await params;
-  const m = msg(await searchParams);
-  const fin = bookingFinancials(s.orgId, id);
+  const m = await msg(await searchParams);
+  const fin = await bookingFinancials(s.orgId, id);
   if (!fin) return <Banner tone="error">That booking no longer exists.</Banner>;
 
   const { booking } = fin;
-  const invoices = listDocuments(s.orgId, { bookingId: id, docType: ['out_invoice', 'out_refund'] });
-  const bills = listDocuments(s.orgId, { bookingId: id, docType: ['in_invoice', 'in_refund'] });
-  const payments = listPayments(s.orgId, { limit: 200 }).filter((p) => p.booking_id === id);
+  const invoices = await listDocuments(s.orgId, { bookingId: id, docType: ['out_invoice', 'out_refund'] });
+  const bills = await listDocuments(s.orgId, { bookingId: id, docType: ['in_invoice', 'in_refund'] });
+  const payments = (await listPayments(s.orgId, { limit: 200 })).filter((p) => p.booking_id === id);
   const ledger = booking.analytic_id
-    ? generalLedger(s.orgId, { from: '1900-01-01', to: isoDate(), analyticId: booking.analytic_id })
+    ? await generalLedger(s.orgId, { from: '1900-01-01', to: isoDate(), analyticId: booking.analytic_id })
     : { lines: [], opening: 0 };
   const costMax = Math.max(1, ...fin.costLines.map((c) => c.amount));
 

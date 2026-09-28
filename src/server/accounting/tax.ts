@@ -36,16 +36,16 @@ export interface TaxRow {
   threshold: number;
 }
 
-export function getTax(orgId: string, taxId: string): TaxRow | null {
-  return one<TaxRow>(
+export async function getTax(orgId: string, taxId: string): Promise<TaxRow | null> {
+  return await one<TaxRow>(
     `SELECT id, name, computation, rate_bps, scope, tax_group, price_included,
             account_id, refund_account_id, threshold
        FROM taxes WHERE id = ? AND org_id = ?`, taxId, orgId,
   );
 }
 
-export function taxChildren(taxId: string): TaxRow[] {
-  return all<TaxRow>(
+export async function taxChildren(taxId: string): Promise<TaxRow[]> {
+  return await all<TaxRow>(
     `SELECT t.id, t.name, t.computation, t.rate_bps, t.scope, t.tax_group,
             t.price_included, t.account_id, t.refund_account_id, t.threshold
        FROM tax_children c JOIN taxes t ON t.id = c.child_id
@@ -53,12 +53,12 @@ export function taxChildren(taxId: string): TaxRow[] {
   );
 }
 
-export function listTaxes(orgId: string, scope?: 'sale' | 'purchase'): TaxRow[] {
-  return all<TaxRow>(
+export async function listTaxes(orgId: string, scope?: 'sale' | 'purchase'): Promise<TaxRow[]> {
+  return await all<TaxRow>(
     `SELECT id, name, computation, rate_bps, scope, tax_group, price_included,
             account_id, refund_account_id, threshold
        FROM taxes WHERE org_id = ? AND active = 1
-         AND (? IS NULL OR scope = ? OR scope = 'none')
+         AND (?::text IS NULL OR scope = ? OR scope = 'none')
          AND tax_group <> 'tds'
          AND id NOT IN (SELECT child_id FROM tax_children)
       ORDER BY rate_bps`,
@@ -67,8 +67,8 @@ export function listTaxes(orgId: string, scope?: 'sale' | 'purchase'): TaxRow[] 
 }
 
 /** Withholding taxes are chosen on the PAYMENT side, so they list separately. */
-export function listWithholdingTaxes(orgId: string): TaxRow[] {
-  return all<TaxRow>(
+export async function listWithholdingTaxes(orgId: string): Promise<TaxRow[]> {
+  return await all<TaxRow>(
     `SELECT id, name, computation, rate_bps, scope, tax_group, price_included,
             account_id, refund_account_id, threshold
        FROM taxes WHERE org_id = ? AND active = 1 AND tax_group = 'tds' ORDER BY rate_bps`,
@@ -100,14 +100,14 @@ export interface LineAmounts {
   splits: TaxSplit[];
 }
 
-export function computeLine(orgId: string, line: LineInput): LineAmounts {
+export async function computeLine(orgId: string, line: LineInput): Promise<LineAmounts> {
   const gross = roundHalfUp((line.qtyMilli * line.unitPrice) / 1000);
   const afterDiscount = gross - pct(gross, line.discountBps ?? 0);
 
-  const tax = line.taxId ? getTax(orgId, line.taxId) : null;
+  const tax = line.taxId ? await getTax(orgId, line.taxId) : null;
   if (!tax) return { subtotal: afterDiscount, taxAmount: 0, total: afterDiscount, splits: [] };
 
-  const children = taxChildren(tax.id);
+  const children = await taxChildren(tax.id);
   const components = children.length ? children : [tax];
 
   // Tax-included: back the base out of the gross first, so the customer pays
@@ -142,9 +142,9 @@ export function computeLine(orgId: string, line: LineInput): LineAmounts {
  *        Vendor Payable    Cr 1,08,000
  *        TDS Payable       Cr   10,000
  */
-export function computeWithholding(orgId: string, taxId: string | null, taxableBase: number): { amount: number; accountId: string | null; name: string } {
+export async function computeWithholding(orgId: string, taxId: string | null, taxableBase: number): Promise<{ amount: number; accountId: string | null; name: string }> {
   if (!taxId) return { amount: 0, accountId: null, name: '' };
-  const tax = getTax(orgId, taxId);
+  const tax = await getTax(orgId, taxId);
   if (!tax) return { amount: 0, accountId: null, name: '' };
   if (tax.threshold > 0 && taxableBase < tax.threshold) {
     return { amount: 0, accountId: tax.account_id, name: tax.name };

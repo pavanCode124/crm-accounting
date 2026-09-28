@@ -18,17 +18,17 @@ export const dynamic = 'force-dynamic';
  * because whoever is doing one is, often as not, about to do the other.
  */
 export default async function NewExpensePage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = ctx();
+  const s = await ctx();
   const params = await searchParams;
-  const m = msg(params);
-  const tab = one(params, 'tab') === 'advance' ? 'advance' : 'claim';
+  const m = await msg(params);
+  const tab = await one(params, 'tab') === 'advance' ? 'advance' : 'claim';
 
-  const accounts = accountOptions(s.orgId, ['expense_direct', 'expense_operating']);
-  const journals = journalOptions(s.orgId);
-  const cashJournals = journalOptions(s.orgId, ['bank', 'cash']);
-  const analytics = analyticOptions(s.orgId);
-  const bookings = bookingOptions(s.orgId);
-  const taxes = listTaxes(s.orgId, 'purchase');
+  const accounts = await accountOptions(s.orgId, ['expense_direct', 'expense_operating']);
+  const journals = await journalOptions(s.orgId);
+  const cashJournals = await journalOptions(s.orgId, ['bank', 'cash']);
+  const analytics = await analyticOptions(s.orgId);
+  const bookings = await bookingOptions(s.orgId);
+  const taxes = await listTaxes(s.orgId, 'purchase');
   const today = isoDate();
 
   return (
