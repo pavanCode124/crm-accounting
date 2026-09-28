@@ -1,11 +1,10 @@
 import { ctx } from '@/server/bootstrap';
 import { msg, one, type SearchParams } from '@/lib/range';
 import { listAssets, assetSchedule, listDeferrals } from '@/server/accounting/assets';
-import { accountOptions, journalOptions } from '@/server/options';
 import { fmtDate, isoDate, titleise } from '@/lib/accounting';
-import { saveAssetAction, runDepreciationAction, saveDeferralAction, runDeferralsAction } from '@/app/actions';
+import { runDepreciationAction, runDeferralsAction } from '@/app/actions';
 import {
-  PageHeader, Card, Banner, Table, Th, Td, Money, Chip, StatTile, EmptyState, Field, inputClass, btn, Bar, Tabs,
+  PageHeader, Card, Banner, Table, Th, Td, Money, Chip, StatTile, EmptyState, btn, Bar, Tabs, LinkButton,
 } from '@/components/ui';
 
 export const dynamic = 'force-dynamic';
@@ -42,6 +41,11 @@ export default async function AssetsPage({ searchParams }: { searchParams: Promi
         title="Assets & Deferrals"
         subtitle="Things the agency owns, and costs that belong to months other than the one they were paid in."
         accent="var(--color-sec-settings)"
+        actions={
+          <LinkButton href={`/assets/new?tab=${tab}`} variant="primary">
+            {tab === 'deferrals' ? '+ New Deferral' : '+ New Asset'}
+          </LinkButton>
+        }
       />
       {m.error && <Banner tone="error">{m.error}</Banner>}
       {m.ok && <Banner tone="ok">{m.ok}</Banner>}
@@ -63,7 +67,7 @@ export default async function AssetsPage({ searchParams }: { searchParams: Promi
 
       {tab === 'assets'
         ? <AssetsTab orgId={s.orgId} assets={assets} today={today} />
-        : <DeferralsTab orgId={s.orgId} deferrals={deferrals} today={today} />}
+        : <DeferralsTab deferrals={deferrals} today={today} />}
     </>
   );
 }
@@ -72,13 +76,9 @@ type AssetRow = ReturnType<typeof listAssets>[number];
 type DeferralRow = ReturnType<typeof listDeferrals>[number];
 
 function AssetsTab({ orgId, assets, today }: { orgId: string; assets: AssetRow[]; today: string }) {
-  const fixedAccounts = accountOptions(orgId, ['asset_fixed']);
-  const depAccounts = accountOptions(orgId, ['expense_depreciation', 'expense_operating']);
-  const journals = journalOptions(orgId, ['general']);
   const running = assets.filter((a) => a.state === 'running').slice(0, 2);
 
   return (
-    <div className="grid gap-5 lg:grid-cols-[2fr_1fr]">
       <div className="space-y-5">
         <Card
           title="Fixed assets"
@@ -154,70 +154,13 @@ function AssetsTab({ orgId, assets, today }: { orgId: string; assets: AssetRow[]
           </Card>
         ))}
       </div>
-
-      <Card title="New asset">
-        <form action={saveAssetAction} className="space-y-3">
-          <Field label="Name"><input name="name" required className={inputClass} /></Field>
-          <Field label="Purchase value">
-            <input name="purchase_value" required inputMode="decimal" className={`${inputClass} text-right`} />
-          </Field>
-          <Field label="Salvage value" hint="What it will still be worth at the end of its life.">
-            <input name="salvage_value" inputMode="decimal" className={`${inputClass} text-right`} />
-          </Field>
-          <Field label="Purchased on">
-            <input type="date" name="purchase_date" defaultValue={today} className={inputClass} />
-          </Field>
-          <Field label="Asset account">
-            <select name="asset_account_id" required className={inputClass}>
-              {fixedAccounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-            </select>
-          </Field>
-          <Field label="Accumulated depreciation"
-            hint="A contra-asset: the cost stays on the books at what was paid.">
-            <select name="depreciation_account_id" required className={inputClass}>
-              {fixedAccounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-            </select>
-          </Field>
-          <Field label="Depreciation expense">
-            <select name="expense_account_id" required className={inputClass}>
-              {depAccounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-            </select>
-          </Field>
-          <Field label="Method">
-            <select name="method" className={inputClass} defaultValue="straight_line">
-              <option value="straight_line">Straight line</option>
-              <option value="declining">Written-down value</option>
-            </select>
-          </Field>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Life (months)">
-              <input name="life_months" defaultValue="36" className={`${inputClass} text-right`} />
-            </Field>
-            <Field label="WDV rate %">
-              <input name="declining_rate" inputMode="decimal" className={`${inputClass} text-right`} />
-            </Field>
-          </div>
-          <input type="hidden" name="journal_id" value={journals[0]?.id ?? ''} />
-          <label className="flex items-center gap-2 text-[13px] font-semibold">
-            <input type="checkbox" name="confirm_now" defaultChecked className="h-4 w-4" />
-            Confirm the schedule straight away
-          </label>
-          <button className={`${btn.primary} w-full`}>Create asset</button>
-        </form>
-      </Card>
-    </div>
   );
 }
 
-function DeferralsTab({ orgId, deferrals, today }: {
-  orgId: string; deferrals: DeferralRow[]; today: string;
+function DeferralsTab({ deferrals, today }: {
+  deferrals: DeferralRow[]; today: string;
 }) {
-  const prepaidAccounts = accountOptions(orgId, ['asset_prepaid', 'liability_current']);
-  const pnlAccounts = accountOptions(orgId, ['expense_operating', 'expense_direct', 'income']);
-  const journals = journalOptions(orgId, ['general']);
-
   return (
-    <div className="grid gap-5 lg:grid-cols-[2fr_1fr]">
       <Card
         title="Deferrals"
         padded={false}
@@ -260,41 +203,5 @@ function DeferralsTab({ orgId, deferrals, today }: {
           </Table>
         )}
       </Card>
-
-      <Card title="New deferral">
-        <form action={saveDeferralAction} className="space-y-3">
-          <Field label="Name"><input name="name" required className={inputClass} /></Field>
-          <Field label="Kind">
-            <select name="kind" className={inputClass} defaultValue="expense">
-              <option value="expense">Prepaid expense</option>
-              <option value="revenue">Deferred revenue</option>
-            </select>
-          </Field>
-          <Field label="Amount">
-            <input name="amount" required inputMode="decimal" className={`${inputClass} text-right`} />
-          </Field>
-          <Field label="Balance account" hint="Prepaid expenses, or deferred revenue.">
-            <select name="balance_account_id" required className={inputClass}>
-              {prepaidAccounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-            </select>
-          </Field>
-          <Field label="Recognition account" hint="Where each slice lands in the P&L.">
-            <select name="recognition_account_id" required className={inputClass}>
-              {pnlAccounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-            </select>
-          </Field>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Starts">
-              <input type="date" name="date_from" defaultValue={today} className={inputClass} />
-            </Field>
-            <Field label="Months">
-              <input name="months" defaultValue="12" className={`${inputClass} text-right`} />
-            </Field>
-          </div>
-          <input type="hidden" name="journal_id" value={journals[0]?.id ?? ''} />
-          <button className={`${btn.primary} w-full`}>Schedule</button>
-        </form>
-      </Card>
-    </div>
   );
 }

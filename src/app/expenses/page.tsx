@@ -1,12 +1,11 @@
 import { ctx } from '@/server/bootstrap';
 import { msg, type SearchParams } from '@/lib/range';
 import { listExpenses } from '@/server/accounting/expenses';
-import { accountOptions, journalOptions, analyticOptions, bookingOptions } from '@/server/options';
-import { listTaxes } from '@/server/accounting/tax';
+import { journalOptions } from '@/server/options';
 import { fmtDate, isoDate, titleise, can } from '@/lib/accounting';
-import { saveExpenseAction, expenseWorkflowAction, employeeAdvanceAction } from '@/app/actions';
+import { expenseWorkflowAction } from '@/app/actions';
 import {
-  PageHeader, Card, Banner, Table, Th, Td, Money, Chip, StatTile, EmptyState, Field, inputClass, btn,
+  PageHeader, Card, Banner, Table, Th, Td, Money, Chip, StatTile, EmptyState, btn, LinkButton,
 } from '@/components/ui';
 
 export const dynamic = 'force-dynamic';
@@ -24,15 +23,11 @@ export default async function ExpensesPage({ searchParams }: { searchParams: Pro
   const s = ctx();
   const m = msg(await searchParams);
   const expenses = listExpenses(s.orgId);
-  const today = isoDate();
   const mayApprove = can(s.role, 'payment.approve');
-
-  const accounts = accountOptions(s.orgId, ['expense_direct', 'expense_operating']);
-  const journals = journalOptions(s.orgId);
+  // Only what the REIMBURSE button on a row needs. The claim form's options
+  // moved to /expenses/new with it.
+  const today = isoDate();
   const cashJournals = journalOptions(s.orgId, ['bank', 'cash']);
-  const analytics = analyticOptions(s.orgId);
-  const bookings = bookingOptions(s.orgId);
-  const taxes = listTaxes(s.orgId, 'purchase');
 
   const pending = expenses.filter((e) => e.state === 'submitted');
   const owed = expenses.filter((e) => e.state === 'posted')
@@ -44,6 +39,12 @@ export default async function ExpensesPage({ searchParams }: { searchParams: Pro
         title="Expenses"
         subtitle="What staff spent on the agency's behalf, and what is still owed back to them."
         accent="var(--color-sec-settings)"
+        actions={
+          <>
+            <LinkButton href="/expenses/new?tab=advance">Pay advance</LinkButton>
+            <LinkButton href="/expenses/new" variant="primary">+ New Claim</LinkButton>
+          </>
+        }
       />
       {m.error && <Banner tone="error">{m.error}</Banner>}
       {m.ok && <Banner tone="ok">{m.ok}</Banner>}
@@ -55,8 +56,7 @@ export default async function ExpensesPage({ searchParams }: { searchParams: Pro
         <StatTile label="Claims this year" value={String(expenses.length)} />
       </div>
 
-      <div className="grid gap-5 lg:grid-cols-[2fr_1fr]">
-        <Card padded={false}>
+      <Card padded={false}>
           {expenses.length === 0 ? (
             <EmptyState title="No expense claims yet." />
           ) : (
@@ -114,78 +114,7 @@ export default async function ExpensesPage({ searchParams }: { searchParams: Pro
               </tbody>
             </Table>
           )}
-        </Card>
-
-        <div className="space-y-5">
-          <Card title="New claim">
-            <form action={saveExpenseAction} className="space-y-3">
-              <Field label="Employee">
-                <input name="employee_name" defaultValue={s.userName} className={inputClass} />
-              </Field>
-              <Field label="Description">
-                <input name="description" required className={inputClass} placeholder="Local guide — Bali day 3" />
-              </Field>
-              <Field label="Amount">
-                <input name="amount" required inputMode="decimal" className={`${inputClass} text-right`} />
-              </Field>
-              <Field label="Date">
-                <input type="date" name="expense_date" defaultValue={today} className={inputClass} />
-              </Field>
-              <Field label="Account">
-                <select name="account_id" required className={inputClass}>
-                  {accounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-                </select>
-              </Field>
-              <Field label="Input tax">
-                <select name="tax_id" className={inputClass} defaultValue="">
-                  <option value="">None</option>
-                  {taxes.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
-                </select>
-              </Field>
-              <Field label="Trip" hint="Tagging it here is what puts the cost into the trip's margin.">
-                <select name="booking_id" className={inputClass} defaultValue="">
-                  <option value="">—</option>
-                  {bookings.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}
-                </select>
-              </Field>
-              <Field label="Analytic">
-                <select name="analytic_id" className={inputClass} defaultValue="">
-                  <option value="">—</option>
-                  {analytics.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-                </select>
-              </Field>
-              <Field label="Paid by">
-                <select name="paid_by" className={inputClass} defaultValue="employee">
-                  <option value="employee">Employee (reimbursable)</option>
-                  <option value="company">Company card / cash</option>
-                </select>
-              </Field>
-              <input type="hidden" name="journal_id" value={journals.find((j) => j.type === 'general')?.id ?? ''} />
-              <button className={`${btn.primary} w-full`}>Submit claim</button>
-            </form>
-          </Card>
-
-          <Card title="Employee advance"
-            subtitle="Cash handed over before the trip. It sits as an asset until the claims come in.">
-            <form action={employeeAdvanceAction} className="space-y-3">
-              <Field label="Employee"><input name="employee_name" required className={inputClass} /></Field>
-              <Field label="Amount">
-                <input name="amount" required inputMode="decimal" className={`${inputClass} text-right`} />
-              </Field>
-              <Field label="Date">
-                <input type="date" name="date" defaultValue={today} className={inputClass} />
-              </Field>
-              <Field label="Paid from">
-                <select name="journal_id" className={inputClass}>
-                  {cashJournals.map((j) => <option key={j.id} value={j.id}>{j.label}</option>)}
-                </select>
-              </Field>
-              <Field label="Note"><input name="note" className={inputClass} /></Field>
-              <button className={`${btn.ghost} w-full`}>Pay advance</button>
-            </form>
-          </Card>
-        </div>
-      </div>
+      </Card>
     </>
   );
 }

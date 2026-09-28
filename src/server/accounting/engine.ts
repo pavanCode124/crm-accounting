@@ -245,7 +245,33 @@ function writeLine(input: PostingInput, entryId: string, l: PostingLine, state: 
     l.taxId ?? null, Math.round(l.taxBase ?? 0), l.bookingId ?? null, input.date, state,
   );
 
-  const spread = l.analytic ?? (l.analyticId ? [{ analyticId: l.analyticId, bps: 10000 }] : []);
+  /*
+   * A LINE TAGGED TO A TRIP IS TAGGED TO THE TRIP'S ANALYTIC ACCOUNT, ALWAYS.
+   *
+   * The two fields look interchangeable on a form and are not: `booking_id`
+   * is a label on the line, `analytic_id` is what Trip Profitability actually
+   * sums. Every entry screen in the product offers both, and a hotel bill
+   * where the accountant picked the trip but left the analytic box alone used
+   * to post with no analytic row at all — the cost was in the ledger, correct
+   * to the rupee, and simply absent from the trip's margin. Nobody notices
+   * that until the season is closed.
+   *
+   * So the booking fills it in. This is the one place worth doing it, because
+   * every posting in the system — invoice, bill, receipt, expense, commission,
+   * depreciation, hand-typed journal — passes through here, and a fallback in
+   * any one screen would have to be repeated in the other six.
+   *
+   * An analytic given explicitly always wins: a split across two trips, or a
+   * line deliberately tagged to a department instead, is a decision, and this
+   * only fills a blank.
+   */
+  let spread = l.analytic ?? (l.analyticId ? [{ analyticId: l.analyticId, bps: 10000 }] : []);
+  if (!spread.length && l.bookingId) {
+    const fromBooking = one<{ analytic_id: string | null }>(
+      'SELECT analytic_id FROM bookings WHERE id = ? AND org_id = ?', l.bookingId, input.orgId,
+    )?.analytic_id;
+    if (fromBooking) spread = [{ analyticId: fromBooking, bps: 10000 }];
+  }
   if (!spread.length) return;
 
   const totalBps = spread.reduce((s, a) => s + a.bps, 0);

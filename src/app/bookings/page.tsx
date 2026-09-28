@@ -1,12 +1,10 @@
 import { ctx } from '@/server/bootstrap';
 import { one, msg, type SearchParams } from '@/lib/range';
 import { listBookings, tripProfitability } from '@/server/accounting/analytics';
-import { partnerOptions } from '@/server/options';
-import { fmtDate, isoDate } from '@/lib/accounting';
+import { fmtDate } from '@/lib/accounting';
 import { fmt } from '@/lib/money';
-import { createBookingAction } from '@/app/actions';
 import {
-  PageHeader, Card, Banner, Table, Th, Td, Money, Chip, EmptyState, RefLink, Field, inputClass, btn,
+  PageHeader, Card, Banner, Table, Th, Td, Money, Chip, EmptyState, RefLink, LinkButton,
 } from '@/components/ui';
 
 export const dynamic = 'force-dynamic';
@@ -26,8 +24,6 @@ export default async function BookingsPage({ searchParams }: { searchParams: Pro
   const search = one(params, 'q');
   const bookings = listBookings(s.orgId, { search, status: one(params, 'status') });
   const profit = new Map(tripProfitability(s.orgId).map((t) => [t.booking_id, t]));
-  const customers = partnerOptions(s.orgId, 'customer');
-  const today = isoDate();
 
   return (
     <>
@@ -35,12 +31,12 @@ export default async function BookingsPage({ searchParams }: { searchParams: Pro
         title="Bookings"
         subtitle="Every trip, with what it has earned and what it has cost so far."
         accent="var(--color-brand)"
+        actions={<LinkButton href="/bookings/new" variant="primary">+ New Booking</LinkButton>}
       />
       {m.error && <Banner tone="error">{m.error}</Banner>}
       {m.ok && <Banner tone="ok">{m.ok}</Banner>}
 
-      <div className="grid gap-5 lg:grid-cols-[2.2fr_1fr]">
-        <Card padded={false}>
+      <Card padded={false}>
           {bookings.length === 0 ? (
             <EmptyState title="No bookings yet."
               hint="Create one here, or let the CRM push them across when a lead is marked Booked." />
@@ -81,39 +77,7 @@ export default async function BookingsPage({ searchParams }: { searchParams: Pro
               </tbody>
             </Table>
           )}
-        </Card>
-
-        <Card title="New booking" subtitle="Its trip analytic account is created alongside it.">
-          <form action={createBookingAction} className="space-y-3">
-            <Field label="Reference"><input name="ref" required className={inputClass} placeholder="BK-1028" /></Field>
-            <Field label="Title"><input name="title" required className={inputClass} placeholder="Bali 5D/4N — Rahul" /></Field>
-            <Field label="Customer">
-              <select name="partner_id" className={inputClass} defaultValue="">
-                <option value="">—</option>
-                {customers.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
-              </select>
-            </Field>
-            <Field label="Destination"><input name="destination" className={inputClass} /></Field>
-            <Field label="Package"><input name="package_name" className={inputClass} /></Field>
-            <Field label="Agent"><input name="agent_name" className={inputClass} /></Field>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Pax"><input name="pax" defaultValue="2" className={`${inputClass} text-right`} /></Field>
-              <Field label="Quoted value">
-                <input name="sell_value" inputMode="decimal" className={`${inputClass} text-right`} />
-              </Field>
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Departs"><input type="date" name="start_date" defaultValue={today} className={inputClass} /></Field>
-              <Field label="Returns"><input type="date" name="end_date" className={inputClass} /></Field>
-            </div>
-            <button className={`${btn.primary} w-full`}>Create booking</button>
-          </form>
-          <p className="mt-3 text-[12px] text-ink-faint">
-            The quoted value is what was sold. The invoice is what is owed — the reports read the
-            invoice, never this field.
-          </p>
-        </Card>
-      </div>
+      </Card>
     </>
   );
 }

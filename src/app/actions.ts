@@ -10,7 +10,7 @@ import {
   createDocument, updateDocument, postDocument, reverseDocument, createCreditNote, getDocument,
 } from '@/server/accounting/documents';
 import {
-  createPayment, allocate, unallocate, applyCreditNote, reversePayment,
+  createPayment, postPayment, allocate, unallocate, applyCreditNote, reversePayment,
 } from '@/server/accounting/payments';
 import { draftEntry, postDraft, postEntry, reverseEntry } from '@/server/accounting/engine';
 import {
@@ -23,11 +23,14 @@ import {
 } from '@/server/accounting/expenses';
 import { createAsset, confirmAsset, runDepreciation, createDeferral, runDeferrals } from '@/server/accounting/assets';
 import {
-  upsertAccount, archiveAccount, upsertJournal, upsertPartner, createBooking, upsertProduct, createBudget,
+  upsertAccount, setAccountReconcilable, upsertJournal, upsertPartner, createBooking,
+  upsertProduct, createBudget,
 } from '@/server/accounting/masters';
 import { setSetting, type SettingKey } from '@/server/accounting/settings';
 import { resetAndSeed } from '@/server/seed';
 import { run, id } from '@/server/db';
+import { connect as connectCrm, disconnect as disconnectCrm } from '@/server/crm/connection';
+import { syncFromCrm, forgetSyncLinks } from '@/server/crm/sync';
 
 /**
  * Every mutation in the product.
@@ -225,6 +228,21 @@ export async function registerPaymentAction(formData: FormData) {
   back(returnTo, r.error ? r : { ok: 'Payment recorded.' });
 }
 
+/**
+ * Post a payment that is sitting in draft.
+ *
+ * Only imported receipts are ever in that state — the on-screen form posts
+ * what it creates — so this is the button the Review & Post queue puts next to
+ * every receipt the CRM sent over. The allocation against an invoice is a
+ * separate, later act: the accountant does it from the receipt or the invoice
+ * once both are posted.
+ */
+export async function postPaymentAction(formData: FormData) {
+  const s = requireCap('payment.approve');
+  const r = guard(() => postPayment(s.orgId, str(formData, 'id'), actorOf(s)));
+  back(str(formData, 'return_to') || '/accounting/review', r.error ? r : { ok: 'Payment posted to the ledger.' });
+}
+
 export async function allocateAction(formData: FormData) {
   const s = requireCap('payment.create');
   const r = guard(() => allocate(
@@ -298,7 +316,7 @@ export async function postEntryAction(formData: FormData) {
   const s = requireCap('journal.post');
   const entryId = str(formData, 'id');
   const r = guard(() => postDraft(s.orgId, entryId, actorOf(s)));
-  back(`/accounting/entries/${entryId}`, r.error ? r : { ok: 'Posted.' });
+  back(str(formData, 'return_to') || `/accounting/entries/${entryId}`, r.error ? r : { ok: 'Posted.' });
 }
 
 export async function reverseEntryAction(formData: FormData) {
@@ -432,7 +450,7 @@ export async function saveExpenseAction(formData: FormData) {
     submitExpense(s.orgId, expenseId, actorOf(s));
     return expenseId;
   });
-  back('/expenses', r.error ? r : { ok: 'Expense submitted.' });
+  back(r.error ? '/expenses/new' : '/expenses', r.error ? r : { ok: 'Expense submitted.' });
 }
 
 export async function expenseWorkflowAction(formData: FormData) {
@@ -448,7 +466,7 @@ export async function expenseWorkflowAction(formData: FormData) {
       journalId: str(formData, 'journal_id'),
     }, actorOf(s));
   });
-  back('/expenses', r.error ? r : { ok: 'Done.' });
+  back(str(formData, 'return_to') || '/expenses', r.error ? r : { ok: 'Done.' });
 }
 
 export async function employeeAdvanceAction(formData: FormData) {
@@ -460,7 +478,7 @@ export async function employeeAdvanceAction(formData: FormData) {
     journalId: str(formData, 'journal_id'),
     note: opt(formData, 'note') ?? undefined,
   }, actorOf(s)));
-  back('/expenses', r.error ? r : { ok: 'Advance paid.' });
+  back(r.error ? '/expenses/new?tab=advance' : '/expenses', r.error ? r : { ok: 'Advance paid.' });
 }
 
 export async function commissionAction(formData: FormData) {
@@ -505,7 +523,8 @@ export async function saveAssetAction(formData: FormData) {
     if (bool(formData, 'confirm_now')) confirmAsset(s.orgId, assetId, actorOf(s));
     return assetId;
   });
-  back('/assets', r.error ? r : { ok: 'Asset created with its schedule.' });
+  back(r.error ? '/assets/new?tab=assets' : '/assets?tab=assets',
+    r.error ? r : { ok: 'Asset created with its schedule.' });
 }
 
 export async function runDepreciationAction(formData: FormData) {
@@ -527,7 +546,8 @@ export async function saveDeferralAction(formData: FormData) {
     dateFrom: str(formData, 'date_from') || isoDate(),
     months: Number(str(formData, 'months') || '12'),
   }, actorOf(s)));
-  back('/assets', r.error ? r : { ok: 'Deferral scheduled.' });
+  back(r.error ? '/assets/new?tab=deferrals' : '/assets?tab=deferrals',
+    r.error ? r : { ok: 'Deferral scheduled.' });
 }
 
 export async function runDeferralsAction(formData: FormData) {
@@ -549,15 +569,28 @@ export async function saveAccountAction(formData: FormData) {
     kind: str(formData, 'kind'),
     reconcilable: bool(formData, 'reconcilable'),
     description: opt(formData, 'description'),
-    active: !bool(formData, 'archived'),
   }, actorOf(s)));
-  back('/accounting/chart-of-accounts', r.error ? r : { ok: 'Account saved.' });
+  // A failure bounces back to the FORM, not to the list. Sending it to the list
+  // would show the reason the save failed on a page with no way to act on it,
+  // having thrown away everything that was typed.
+  back(r.error ? '/accounting/chart-of-accounts/new' : '/accounting/chart-of-accounts',
+    r.error ? r : { ok: 'Account created.' });
 }
 
-export async function archiveAccountAction(formData: FormData) {
+/**
+ * The "Allow Reconciliation" switch on the Chart of Accounts.
+ *
+ * The form sends the state it WANTS, not a "flip it" instruction. Two
+ * accountants on the same screen both pressing the same switch then agree on
+ * the outcome instead of racing to undo each other.
+ */
+export async function setReconcilableAction(formData: FormData) {
   const s = requireCap('coa.configure');
-  const r = guard(() => archiveAccount(s.orgId, str(formData, 'id'), actorOf(s)));
-  back('/accounting/chart-of-accounts', r.error ? r : { ok: 'Account archived.' });
+  const accountId = str(formData, 'id');
+  const on = str(formData, 'on') === '1';
+  const r = guard(() => setAccountReconcilable(s.orgId, accountId, on, actorOf(s)));
+  back(str(formData, 'return_to') || '/accounting/chart-of-accounts',
+    r.error ? r : { ok: on ? 'Reconciliation allowed on this account.' : 'Reconciliation switched off.' });
 }
 
 export async function saveJournalAction(formData: FormData) {
@@ -569,7 +602,8 @@ export async function saveJournalAction(formData: FormData) {
     type: str(formData, 'type'),
     defaultAccountId: opt(formData, 'default_account_id'),
   }, actorOf(s)));
-  back('/accounting/journals', r.error ? r : { ok: 'Journal saved.' });
+  back(r.error ? '/accounting/journals/new' : '/accounting/journals',
+    r.error ? r : { ok: 'Journal created.' });
 }
 
 export async function savePartnerAction(formData: FormData) {
@@ -618,7 +652,7 @@ export async function saveTaxAction(formData: FormData) {
       newId, s.orgId, fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6]);
     return newId;
   });
-  back('/taxes', r.error ? r : { ok: 'Tax saved.' });
+  back(r.error ? '/taxes/new' : '/taxes', r.error ? r : { ok: 'Tax created.' });
 }
 
 export async function saveProductAction(formData: FormData) {
@@ -634,7 +668,8 @@ export async function saveProductAction(formData: FormData) {
     saleTaxId: opt(formData, 'sale_tax_id'),
     purchaseTaxId: opt(formData, 'purchase_tax_id'),
   }, actorOf(s)));
-  back('/settings/products', r.error ? r : { ok: 'Product saved.' });
+  back(r.error ? '/settings/products/new' : '/settings/products',
+    r.error ? r : { ok: 'Product created.' });
 }
 
 export async function createBookingAction(formData: FormData) {
@@ -652,7 +687,7 @@ export async function createBookingAction(formData: FormData) {
     endDate: opt(formData, 'end_date'),
     sellValue: money(formData, 'sell_value'),
   }, actorOf(s)));
-  if (r.error) back('/bookings', r);
+  if (r.error) back('/bookings/new', r);
   back(`/bookings/${r.value}`, { ok: 'Booking created with its trip analytic account.' });
 }
 
@@ -672,7 +707,7 @@ export async function saveBudgetAction(formData: FormData) {
       planned: toMinor(planned[i] || '0'),
     })).filter((l) => l.planned !== 0),
   }, actorOf(s)));
-  back('/budgets', r.error ? r : { ok: 'Budget created.' });
+  back(r.error ? '/budgets/new' : '/budgets', r.error ? r : { ok: 'Budget created.' });
 }
 
 export async function saveSettingsAction(formData: FormData) {
@@ -698,6 +733,62 @@ export async function resetAction(formData: FormData) {
   if (str(formData, 'confirm') !== 'RESET') back('/settings', { error: 'Type RESET to confirm.' });
   const r = guard(() => resetAndSeed());
   back('/settings', r.error ? r : { ok: 'Books reset and re-seeded.' });
+}
+
+// ---------------------------------------------------------------------------
+// TripzoCRM sync
+// ---------------------------------------------------------------------------
+
+/**
+ * Sign in to the CRM and remember the session.
+ *
+ * `async` rather than sync because it is a network call, which is also why the
+ * usual `guard()` cannot wrap it — that helper takes a synchronous thunk.
+ */
+export async function crmConnectAction(formData: FormData) {
+  const s = requireCap('coa.configure');
+  const email = str(formData, 'email');
+  const password = String(formData.get('password') ?? '');
+  if (!email || !password) back('/settings/crm-sync', { error: 'Email and password are both needed.' });
+  try {
+    await connectCrm(s.orgId, email, password);
+  } catch (e) {
+    // The message is shown to a person, so it must not carry the password or a
+    // stack. client.ts already writes these for a reader.
+    back('/settings/crm-sync', { error: e instanceof Error ? e.message : 'Could not connect.' });
+  }
+  back('/settings/crm-sync', { ok: `Connected to TripzoCRM as ${email}.` });
+}
+
+export async function crmSyncAction() {
+  const s = requireCap('coa.configure');
+  let summary: string;
+  try {
+    const r = await syncFromCrm(s.orgId, actorOf(s));
+    summary =
+      `Imported ${r.customers} customer(s), ${r.suppliers} supplier(s), ${r.bookings} booking(s), ` +
+      `${r.invoices} invoice(s) and ${r.payments} payment(s) as DRAFTS — post them in ` +
+      `Accounting → Review & Post. ${r.skipped} already present.` +
+      (r.warnings.length ? ` ${r.warnings.length} warning(s) — see below.` : '');
+  } catch (e) {
+    back('/settings/crm-sync', { error: e instanceof Error ? e.message : 'Sync failed.' });
+  }
+  back('/settings/crm-sync', { ok: summary });
+}
+
+export async function crmDisconnectAction() {
+  const s = requireCap('coa.configure');
+  const r = guard(() => disconnectCrm(s.orgId));
+  back('/settings/crm-sync', r.error ? r : { ok: 'Disconnected. The stored token has been deleted.' });
+}
+
+export async function crmForgetLinksAction(formData: FormData) {
+  const s = requireCap('coa.configure');
+  if (str(formData, 'confirm') !== 'FORGET') {
+    back('/settings/crm-sync', { error: 'Type FORGET to confirm.' });
+  }
+  const r = guard(() => forgetSyncLinks(s.orgId));
+  back('/settings/crm-sync', r.error ? r : { ok: 'Import history cleared. The next sync will re-import everything.' });
 }
 
 void ctx;

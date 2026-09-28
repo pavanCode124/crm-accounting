@@ -3,11 +3,11 @@ import { ctx } from '@/server/bootstrap';
 import { msg, one, type SearchParams } from '@/lib/range';
 import { accountsWithBalances } from '@/server/accounting/reports';
 import {
-  ACCOUNT_KINDS, ACCOUNT_GROUPS, kindLabel, kindGroup, kindSign, drCr, isoDate, type AccountKind,
+  ACCOUNT_GROUPS, kindLabel, kindGroup, kindSign, drCr, isoDate,
 } from '@/lib/accounting';
-import { saveAccountAction, archiveAccountAction } from '@/app/actions';
+import { setReconcilableAction } from '@/app/actions';
 import {
-  PageHeader, Card, Banner, Table, Th, Td, Money, Chip, Field, inputClass, btn, StatTile,
+  PageHeader, Card, Banner, Table, Th, Td, Money, StatTile, LinkButton, ToggleSwitch,
 } from '@/components/ui';
 
 export const dynamic = 'force-dynamic';
@@ -47,6 +47,11 @@ export default async function ChartOfAccountsPage({ searchParams }: { searchPara
         title="Chart of Accounts"
         subtitle="Every account the ledger can post to, and what sits on it today."
         accent="var(--color-sec-accounting)"
+        actions={
+          <LinkButton href="/accounting/chart-of-accounts/new" variant="primary">
+            + New Account
+          </LinkButton>
+        }
       />
       {m.error && <Banner tone="error">{m.error}</Banner>}
       {m.ok && <Banner tone="ok">{m.ok}</Banner>}
@@ -65,30 +70,56 @@ export default async function ChartOfAccountsPage({ searchParams }: { searchPara
         </p>
       )}
 
-      <div className="grid gap-5 lg:grid-cols-[2fr_1fr]">
-        <Card padded={false}>
+      {/*
+        ONE COLUMN, full width. The add-an-account form used to sit in a second
+        column beside this table, permanently, costing a third of the window on
+        every visit for something done a handful of times a year. It is a page
+        now — see the button in the header.
+      */}
+      <Card padded={false}>
           <Table>
             <thead>
               <tr><Th width="90px">Code</Th><Th>Name</Th><Th>Type</Th>
+                <Th align="center" width="150px">Allow Reconciliation</Th>
                 <Th align="center" width="60px">Nature</Th>
-                <Th align="right" width="130px">Debit</Th>
-                <Th align="right" width="130px">Credit</Th>
-                <Th width="80px" /></tr>
+                <Th align="right" width="150px">Debit</Th>
+                <Th align="right" width="150px">Credit</Th></tr>
             </thead>
             <tbody>
               {shown.map((a) => {
                 const { debit, credit } = drCr(a.balance);
                 return (
-                  <tr key={a.id} className={`hover:bg-canvas ${a.active ? '' : 'opacity-55'}`}>
+                  <tr key={a.id} className="hover:bg-canvas">
                     <Td><span className="num !text-left font-bold">{a.code}</span></Td>
                     <Td>
                       <Link href={`/reports/ledger-account?account=${a.id}`} className="font-semibold text-brand hover:underline">
                         {a.name}
                       </Link>
-                      {!a.active && <span className="ml-2"><Chip state="closed" label="Archived" /></span>}
-                      {!!a.reconcilable && <span className="ml-2"><Chip state="draft" label="Reconcilable" /></span>}
                     </Td>
                     <Td><span className="text-ink-muted">{kindLabel(a.kind)}</span></Td>
+                    {/*
+                      ALLOW RECONCILIATION — a switch, not a badge.
+                      It used to be a "Reconcilable" chip tucked beside the
+                      account name, which told you the answer and gave you
+                      nowhere to change it: the only way to set the flag was to
+                      have ticked a box when the account was created, months
+                      ago. A column of switches is also the only shape in which
+                      the useful reading — "which of my control accounts can be
+                      matched off?" — is a glance down one column rather than a
+                      hunt through sixty rows of names.
+                    */}
+                    <Td align="center">
+                      <form action={setReconcilableAction} className="inline-flex">
+                        <input type="hidden" name="id" value={a.id} />
+                        <input type="hidden" name="on" value={a.reconcilable ? '0' : '1'} />
+                        <input type="hidden" name="return_to"
+                          value={group ? `/accounting/chart-of-accounts?group=${group}` : '/accounting/chart-of-accounts'} />
+                        <ToggleSwitch
+                          on={!!a.reconcilable}
+                          title={`${a.reconcilable ? 'Stop allowing' : 'Allow'} reconciliation on ${a.code} ${a.name}`}
+                        />
+                      </form>
+                    </Td>
                     {/* The side this account is SUPPOSED to sit on, from its kind. A
                         payable showing a debit balance is not illegal, but it is
                         worth a second look, and the reader can only spot that if
@@ -100,12 +131,6 @@ export default async function ChartOfAccountsPage({ searchParams }: { searchPara
                     </Td>
                     <Td align="right"><Money value={debit} bold /></Td>
                     <Td align="right"><Money value={credit} bold /></Td>
-                    <Td align="right">
-                      <form action={archiveAccountAction}>
-                        <input type="hidden" name="id" value={a.id} />
-                        <button className="text-[12px] font-bold text-ink-faint hover:text-negative">Archive</button>
-                      </form>
-                    </Td>
                   </tr>
                 );
               })}
@@ -118,14 +143,13 @@ export default async function ChartOfAccountsPage({ searchParams }: { searchPara
             */}
             <tfoot>
               <tr className="bg-brand-soft">
-                <Td colSpan={4}>
+                <Td colSpan={5}>
                   <span className="font-extrabold">
                     {group ? `Total — ${group} accounts` : 'Total — all accounts'}
                   </span>
                 </Td>
                 <Td align="right"><Money value={totalDebit} bold dash={false} /></Td>
                 <Td align="right"><Money value={totalCredit} bold dash={false} /></Td>
-                <Td />
               </tr>
               {!group && (
                 <tr>
@@ -141,35 +165,7 @@ export default async function ChartOfAccountsPage({ searchParams }: { searchPara
               )}
             </tfoot>
           </Table>
-        </Card>
-
-        <Card title="Add an account"
-          subtitle="The type decides which statement it lands on, and how its balance is read.">
-          <form action={saveAccountAction} className="space-y-3">
-            <Field label="Code" hint="Four to six digits, following the ranges already in use.">
-              <input name="code" required className={inputClass} placeholder="512000" />
-            </Field>
-            <Field label="Name"><input name="name" required className={inputClass} /></Field>
-            <Field label="Type">
-              <select name="kind" className={inputClass} defaultValue="expense_direct">
-                {(Object.keys(ACCOUNT_KINDS) as AccountKind[]).map((k) => (
-                  <option key={k} value={k}>{ACCOUNT_KINDS[k].label} ({ACCOUNT_KINDS[k].group})</option>
-                ))}
-              </select>
-            </Field>
-            <label className="flex items-center gap-2 text-[13px] font-semibold">
-              <input type="checkbox" name="reconcilable" className="h-4 w-4" />
-              Reconcilable
-            </label>
-            <p className="text-[12px] text-ink-faint">
-              Tick it for receivables, payables and advances — accounts whose lines are matched off
-              against each other rather than against a bank statement.
-            </p>
-            <Field label="Description"><input name="description" className={inputClass} /></Field>
-            <button className={`${btn.primary} w-full`}>Add account</button>
-          </form>
-        </Card>
-      </div>
+      </Card>
     </>
   );
 }

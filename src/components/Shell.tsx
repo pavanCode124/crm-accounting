@@ -166,9 +166,13 @@ function Brand({ orgName }: { orgName: string }) {
 /**
  * One section of the bar: the button, and the panel it drops.
  *
- * The section's own colour is the underline on the active section and the dot
- * beside its name — the CRM's SECTION table, carried across so Sales is the
- * same green in both products.
+ * NO SECTION COLOUR ANYWHERE IN HERE, deliberately. The bar used to carry a
+ * coloured dot beside every label and a coloured underline under the active
+ * one — nine hues competing for attention above a page whose own use of colour
+ * is meaningful (red is money going out, green is money coming in). Chrome that
+ * borrows the same vocabulary makes the figures harder to read, not easier.
+ * Position and weight mark the active section instead, which is what a ledger
+ * product should look like.
  */
 function SectionButton({ section, pathname, open, onToggle }: {
   section: NavSection; pathname: string; open: boolean; onToggle: () => void;
@@ -198,16 +202,17 @@ function SectionButton({ section, pathname, open, onToggle }: {
         onClick={toggle}
         aria-expanded={open}
         aria-haspopup="true"
-        className="flex items-center gap-1.5 whitespace-nowrap px-3.5 py-2.5 text-[13px] font-bold"
+        className="flex items-center gap-1.5 whitespace-nowrap px-3.5 py-2.5 text-[13px] font-semibold"
         style={{
           color: active || open ? '#ffffff' : 'var(--nav-text)',
-          boxShadow: active ? `inset 0 -3px 0 0 ${section.color}` : undefined,
+          // A plain white rule, the same on every section. It says "you are
+          // here" without also saying "and here is a colour to remember".
+          boxShadow: active ? 'inset 0 -2px 0 0 #ffffff' : undefined,
           background: open ? 'var(--nav-input)' : 'transparent',
         }}
       >
-        <span className="h-[7px] w-[7px] shrink-0 rounded-full" style={{ background: section.color }} />
         {section.label}
-        <span className="text-[9px] leading-none opacity-70">{open ? '▲' : '▼'}</span>
+        <span className="text-[8px] leading-none opacity-55">{open ? '▲' : '▼'}</span>
       </button>
 
       {open && (
@@ -216,20 +221,14 @@ function SectionButton({ section, pathname, open, onToggle }: {
             alignRight ? 'right-0' : 'left-0'}`}
           style={{ boxShadow: '0 18px 44px rgba(20,16,31,0.22)' }}
         >
-          <div className="mb-1 flex items-center gap-2 border-b border-line px-4 pb-1.5 pt-1">
-            <span className="h-[3px] w-[14px] rounded-full" style={{ background: section.color }} />
-            <span className="text-[10px] font-extrabold uppercase tracking-[0.12em] text-ink-faint">
-              {section.label}
-            </span>
-          </div>
           {section.items.map((item) => {
             const on = item.match ? pathname.startsWith(item.match) : pathname === item.href;
             return (
               <Link
                 key={item.href}
                 href={item.href}
-                className={`block px-4 py-2 text-[13.5px] font-semibold ${
-                  on ? 'bg-brand-soft text-brand' : 'text-ink hover:bg-canvas'}`}
+                className={`block px-4 py-2 text-[13.5px] ${
+                  on ? 'bg-canvas font-bold text-ink' : 'font-medium text-ink-muted hover:bg-canvas hover:text-ink'}`}
               >
                 {item.label}
               </Link>
@@ -257,19 +256,16 @@ function MobileSheet({ sections, pathname }: { sections: NavSection[]; pathname:
       </form>
       {sections.map((s) => (
         <div key={s.key} className="mb-3.5">
-          <div className="mb-1 flex items-center gap-2">
-            <span className="h-[3px] w-[14px] rounded-full" style={{ background: s.color }} />
-            <span className="text-[10px] font-extrabold uppercase tracking-[0.12em] text-ink-faint">
-              {s.label}
-            </span>
+          <div className="mb-1 text-[10px] font-bold uppercase tracking-[0.12em] text-ink-faint">
+            {s.label}
           </div>
           <div className="grid grid-cols-2 gap-1">
             {s.items.map((item) => {
               const on = item.match ? pathname.startsWith(item.match) : pathname === item.href;
               return (
                 <Link key={item.href} href={item.href}
-                  className={`truncate rounded-[9px] px-3 py-2 text-[13px] font-semibold ${
-                    on ? 'bg-brand-soft text-brand' : 'text-ink hover:bg-canvas'}`}>
+                  className={`truncate rounded-[9px] px-3 py-2 text-[13px] ${
+                    on ? 'bg-canvas font-bold text-ink' : 'font-medium text-ink-muted hover:bg-canvas'}`}>
                   {item.label}
                 </Link>
               );

@@ -626,3 +626,37 @@ CREATE TABLE IF NOT EXISTS org_settings (
   value  TEXT,
   PRIMARY KEY (org_id, key)
 );
+
+-- ---------------------------------------------------------------------------
+-- TripzoCRM connection and record links
+-- ---------------------------------------------------------------------------
+-- The books are DERIVED from the CRM rather than typed into this app twice, so
+-- two things have to be remembered between syncs: who we are signed in as, and
+-- which local record each CRM record became.
+
+-- One row, holding the Supabase session the accountant signed in with at
+-- /settings/crm-sync. The PASSWORD IS NEVER HERE — see src/server/crm/client.ts.
+CREATE TABLE IF NOT EXISTS crm_connection (
+  org_id        TEXT PRIMARY KEY,
+  email         TEXT NOT NULL,
+  access_token  TEXT NOT NULL,
+  refresh_token TEXT,
+  expires_at    INTEGER NOT NULL,       -- epoch ms
+  crm_org_id    TEXT,
+  crm_org_name  TEXT,
+  last_sync_at  TEXT,
+  last_result   TEXT
+);
+
+-- The identity map. Without it a second sync creates a second copy of every
+-- invoice, which in a double-entry system is not a duplicate row but a doubled
+-- set of postings — revenue, receivable and tax all twice over.
+CREATE TABLE IF NOT EXISTS crm_links (
+  org_id   TEXT NOT NULL,
+  kind     TEXT NOT NULL,               -- partner | booking | document | payment
+  crm_id   TEXT NOT NULL,
+  local_id TEXT NOT NULL,
+  synced_at TEXT NOT NULL,
+  PRIMARY KEY (org_id, kind, crm_id)
+);
+CREATE INDEX IF NOT EXISTS idx_crm_links_local ON crm_links(org_id, kind, local_id);

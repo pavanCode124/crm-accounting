@@ -1,5 +1,5 @@
 import 'server-only';
-import { all, one, run, tx, id, nowIso, scalar } from '../db';
+import { all, one, run, scalar, tx, id, nowIso } from '../db';
 import { audit } from './audit';
 import type { Actor } from './engine';
 
@@ -63,21 +63,96 @@ export function upsertAccount(orgId: string, a: {
 }
 
 /**
- * An account that has ever been posted to is archived, never deleted.
- * Deleting it would orphan journal entry lines, which is the one thing a
- * double-entry system can never allow.
+ * Flip "Allow Reconciliation" on one account.
+ *
+ * -------------------------------------------------------------------------
+ * WHAT THE FLAG MEANS HERE
+ * -------------------------------------------------------------------------
+ * A reconcilable account is one whose lines are matched OFF AGAINST EACH
+ * OTHER: a receivable that an receipt settles, a payable that a supplier
+ * payment clears, an advance that an invoice consumes. It is the flag that
+ * makes "this invoice still owes ₹40,000" a sentence the ledger can support,
+ * because the residual is the unmatched part of the control account's lines
+ * for that document.
+ *
+ * It is NOT bank reconciliation. A bank account is reconciled against a
+ * STATEMENT — a different mechanism, on a different screen, and marking the
+ * bank account reconcilable here changes nothing about it.
+ *
+ * -------------------------------------------------------------------------
+ * WHY THIS IS A TOGGLE AND NOT A FIELD ON THE EDIT FORM
+ * -------------------------------------------------------------------------
+ * It is the one property of an account that gets set wrong and then sits there
+ * — a new "Advances from Agents" account, created in a hurry, unreconcilable,
+ * and discovered when the first advance refuses to apply. A switch on the list
+ * lets someone scan the whole chart and fix it in the column where the mistake
+ * is visible, which is the only place anyone would notice it.
+ *
+ * -------------------------------------------------------------------------
+ * THE ONE REFUSAL
+ * -------------------------------------------------------------------------
+ * Turning it OFF on an account that still carries an unsettled document is
+ * refused, and named. The flag is what allocation stands on; removing it under
+ * a live receivable would leave invoices that can never be settled and an
+ * ageing report with no way to clear its oldest column. Settle them, or move
+ * the partner to a different control account first.
  */
-export function archiveAccount(orgId: string, accountId: string, actor: Actor = {}) {
-  const used = scalar('SELECT COUNT(*) FROM journal_entry_lines WHERE account_id=?', accountId);
-  if (used === 0) {
-    run('DELETE FROM accounts WHERE id=? AND org_id=?', accountId, orgId);
-    audit(orgId, actor, 'deleted', 'account', accountId, 'Unused account removed');
-    return 'deleted';
+export function setAccountReconcilable(
+  orgId: string, accountId: string, on: boolean, actor: Actor = {},
+): void {
+  const account = one<{ code: string; name: string }>(
+    'SELECT code, name FROM accounts WHERE id=? AND org_id=?', accountId, orgId,
+  );
+  if (!account) throw new Error('Unknown account.');
+
+  if (!on) {
+    // Documents settle against the control account their PARTNER resolves to,
+    // which is the partner override where there is one and the org default
+    // otherwise — so both are checked, rather than assuming every receivable
+    // lands on the setting.
+    const open = scalar(
+      `SELECT COUNT(*) FROM documents d
+         JOIN partners p ON p.id = d.partner_id
+        WHERE d.org_id = ? AND d.state = 'posted' AND d.residual > 0
+          AND (
+            COALESCE(p.receivable_account_id, (SELECT value FROM org_settings WHERE org_id=d.org_id AND key='account.receivable')) = ?
+            OR
+            COALESCE(p.payable_account_id, (SELECT value FROM org_settings WHERE org_id=d.org_id AND key='account.payable')) = ?
+          )`,
+      orgId, accountId, accountId,
+    );
+    if (open > 0) {
+      throw new Error(
+        `${account.code} ${account.name} still carries ${open} unsettled document(s). ` +
+        'Reconciliation cannot be switched off while anything is waiting to be matched against it.',
+      );
+    }
   }
-  run('UPDATE accounts SET active=0 WHERE id=? AND org_id=?', accountId, orgId);
-  audit(orgId, actor, 'archived', 'account', accountId, `Archived (${used} posted line(s))`);
-  return 'archived';
+
+  run('UPDATE accounts SET reconcilable=? WHERE id=? AND org_id=?', on ? 1 : 0, accountId, orgId);
+  audit(orgId, actor, 'modified', 'account', accountId,
+    `${account.code} ${account.name} — reconciliation ${on ? 'allowed' : 'not allowed'}`);
 }
+
+/*
+ * ARCHIVING AN ACCOUNT WAS REMOVED, deliberately.
+ *
+ * It offered two outcomes that both turned out to be wrong for this product. An
+ * account with no postings was DELETED outright, which is a destructive button
+ * sitting on every row of a table people scroll through daily. An account with
+ * postings was flagged inactive — and an inactive account still carries its
+ * balance, still appears on the trial balance and the balance sheet (it must:
+ * its lines are real), but silently refuses new postings. So the chart showed a
+ * greyed-out row with money on it and no explanation, and the only way to post
+ * to it again was a button that no longer existed.
+ *
+ * A chart of accounts is small and slow-moving. An account that should not be
+ * used is handled by not using it, and renaming it if that needs saying out
+ * loud. `accounts.active` survives in the schema because the posting engine
+ * still honours it and a future release may want a considered version of this,
+ * but nothing in the product sets it to 0 any more — see the repair statement
+ * in src/server/db.ts.
+ */
 
 // ------------------------------------------------------------------ journals
 export interface JournalRow {

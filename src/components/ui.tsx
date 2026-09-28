@@ -202,6 +202,41 @@ export function LinkButton({ href, children, variant = 'ghost' }: {
   return <Link href={href} className={btn[variant]}>{children}</Link>;
 }
 
+/**
+ * A TOGGLE SWITCH THAT IS A SUBMIT BUTTON.
+ *
+ * Every setting in this product is a form post, and this one stays that way:
+ * the switch is the button, the button is inside a `<form action={...}>`, and
+ * flipping it is an ordinary server action with an audit row behind it. There
+ * is no onChange, no fetch and no optimistic state, so it behaves identically
+ * with JavaScript disabled and cannot show "on" for a change the server
+ * refused — which for an accounting flag is the whole point.
+ *
+ * The visual is the usual pill-and-knob. `title` matters more than it looks:
+ * on a table of sixty rows of identical switches, the hover text is what tells
+ * the reader which account they are about to change.
+ */
+export function ToggleSwitch({ on, title, disabled }: {
+  on: boolean; title: string; disabled?: boolean;
+}) {
+  return (
+    <button
+      type="submit"
+      title={title}
+      disabled={disabled}
+      aria-pressed={on}
+      className={`relative inline-flex h-[22px] w-[40px] shrink-0 items-center rounded-full border transition-colors
+        disabled:cursor-not-allowed disabled:opacity-40
+        ${on ? 'border-positive bg-positive' : 'border-line bg-canvas'}`}
+    >
+      <span
+        className={`absolute h-[16px] w-[16px] rounded-full bg-surface shadow-sm transition-all
+          ${on ? 'left-[21px]' : 'left-[2px]'}`}
+      />
+    </button>
+  );
+}
+
 /** The blue-ish reference link used on every document number in a list. */
 export function RefLink({ href, children }: { href: string; children: ReactNode }) {
   return <Link href={href} className="font-bold text-brand hover:underline">{children}</Link>;
@@ -292,7 +327,7 @@ export function Bar({ value, max, color }: { value: number; max: number; color?:
   const pct = max === 0 ? 0 : Math.min(Math.abs(value / max) * 100, 100);
   return (
     <div className="h-2 w-full overflow-hidden rounded-full bg-canvas">
-      <div className="h-full rounded-full" style={{ width: `${pct}%`, background: color ?? 'varbrand' }} />
+      <div className="h-full rounded-full" style={{ width: `${pct}%`, background: color ?? 'var(--color-brand)' }} />
     </div>
   );
 }

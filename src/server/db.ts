@@ -53,6 +53,16 @@ function open(): DatabaseSync {
 function migrate(database: DatabaseSync) {
   const additions = [
     "ALTER TABLE payments ADD COLUMN side TEXT NOT NULL DEFAULT 'customer'",
+    /*
+     * Un-archive every account.
+     *
+     * Archiving was removed from the product (see masters.ts), but a database
+     * created before that has accounts sitting at active=0 — greyed out on the
+     * chart, refused by the posting engine, and now with no button anywhere to
+     * bring them back. This repairs them. It is idempotent and a no-op on a
+     * fresh install, which is what lets it live in this list.
+     */
+    'UPDATE accounts SET active = 1 WHERE active = 0',
   ];
   for (const sql of additions) {
     try {

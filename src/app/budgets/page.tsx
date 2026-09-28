@@ -2,12 +2,10 @@ import { ctx } from '@/server/bootstrap';
 import { msg, one, type SearchParams } from '@/lib/range';
 import { listBudgets } from '@/server/accounting/masters';
 import { budgetWithActuals } from '@/server/accounting/analytics';
-import { accountOptions, analyticOptions } from '@/server/options';
-import { fmtDate, fiscalYearOf, isoDate } from '@/lib/accounting';
+import { fmtDate } from '@/lib/accounting';
 import { fmt } from '@/lib/money';
-import { saveBudgetAction } from '@/app/actions';
 import {
-  PageHeader, Card, Banner, Table, Th, Td, Money, Chip, StatTile, EmptyState, Field, inputClass, btn, Bar,
+  PageHeader, Card, Banner, Table, Th, Td, Money, Chip, StatTile, EmptyState, Bar, LinkButton,
 } from '@/components/ui';
 
 export const dynamic = 'force-dynamic';
@@ -26,9 +24,6 @@ export default async function BudgetsPage({ searchParams }: { searchParams: Prom
   const budgets = listBudgets(s.orgId);
   const selected = one(params, 'id') ?? budgets[0]?.id;
   const detail = selected ? budgetWithActuals(s.orgId, selected) : null;
-  const fy = fiscalYearOf(isoDate(), s.fyStartMonth);
-  const accounts = accountOptions(s.orgId, ['expense_direct', 'expense_operating', 'income']);
-  const analytics = analyticOptions(s.orgId);
 
   return (
     <>
@@ -36,6 +31,7 @@ export default async function BudgetsPage({ searchParams }: { searchParams: Prom
         title="Budgets"
         subtitle="What was planned against what the ledger actually recorded."
         accent="var(--color-sec-settings)"
+        actions={<LinkButton href="/budgets/new" variant="primary">+ New Budget</LinkButton>}
       />
       {m.error && <Banner tone="error">{m.error}</Banner>}
       {m.ok && <Banner tone="ok">{m.ok}</Banner>}
@@ -52,8 +48,7 @@ export default async function BudgetsPage({ searchParams }: { searchParams: Prom
         </div>
       )}
 
-      <div className="grid gap-5 lg:grid-cols-[2fr_1fr]">
-        <div className="space-y-5">
+      <div className="space-y-5">
           {budgets.length > 1 && (
             <Card padded={false}>
               <Table>
@@ -78,7 +73,9 @@ export default async function BudgetsPage({ searchParams }: { searchParams: Prom
           <Card title={detail ? detail.budget.name : 'Budget'} padded={false}
             subtitle={detail ? `${fmtDate(detail.budget.date_from)} to ${fmtDate(detail.budget.date_to)}` : undefined}>
             {!detail ? (
-              <EmptyState title="No budget yet." hint="Create one beside this panel." />
+              <EmptyState title="No budget yet."
+                hint="Create one with the button at the top of this page."
+                action={<LinkButton href="/budgets/new" variant="primary">+ New Budget</LinkButton>} />
             ) : (
               <Table>
                 <thead>
@@ -123,37 +120,6 @@ export default async function BudgetsPage({ searchParams }: { searchParams: Prom
               </Table>
             )}
           </Card>
-        </div>
-
-        <Card title="New budget" subtitle="Five lines is usually enough; add more by creating another.">
-          <form action={saveBudgetAction} className="space-y-3">
-            <Field label="Name"><input name="name" required className={inputClass} /></Field>
-            <Field label="Responsible"><input name="owner" className={inputClass} /></Field>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="From">
-                <input type="date" name="date_from" defaultValue={fy.from} className={inputClass} />
-              </Field>
-              <Field label="To">
-                <input type="date" name="date_to" defaultValue={fy.to} className={inputClass} />
-              </Field>
-            </div>
-            {[0, 1, 2, 3, 4].map((i) => (
-              <div key={i} className="grid grid-cols-[1fr_auto] gap-2">
-                <select name="line_account" className={inputClass} defaultValue="">
-                  <option value="">— account —</option>
-                  {accounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-                </select>
-                <input name="line_planned" inputMode="decimal" placeholder="0.00"
-                  className={`${inputClass} w-[120px] text-right`} />
-                <select name="line_analytic" className={`${inputClass} col-span-2`} defaultValue="">
-                  <option value="">— any analytic —</option>
-                  {analytics.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-                </select>
-              </div>
-            ))}
-            <button className={`${btn.primary} w-full`}>Create budget</button>
-          </form>
-        </Card>
       </div>
     </>
   );

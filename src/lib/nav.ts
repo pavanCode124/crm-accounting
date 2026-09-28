@@ -21,12 +21,19 @@ export interface NavItem {
   match?: string;
 }
 
+/**
+ * A section carries no colour and no icon.
+ *
+ * It used to carry both, mirroring the CRM's SECTION table. In a CRM that works
+ * — the sections are places, and a colour per place helps you learn the map. In
+ * a ledger it fights the content: red, green and amber already MEAN something
+ * on these screens, and a menu that spends nine more hues on decoration leaves
+ * the reader deciding, every time, whether a colour is telling them something.
+ * The masthead marks the active section by weight and an underline instead.
+ */
 export interface NavSection {
   key: string;
   label: string;
-  /** The section's deep colour — the CRM's SECTION table. */
-  color: string;
-  icon: string;
   items: NavItem[];
 }
 
@@ -34,8 +41,6 @@ export const NAV: NavSection[] = [
   {
     key: 'overview',
     label: 'Overview',
-    color: 'var(--color-brand)',
-    icon: 'grid',
     items: [
       { label: 'Finance Overview', href: '/' },
       { label: 'Bookings', href: '/bookings', match: '/bookings' },
@@ -44,8 +49,6 @@ export const NAV: NavSection[] = [
   {
     key: 'sales',
     label: 'Sales',
-    color: 'var(--color-sec-sales)',
-    icon: 'receipt',
     items: [
       { label: 'Invoices', href: '/sales/invoices', match: '/sales/invoices', cap: 'finance.view' },
       { label: 'Payments Received', href: '/sales/payments', match: '/sales/payments' },
@@ -56,8 +59,6 @@ export const NAV: NavSection[] = [
   {
     key: 'purchases',
     label: 'Purchases',
-    color: 'var(--color-sec-purchases)',
-    icon: 'bag',
     items: [
       { label: 'Vendor Bills', href: '/purchases/bills', match: '/purchases/bills' },
       { label: 'Payments Made', href: '/purchases/payments', match: '/purchases/payments' },
@@ -68,8 +69,6 @@ export const NAV: NavSection[] = [
   {
     key: 'banking',
     label: 'Banking',
-    color: 'var(--color-sec-banking)',
-    icon: 'bank',
     items: [
       { label: 'Bank Accounts', href: '/banking', match: '/banking' },
       { label: 'Reconciliation', href: '/banking/reconcile', match: '/banking/reconcile', cap: 'bank.reconcile' },
@@ -78,14 +77,21 @@ export const NAV: NavSection[] = [
   {
     key: 'accounting',
     label: 'Accounting',
-    color: 'var(--color-sec-accounting)',
-    icon: 'book',
     items: [
+      /*
+       * FIRST in the section, deliberately.
+       *
+       * It is the screen an accountant opens most days and the only place
+       * anything enters the ledger. Sorting it under J for Journal, between
+       * two configuration screens, buried the daily job under the annual one.
+       */
+      { label: 'Review & Post', href: '/accounting/review', match: '/accounting/review' },
       { label: 'Chart of Accounts', href: '/accounting/chart-of-accounts', match: '/accounting/chart-of-accounts' },
       { label: 'Journal Entries', href: '/accounting/entries', match: '/accounting/entries' },
       { label: 'Journals', href: '/accounting/journals', match: '/accounting/journals' },
       { label: 'Accounting Periods', href: '/accounting/periods', match: '/accounting/periods' },
       { label: 'Opening Balances', href: '/accounting/opening-balances', cap: 'coa.configure' },
+      { label: 'Audit Trail', href: '/accounting/audit', match: '/accounting/audit' },
     ],
   },
   {
@@ -101,8 +107,6 @@ export const NAV: NavSection[] = [
      */
     key: 'books',
     label: 'Books',
-    color: 'var(--color-sec-books)',
-    icon: 'ledger',
     items: [
       { label: 'Day Book', href: '/reports/day-book', match: '/reports/day-book', cap: 'reports.view' },
       { label: 'Ledger Account', href: '/reports/ledger-account', match: '/reports/ledger-account', cap: 'reports.view' },
@@ -115,8 +119,6 @@ export const NAV: NavSection[] = [
   {
     key: 'taxes',
     label: 'Taxes',
-    color: 'var(--color-sec-taxes)',
-    icon: 'percent',
     items: [
       { label: 'Taxes & TDS', href: '/taxes', match: '/taxes' },
       { label: 'Tax Report', href: '/reports/tax' },
@@ -125,8 +127,6 @@ export const NAV: NavSection[] = [
   {
     key: 'analytics',
     label: 'Analytics',
-    color: 'var(--color-sec-analytics)',
-    icon: 'chart',
     items: [
       { label: 'Trip Profitability', href: '/analytics/trips', match: '/analytics/trips', cap: 'profitability.view' },
       { label: 'Packages', href: '/analytics/packages', cap: 'profitability.view' },
@@ -137,20 +137,17 @@ export const NAV: NavSection[] = [
   {
     key: 'operations',
     label: 'Operations',
-    color: 'var(--color-sec-settings)',
-    icon: 'tools',
     items: [
       { label: 'Expenses', href: '/expenses', match: '/expenses' },
       { label: 'Commissions', href: '/commissions' },
       { label: 'Budgets', href: '/budgets', match: '/budgets', cap: 'budget.manage' },
       { label: 'Assets & Deferrals', href: '/assets', match: '/assets' },
+      { label: 'CRM Sync', href: '/settings/crm-sync', match: '/settings/crm-sync', cap: 'coa.configure' },
     ],
   },
   {
     key: 'reports',
     label: 'Reports',
-    color: 'var(--color-sec-reports)',
-    icon: 'report',
     items: [
       { label: 'Profit & Loss', href: '/reports/profit-and-loss', cap: 'reports.view' },
       { label: 'Balance Sheet', href: '/reports/balance-sheet', cap: 'reports.view' },

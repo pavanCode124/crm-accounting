@@ -2,12 +2,10 @@ import Link from 'next/link';
 import { ctx } from '@/server/bootstrap';
 import { msg, type SearchParams } from '@/lib/range';
 import { all } from '@/server/db';
-import { accountOptions } from '@/server/options';
 import { bpsToPct, fmt } from '@/lib/money';
 import { titleise } from '@/lib/accounting';
-import { saveTaxAction } from '@/app/actions';
 import {
-  PageHeader, Card, Banner, Table, Th, Td, Chip, Field, inputClass, btn,
+  PageHeader, Card, Banner, Table, Th, Td, Chip, btn, LinkButton,
 } from '@/components/ui';
 
 export const dynamic = 'force-dynamic';
@@ -44,7 +42,6 @@ export default async function TaxesPage({ searchParams }: { searchParams: Promis
   const parents = taxes.filter((t) => !t.is_child && t.tax_group !== 'tds');
   const children = taxes.filter((t) => t.is_child);
   const withholding = taxes.filter((t) => t.tax_group === 'tds');
-  const accounts = accountOptions(s.orgId, ['liability_tax', 'asset_current']);
 
   return (
     <>
@@ -52,13 +49,17 @@ export default async function TaxesPage({ searchParams }: { searchParams: Promis
         title="Taxes"
         subtitle="GST, IGST and TDS — configured, not hard-coded."
         accent="var(--color-sec-taxes)"
-        actions={<Link href="/reports/tax" className={btn.ghost}>Tax report →</Link>}
+        actions={
+          <>
+            <Link href="/reports/tax" className={btn.ghost}>Tax report →</Link>
+            <LinkButton href="/taxes/new" variant="primary">+ New Tax</LinkButton>
+          </>
+        }
       />
       {m.error && <Banner tone="error">{m.error}</Banner>}
       {m.ok && <Banner tone="ok">{m.ok}</Banner>}
 
-      <div className="grid gap-5 lg:grid-cols-[2fr_1fr]">
-        <div className="space-y-5">
+      <div className="space-y-5">
           <Card title="Sales and purchase taxes" padded={false}
             subtitle="What an invoice or bill line can carry.">
             <Table>
@@ -119,47 +120,6 @@ export default async function TaxesPage({ searchParams }: { searchParams: Promis
               does not withhold tax on its own tax. Below the threshold, nothing is withheld.
             </p>
           </Card>
-        </div>
-
-        <Card title="Add a tax">
-          <form action={saveTaxAction} className="space-y-3">
-            <Field label="Name"><input name="name" required className={inputClass} placeholder="GST 28% (Sales)" /></Field>
-            <Field label="Rate %">
-              <input name="rate" required inputMode="decimal" className={`${inputClass} text-right`} placeholder="28" />
-            </Field>
-            <Field label="Applies to">
-              <select name="scope" className={inputClass} defaultValue="sale">
-                <option value="sale">Sales</option>
-                <option value="purchase">Purchases</option>
-                <option value="none">Neither (manual)</option>
-              </select>
-            </Field>
-            <Field label="Group">
-              <select name="tax_group" className={inputClass} defaultValue="gst">
-                {['gst', 'igst', 'cgst_sgst', 'tds', 'tcs', 'vat', 'none'].map((g) =>
-                  <option key={g} value={g}>{g.toUpperCase()}</option>)}
-              </select>
-            </Field>
-            <Field label="Posted to">
-              <select name="account_id" className={inputClass} defaultValue="">
-                <option value="">— choose —</option>
-                {accounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-              </select>
-            </Field>
-            <Field label="Threshold" hint="TDS only. Below this annual value nothing is withheld.">
-              <input name="threshold" inputMode="decimal" className={`${inputClass} text-right`} />
-            </Field>
-            <label className="flex items-center gap-2 text-[13px] font-semibold">
-              <input type="checkbox" name="price_included" className="h-4 w-4" />
-              Price already includes this tax
-            </label>
-            <button className={`${btn.primary} w-full`}>Add tax</button>
-          </form>
-          <p className="mt-3 text-[12px] text-ink-faint">
-            A CGST/SGST pair is created as a parent at the full rate with two children at half —
-            the seed shows the shape.
-          </p>
-        </Card>
       </div>
     </>
   );

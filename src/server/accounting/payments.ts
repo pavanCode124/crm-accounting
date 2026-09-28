@@ -50,6 +50,16 @@ export interface PaymentInput {
   note?: string | null;
   /** Documents to settle straight away, in the same transaction. */
   allocations?: Array<{ documentId: string; amount: number }>;
+  /**
+   * Post it, or leave it in draft for someone to review first.
+   *
+   * Defaults to true, which is what "Receive payment" on screen means: the
+   * accountant filled the form, so the accountant decided. The CRM importer
+   * passes false — a receipt that arrived from another system has not been
+   * looked at by anybody here yet, and a draft is exactly the right shape for
+   * "this is claimed, and not yet a fact in the books".
+   */
+  post?: boolean;
 }
 
 export interface PaymentRow {
@@ -61,7 +71,12 @@ export interface PaymentRow {
   created_at: string; posted_at: string | null;
 }
 
-/** Create and post in one step — what "Receive payment" does on screen. */
+/**
+ * Create, and post unless the caller asked for a draft.
+ *
+ * "Receive payment" on screen posts, because the person clicking it is the
+ * person deciding. An import leaves the draft for that decision to be made.
+ */
 export function createPayment(input: PaymentInput, actor: Actor = {}): string {
   return tx(() => {
     if (input.amount <= 0) throw new PostingError('A payment must be for a positive amount.');
@@ -81,6 +96,11 @@ export function createPayment(input: PaymentInput, actor: Actor = {}): string {
       input.reference ?? null, input.isAdvance ? 1 : 0, input.amount,
       input.note ?? null, actor.id ?? null, nowIso(),
     );
+
+    // A draft payment allocates nothing: an allocation moves a document's
+    // residual, and a residual that moved because of an unposted receipt is a
+    // debtors list that disagrees with the ledger behind it.
+    if (input.post === false) return paymentId;
 
     postPayment(input.orgId, paymentId, actor);
 
@@ -193,6 +213,32 @@ export function allocate(orgId: string, paymentId: string, documentId: string, a
     const doc = getDocument(orgId, documentId);
     if (!doc) throw new PostingError('Unknown document.');
     if (doc.state !== 'posted') throw new PostingError('Only a posted document can be settled.');
+
+    /*
+     * THE CONTROL ACCOUNT MUST ALLOW RECONCILIATION.
+     *
+     * Settling a document IS reconciling: it matches this receipt's line
+     * against that invoice's line on the same control account, and the
+     * document's residual is the unmatched remainder. On an account not marked
+     * reconcilable that remainder means nothing, so the switch on the Chart of
+     * Accounts is checked here rather than being decoration.
+     *
+     * The message names the account and the screen, because the person who
+     * hits this is almost always looking at a control account somebody created
+     * last week and forgot to switch on.
+     */
+    const controlId = doc.doc_type.startsWith('out_')
+      ? receivableAccount(orgId, doc.partner_id)
+      : payableAccount(orgId, doc.partner_id);
+    const control = one<{ code: string; name: string; reconcilable: number }>(
+      'SELECT code, name, reconcilable FROM accounts WHERE id = ?', controlId,
+    );
+    if (control && !control.reconcilable) {
+      throw new PostingError(
+        `${control.code} ${control.name} does not allow reconciliation, so nothing can be settled ` +
+        'against it. Switch it on in Accounting → Chart of Accounts.',
+      );
+    }
 
     const unallocated = paymentUnallocated(orgId, paymentId);
     if (amount <= 0) throw new PostingError('Allocate a positive amount.');

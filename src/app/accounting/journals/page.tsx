@@ -1,11 +1,9 @@
 import { ctx } from '@/server/bootstrap';
 import { msg, type SearchParams } from '@/lib/range';
 import { listJournals } from '@/server/accounting/masters';
-import { accountOptions } from '@/server/options';
-import { JOURNAL_TYPES, titleise } from '@/lib/accounting';
-import { saveJournalAction } from '@/app/actions';
+import { titleise } from '@/lib/accounting';
 import {
-  PageHeader, Card, Banner, Table, Th, Td, Chip, Field, inputClass, btn,
+  PageHeader, Card, Banner, Table, Th, Td, Chip, LinkButton,
 } from '@/components/ui';
 
 export const dynamic = 'force-dynamic';
@@ -22,7 +20,6 @@ export default async function JournalsPage({ searchParams }: { searchParams: Pro
   const s = ctx();
   const m = msg(await searchParams);
   const journals = listJournals(s.orgId);
-  const accounts = accountOptions(s.orgId, ['asset_cash']);
 
   return (
     <>
@@ -30,12 +27,12 @@ export default async function JournalsPage({ searchParams }: { searchParams: Pro
         title="Journals"
         subtitle="Where each kind of entry is written, and which account a bank or cash journal moves."
         accent="var(--color-sec-accounting)"
+        actions={<LinkButton href="/accounting/journals/new" variant="primary">+ New Journal</LinkButton>}
       />
       {m.error && <Banner tone="error">{m.error}</Banner>}
       {m.ok && <Banner tone="ok">{m.ok}</Banner>}
 
-      <div className="grid gap-5 lg:grid-cols-[2fr_1fr]">
-        <Card padded={false}>
+      <Card padded={false}>
           <Table>
             <thead>
               <tr><Th width="80px">Code</Th><Th>Name</Th><Th>Type</Th>
@@ -53,30 +50,7 @@ export default async function JournalsPage({ searchParams }: { searchParams: Pro
               ))}
             </tbody>
           </Table>
-        </Card>
-
-        <Card title="Add a journal" subtitle="Its own numbering series is created with it.">
-          <form action={saveJournalAction} className="space-y-3">
-            <Field label="Code" hint="Three letters, used as the prefix on every entry number.">
-              <input name="code" required maxLength={5} className={inputClass} placeholder="ADJ" />
-            </Field>
-            <Field label="Name"><input name="name" required className={inputClass} /></Field>
-            <Field label="Type">
-              <select name="type" className={inputClass} defaultValue="general">
-                {JOURNAL_TYPES.map((t) => <option key={t} value={t}>{titleise(t)}</option>)}
-              </select>
-            </Field>
-            <Field label="Default account"
-              hint="Bank and cash journals need one — it is the account the money moves through.">
-              <select name="default_account_id" className={inputClass} defaultValue="">
-                <option value="">—</option>
-                {accounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-              </select>
-            </Field>
-            <button className={`${btn.primary} w-full`}>Add journal</button>
-          </form>
-        </Card>
-      </div>
+      </Card>
     </>
   );
 }
