@@ -142,7 +142,16 @@ html, body {
 .scroll-x::-webkit-scrollbar { height: 8px; }
 .scroll-x::-webkit-scrollbar-thumb { background: var(--color-line); border-radius: 4px; }
 
-input, select, textarea, button { font: inherit; color: inherit; }
+/*
+ * `@layer base` on purpose, not a bare rule: Tailwind v4's own utilities
+ * (including the masthead search input's `text-white`) live in `@layer
+ * utilities`, and an UNLAYERED rule here would beat every layered utility
+ * regardless of specificity — this reset is meant to be the floor every
+ * input starts from, not a ceiling nothing can paint over.
+ */
+@layer base {
+  input, select, textarea, button { font: inherit; color: inherit; }
+}
 
 input[type="date"]::-webkit-calendar-picker-indicator { opacity: .55; cursor: pointer; }
 
