@@ -95,20 +95,12 @@ function Masthead({ user, sections, pathname }: {
           <input
             name="q"
             placeholder="Search invoices, bills, customers, bookings…"
-            className="w-full rounded-[10px] px-3.5 py-1.5 text-[13px] text-white outline-none focus:border-brand"
+            className="w-full rounded-[10px] px-3.5 py-1.5 text-[13px] text-white outline-none placeholder:text-[var(--nav-text-dim)] focus:border-brand"
             style={{ background: 'var(--nav-input)', border: '1px solid var(--nav-line)' }}
           />
         </form>
 
         <div className="ml-auto flex items-center gap-3">
-          <Link href="/sales/invoices/new"
-            className="hidden rounded-[10px] bg-action px-3.5 py-1.5 text-[13px] font-bold text-white hover:bg-action-dark sm:block">
-            + New Invoice
-          </Link>
-          <Link href={SETTINGS_ITEM.href} className="hidden text-[13px] font-semibold md:block"
-            style={{ color: pathname.startsWith('/settings') ? '#ffffff' : 'var(--nav-text)' }}>
-            Settings
-          </Link>
           <div className="hidden text-right sm:block">
             <div className="text-[12.5px] font-bold leading-tight text-white">{user.name}</div>
             <div className="text-[10px] font-bold uppercase tracking-[0.1em]"
@@ -146,6 +138,14 @@ function Masthead({ user, sections, pathname }: {
               open={open === s.key}
               onToggle={() => setOpen((k) => (k === s.key ? null : s.key))} />
           ))}
+          <Link href={SETTINGS_ITEM.href}
+            className="ml-auto flex items-center whitespace-nowrap px-3.5 py-2.5 text-[13px] font-semibold"
+            style={{
+              color: pathname.startsWith('/settings') ? '#ffffff' : 'var(--nav-text)',
+              boxShadow: pathname.startsWith('/settings') ? 'inset 0 -2px 0 0 #ffffff' : undefined,
+            }}>
+            Settings
+          </Link>
         </nav>
       </div>
 
