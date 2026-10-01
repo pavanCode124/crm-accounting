@@ -272,6 +272,46 @@ export async function upsertPartner(orgId: string, p: {
   });
 }
 
+/**
+ * A customer or supplier field that is TYPED rather than chosen from a
+ * dropdown, resolved to a partner record on submit.
+ *
+ * A trip's traveller, or a one-off supplier, should not have to exist as a
+ * partner master before the first invoice or payment can be raised against
+ * them — so a name with no case-insensitive match on this side becomes a new
+ * partner here, rather than blocking the document. Matched BY SIDE, not by
+ * name alone: a name that already exists as a supplier does not silently
+ * become a customer too just because it was typed into an invoice.
+ */
+export async function resolvePartnerByName(
+  orgId: string, rawName: string, side: 'customer' | 'supplier', actor: Actor = {},
+): Promise<string> {
+  const name = rawName.trim();
+  if (!name) throw new Error(`${side === 'customer' ? 'Customer' : 'Supplier'} is required.`);
+  const flagCol = side === 'customer' ? 'is_customer' : 'is_supplier';
+  const existing = await one<{ id: string }>(
+    `SELECT id FROM partners WHERE org_id=? AND ${flagCol}=1 AND LOWER(name)=LOWER(?)`,
+    orgId, name,
+  );
+  if (existing) return existing.id;
+  return await upsertPartner(orgId, { name, isCustomer: side === 'customer', isSupplier: side === 'supplier' }, actor);
+}
+
+/**
+ * The same lookup for an OPTIONAL partner tag (a manual journal line's
+ * analytic-style attribution) — match only, either side. A typo here should
+ * leave the line untagged rather than mint a partner record nobody meant to
+ * create, so unlike `resolvePartnerByName` this never creates one.
+ */
+export async function findPartnerIdByName(orgId: string, rawName: string): Promise<string | null> {
+  const name = rawName.trim();
+  if (!name) return null;
+  const existing = await one<{ id: string }>(
+    `SELECT id FROM partners WHERE org_id=? AND LOWER(name)=LOWER(?)`, orgId, name,
+  );
+  return existing?.id ?? null;
+}
+
 // ------------------------------------------------------------------ products
 export async function listProducts(orgId: string) {
   return await all<{

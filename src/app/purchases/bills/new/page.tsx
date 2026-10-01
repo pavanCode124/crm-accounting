@@ -24,7 +24,7 @@ export default async function NewBillPage({ searchParams }: { searchParams: Prom
       <DocumentForm
         {...options}
         defaults={{
-          partnerId: await one(params, 'partner'),
+          partnerName: await one(params, 'customer'),
           bookingId: await one(params, 'booking'),
           journalId: options.journals[0]?.id,
         }}

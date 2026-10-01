@@ -7,7 +7,7 @@ import { accountOptions, partnerOptions } from '@/server/options';
 import { fmtDate } from '@/lib/accounting';
 import { fmt } from '@/lib/money';
 import { reconcileAction } from '@/app/actions';
-import { PageHeader, Card, Banner, EmptyState, inputClass, btn, Chip } from '@/components/ui';
+import { PageHeader, Card, Banner, EmptyState, inputClass, btn, Chip, PartnerDatalist } from '@/components/ui';
 
 export const dynamic = 'force-dynamic';
 
@@ -132,14 +132,14 @@ export default async function ReconcilePage({ searchParams }: { searchParams: Pr
                   <form action={reconcileAction} className="space-y-2.5">
                     <input type="hidden" name="txn_id" value={t.id} />
                     <input type="hidden" name="mode" value="create" />
+                    <input type="hidden" name="side" value={inbound ? 'customer' : 'supplier'} />
                     <input type="hidden" name="return_to" value={returnTo} />
                     <div className="text-[11px] font-bold uppercase tracking-[0.06em] text-ink-faint">
                       Record as a {inbound ? 'customer receipt' : 'supplier payment'}
                     </div>
-                    <select name="partner_id" required className={inputClass}>
-                      <option value="">Choose {inbound ? 'customer' : 'supplier'}…</option>
-                      {partners.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
-                    </select>
+                    <input name="partner_name" list={`recon-partners-${t.id}`} required autoComplete="off"
+                      placeholder={inbound ? 'Customer name' : 'Supplier name'} className={inputClass} />
+                    <PartnerDatalist id={`recon-partners-${t.id}`} options={partners} />
                     <select name="document_id" className={inputClass} defaultValue="">
                       <option value="">— no document (advance / on account) —</option>
                       {docs.map((d) => (

@@ -50,7 +50,8 @@ export default async function BookingPage({ params, searchParams }: {
         actions={
           <>
             <Chip state={booking.status} />
-            <Link href={`/sales/invoices/new?booking=${id}&partner=${booking.partner_id ?? ''}`}
+            <Link href={`/sales/invoices/new?booking=${id}&customer=${
+              encodeURIComponent(booking.partner_name ?? booking.customer_name ?? '')}`}
               className={btn.primary}>+ Invoice</Link>
             <Link href={`/purchases/bills/new?booking=${id}`} className={btn.ghost}>+ Bill</Link>
           </>

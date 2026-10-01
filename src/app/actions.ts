@@ -24,7 +24,7 @@ import {
 import { createAsset, confirmAsset, runDepreciation, createDeferral, runDeferrals } from '@/server/accounting/assets';
 import {
   upsertAccount, setAccountReconcilable, upsertJournal, upsertPartner, createBooking,
-  upsertProduct, createBudget,
+  upsertProduct, createBudget, resolvePartnerByName, findPartnerIdByName,
 } from '@/server/accounting/masters';
 import { setSetting, type SettingKey } from '@/server/accounting/settings';
 import { resetAndSeed } from '@/server/seed';
@@ -131,25 +131,30 @@ export async function saveDocumentAction(formData: FormData) {
   const lines = readLines(formData);
   if (!lines.length) back(`${listPath}/new`, { error: 'Add at least one line with a description and an account.' });
 
-  const input = {
-    orgId: s.orgId,
-    docType,
-    partnerId: str(formData, 'partner_id'),
-    journalId: str(formData, 'journal_id'),
-    bookingId: opt(formData, 'booking_id'),
-    analyticId: opt(formData, 'analytic_id'),
-    docDate: str(formData, 'doc_date') || isoDate(),
-    dueDate: opt(formData, 'due_date'),
-    paymentTermsId: opt(formData, 'payment_terms_id'),
-    supplierRef: opt(formData, 'supplier_ref'),
-    currency: str(formData, 'currency') || 'INR',
-    rateE6: Math.round(parseFloat(str(formData, 'rate') || '1') * 1_000_000),
-    withholdingTaxId: opt(formData, 'withholding_tax_id'),
-    note: opt(formData, 'note'),
-    lines,
-  };
-
   const r = await guard(async () => {
+    // Typed, not chosen from a dropdown: a name with no match on this side
+    // becomes a new partner here, so the customer/supplier never has to exist
+    // beforehand for the first document against them to be raised.
+    const partnerId = await resolvePartnerByName(
+      s.orgId, str(formData, 'partner_name'), isBill ? 'supplier' : 'customer', actorOf(s),
+    );
+    const input = {
+      orgId: s.orgId,
+      docType,
+      partnerId,
+      journalId: str(formData, 'journal_id'),
+      bookingId: opt(formData, 'booking_id'),
+      analyticId: opt(formData, 'analytic_id'),
+      docDate: str(formData, 'doc_date') || isoDate(),
+      dueDate: opt(formData, 'due_date'),
+      paymentTermsId: opt(formData, 'payment_terms_id'),
+      supplierRef: opt(formData, 'supplier_ref'),
+      currency: str(formData, 'currency') || 'INR',
+      rateE6: Math.round(parseFloat(str(formData, 'rate') || '1') * 1_000_000),
+      withholdingTaxId: opt(formData, 'withholding_tax_id'),
+      note: opt(formData, 'note'),
+      lines,
+    };
     if (existing) { await updateDocument(existing, input, actorOf(s)); return existing; }
     return await createDocument(input, actorOf(s));
   });
@@ -214,22 +219,25 @@ export async function registerPaymentAction(formData: FormData) {
   const amount = money(formData, 'amount');
   const listPath = direction === 'inbound' ? '/sales/payments' : '/purchases/payments';
 
-  const r = await guard(async () => await createPayment({
-    orgId: s.orgId,
-    direction,
-    side,
-    partnerId: str(formData, 'partner_id'),
-    journalId: str(formData, 'journal_id'),
-    bankAccountId: opt(formData, 'bank_account_id'),
-    bookingId: opt(formData, 'booking_id'),
-    payDate: str(formData, 'pay_date') || isoDate(),
-    amount,
-    method: str(formData, 'method') || 'bank',
-    reference: opt(formData, 'reference'),
-    isAdvance: bool(formData, 'is_advance'),
-    note: opt(formData, 'note'),
-    allocations: docId && !bool(formData, 'is_advance') ? [{ documentId: docId, amount }] : [],
-  }, actorOf(s)));
+  const r = await guard(async () => {
+    const partnerId = await resolvePartnerByName(s.orgId, str(formData, 'partner_name'), side, actorOf(s));
+    return await createPayment({
+      orgId: s.orgId,
+      direction,
+      side,
+      partnerId,
+      journalId: str(formData, 'journal_id'),
+      bankAccountId: opt(formData, 'bank_account_id'),
+      bookingId: opt(formData, 'booking_id'),
+      payDate: str(formData, 'pay_date') || isoDate(),
+      amount,
+      method: str(formData, 'method') || 'bank',
+      reference: opt(formData, 'reference'),
+      isAdvance: bool(formData, 'is_advance'),
+      note: opt(formData, 'note'),
+      allocations: docId && !bool(formData, 'is_advance') ? [{ documentId: docId, amount }] : [],
+    }, actorOf(s));
+  });
 
   const returnTo = str(formData, 'return_to') || listPath;
   back(returnTo, r.error ? r : { ok: 'Payment recorded.' });
@@ -290,15 +298,19 @@ export async function saveJournalEntryAction(formData: FormData) {
   const debits = formData.getAll('line_debit').map(String);
   const credits = formData.getAll('line_credit').map(String);
   const labels = formData.getAll('line_label').map(String);
-  const partners = formData.getAll('line_partner').map(String);
+  const partnerNames = formData.getAll('line_partner').map(String);
   const analytics = formData.getAll('line_analytic').map(String);
+  // Typed, not chosen — but unlike a document's customer/supplier this tag is
+  // optional, so a name that matches nothing just leaves the line untagged
+  // rather than minting a partner record nobody meant to create.
+  const partnerIds = await Promise.all(partnerNames.map((n) => findPartnerIdByName(s.orgId, n)));
 
   const lines = accounts.map((accountId, i) => ({
     accountId,
     debit: toMinor(debits[i] || '0'),
     credit: toMinor(credits[i] || '0'),
     label: labels[i] || null,
-    partnerId: partners[i] || null,
+    partnerId: partnerIds[i] ?? null,
     analyticId: analytics[i] || null,
   })).filter((l) => l.accountId && (l.debit !== 0 || l.credit !== 0));
 
@@ -371,8 +383,16 @@ export async function reconcileAction(formData: FormData) {
       return await reconcileToAccount(s.orgId, txnId, str(formData, 'account_id'),
         str(formData, 'label') || 'Bank entry', actorOf(s));
     }
+    // The Suggested row already resolved a partner and sends its id directly;
+    // the manual form below it only has a typed name plus the side implied by
+    // which half of the screen (money in/out) it is in.
+    const partnerId = opt(formData, 'partner_id')
+      ?? await resolvePartnerByName(
+        s.orgId, str(formData, 'partner_name'),
+        str(formData, 'side') === 'supplier' ? 'supplier' : 'customer', actorOf(s),
+      );
     return await reconcileAsPayment(s.orgId, txnId, {
-      partnerId: str(formData, 'partner_id'),
+      partnerId,
       documentId: opt(formData, 'document_id'),
       isAdvance: bool(formData, 'is_advance'),
     }, actorOf(s));

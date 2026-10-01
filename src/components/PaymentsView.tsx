@@ -6,7 +6,7 @@ import { bankAccountOptions, journalOptions, partnerOptions, bookingOptions } fr
 import { registerPaymentAction, allocateAction, reversePaymentAction } from '@/app/actions';
 import { fmt } from '@/lib/money';
 import {
-  Card, Table, Th, Td, Money, Chip, EmptyState, RefLink, Field, inputClass, btn, StatTile,
+  Card, Table, Th, Td, Money, Chip, EmptyState, RefLink, Field, inputClass, btn, StatTile, PartnerDatalist,
 } from './ui';
 
 /**
@@ -165,10 +165,9 @@ export async function PaymentsView({ orgId, direction }: { orgId: string; direct
             <input type="hidden" name="side" value={inbound ? 'customer' : 'supplier'} />
             <input type="hidden" name="return_to" value={`${basePath}/payments`} />
             <Field label={inbound ? 'Customer' : 'Supplier'}>
-              <select name="partner_id" required className={inputClass}>
-                <option value="">Choose…</option>
-                {partners.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
-              </select>
+              <input name="partner_name" list="payment-partner-options" required autoComplete="off"
+                placeholder={inbound ? 'Who paid' : 'Who was paid'} className={inputClass} />
+              <PartnerDatalist id="payment-partner-options" options={partners} />
             </Field>
             <Field label="Amount">
               <input name="amount" inputMode="decimal" required placeholder="0.00"

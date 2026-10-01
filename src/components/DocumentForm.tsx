@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from 'react';
 import { saveDocumentAction } from '@/app/actions';
-import { inputClass, btn, Card, Field } from './ui';
+import { inputClass, btn, Card, Field, PartnerDatalist } from './ui';
 import { fmt, toMinor, qtyToMilli, pct, roundHalfUp } from '@/lib/money';
 import type { DocType } from '@/lib/accounting';
 
@@ -35,7 +35,7 @@ export interface DocFormProps {
   withholdingTaxes?: TaxOption[];
   products?: Array<{ id: string; name: string; price: number; accountId: string | null; taxId: string | null }>;
   defaults?: {
-    partnerId?: string; journalId?: string; bookingId?: string; analyticId?: string; date?: string;
+    partnerName?: string; journalId?: string; bookingId?: string; analyticId?: string; date?: string;
   };
   canPost: boolean;
 }
@@ -96,10 +96,10 @@ export function DocumentForm(props: DocFormProps) {
       }>
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <Field label={isBill ? 'Supplier' : 'Customer'}>
-            <select name="partner_id" required defaultValue={props.defaults?.partnerId ?? ''} className={inputClass}>
-              <option value="">Choose…</option>
-              {partners.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
-            </select>
+            <input name="partner_name" list="partner-options" required autoComplete="off"
+              defaultValue={props.defaults?.partnerName ?? ''}
+              placeholder={isBill ? 'Who billed it' : 'Who it is billed to'} className={inputClass} />
+            <PartnerDatalist id="partner-options" options={partners} />
           </Field>
           <Field label="Journal">
             <select name="journal_id" required defaultValue={props.defaults?.journalId ?? journals[0]?.id} className={inputClass}>

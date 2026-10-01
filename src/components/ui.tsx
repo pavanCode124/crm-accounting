@@ -262,6 +262,25 @@ export function Field({ label, children, hint, wide }: {
 }
 
 /**
+ * The suggestion list behind a customer/supplier field that is TYPED rather
+ * than chosen.
+ *
+ * A plain `<input list>` + `<datalist>` pair, on purpose, rather than a
+ * custom combobox: it needs no client JS to filter as you type, it degrades
+ * to a normal text field if the browser ignores `list`, and a server
+ * component can render it directly. Pair every `PartnerDatalist` with a text
+ * `<input list={id} name=… />` posting the typed NAME, not an id — the
+ * action resolves it to a partner, creating one if nothing matches.
+ */
+export function PartnerDatalist({ id, options }: { id: string; options: Array<{ id: string; label: string }> }) {
+  return (
+    <datalist id={id}>
+      {options.map((o) => <option key={o.id} value={o.label} />)}
+    </datalist>
+  );
+}
+
+/**
  * A banner for the thing a finance screen most needs to say: what went wrong,
  * or what just happened. Read from the query string so a server action can
  * redirect with it and the message survives the navigation.

@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from 'react';
 import { saveJournalEntryAction } from '@/app/actions';
-import { Card, Field, inputClass, btn } from './ui';
+import { Card, Field, inputClass, btn, PartnerDatalist } from './ui';
 import { fmt, toMinor } from '@/lib/money';
 
 /**
@@ -18,13 +18,13 @@ import { fmt, toMinor } from '@/lib/money';
 export interface Opt { id: string; label: string }
 
 interface Line {
-  key: number; accountId: string; label: string; partnerId: string; analyticId: string;
+  key: number; accountId: string; label: string; partnerName: string; analyticId: string;
   debit: string; credit: string;
 }
 
 let nextKey = 1;
 const blank = (): Line => ({
-  key: nextKey++, accountId: '', label: '', partnerId: '', analyticId: '', debit: '', credit: '',
+  key: nextKey++, accountId: '', label: '', partnerName: '', analyticId: '', debit: '', credit: '',
 });
 
 export function JournalEntryForm({ journals, accounts, partners, analytics, canPost }: {
@@ -46,6 +46,7 @@ export function JournalEntryForm({ journals, accounts, partners, analytics, canP
 
   return (
     <form action={saveJournalEntryAction} className="space-y-5">
+      <PartnerDatalist id="je-partner-options" options={partners} />
       <Card title="Entry">
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <Field label="Journal">
@@ -95,11 +96,9 @@ export function JournalEntryForm({ journals, accounts, partners, analytics, canP
                       onChange={(e) => update(l.key, { label: e.target.value })} className={inputClass} />
                   </td>
                   <td className="border-b border-line px-2 py-1.5">
-                    <select name="line_partner" value={l.partnerId}
-                      onChange={(e) => update(l.key, { partnerId: e.target.value })} className={inputClass}>
-                      <option value="">—</option>
-                      {partners.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
-                    </select>
+                    <input name="line_partner" list="je-partner-options" value={l.partnerName} autoComplete="off"
+                      placeholder="—" onChange={(e) => update(l.key, { partnerName: e.target.value })}
+                      className={inputClass} />
                   </td>
                   <td className="border-b border-line px-2 py-1.5">
                     <select name="line_analytic" value={l.analyticId}
