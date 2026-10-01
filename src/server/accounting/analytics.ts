@@ -79,6 +79,7 @@ export interface BookingFinancials {
   booking: {
     id: string; ref: string; title: string; destination: string | null;
     package_name: string | null; partner_id: string | null; partner_name: string | null;
+    customer_name: string | null;
     agent_name: string | null; pax: number; start_date: string | null; end_date: string | null;
     sell_value: number; status: string; analytic_id: string | null;
   };
@@ -91,7 +92,7 @@ export interface BookingFinancials {
 
 export async function bookingFinancials(orgId: string, bookingId: string): Promise<BookingFinancials | null> {
   const booking = await one<BookingFinancials['booking']>(
-    `SELECT b.id, b.ref, b.title, b.destination, b.package_name, b.partner_id,
+    `SELECT b.id, b.ref, b.title, b.destination, b.package_name, b.partner_id, b.customer_name,
             p.name AS partner_name, b.agent_name, b.pax, b.start_date, b.end_date,
             b.sell_value, b.status, b.analytic_id
        FROM bookings b LEFT JOIN partners p ON p.id = b.partner_id
@@ -219,9 +220,10 @@ export async function supplierCostReport(orgId: string, p: { from?: string; to?:
 export async function bookingPaymentReport(orgId: string) {
   return await all<{
     booking_id: string; ref: string; title: string; partner_name: string | null;
+    customer_name: string | null;
     total: number; paid: number; balance: number; due_date: string | null; status: string;
   }>(
-    `SELECT b.id AS booking_id, b.ref, b.title, p.name AS partner_name, b.status,
+    `SELECT b.id AS booking_id, b.ref, b.title, p.name AS partner_name, b.customer_name, b.status,
             COALESCE(SUM(CASE WHEN d.doc_type='out_invoice' THEN d.total ELSE -d.total END),0) AS total,
             COALESCE(SUM(CASE WHEN d.doc_type='out_invoice' THEN d.total - d.residual ELSE 0 END),0) AS paid,
             COALESCE(SUM(CASE WHEN d.doc_type='out_invoice' THEN d.residual ELSE -d.residual END),0) AS balance,
@@ -357,11 +359,11 @@ export async function listBookings(orgId: string, opts: { status?: string; searc
   }
   return await all<{
     id: string; ref: string; title: string; destination: string | null; status: string;
-    partner_name: string | null; agent_name: string | null; start_date: string | null;
-    sell_value: number; pax: number; analytic_id: string | null;
+    partner_name: string | null; customer_name: string | null; agent_name: string | null;
+    start_date: string | null; sell_value: number; pax: number; analytic_id: string | null;
   }>(
     `SELECT b.id, b.ref, b.title, b.destination, b.status, b.agent_name, b.start_date,
-            b.sell_value, b.pax, b.analytic_id, p.name AS partner_name
+            b.sell_value, b.pax, b.analytic_id, b.customer_name, p.name AS partner_name
        FROM bookings b LEFT JOIN partners p ON p.id = b.partner_id
       WHERE ${clauses.join(' AND ')}
       ORDER BY b.start_date DESC, b.ref DESC LIMIT ${opts.limit ?? 200}`,

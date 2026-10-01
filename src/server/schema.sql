@@ -329,6 +329,13 @@ CREATE TABLE IF NOT EXISTS bookings (
   ref            TEXT NOT NULL,             -- BK-1023
   title          TEXT NOT NULL,             -- "Bali 5D/4N -- Rahul"
   partner_id     TEXT REFERENCES partners(id),
+  -- Typed on the New Booking form, not chosen from the customer dropdown: a
+  -- trip is often booked before the traveller exists as a CRM partner record,
+  -- and making that record a precondition for logging the trip is backwards.
+  -- `partner_id` stays alongside it for bookings that DO resolve to a real
+  -- partner (every CRM sync sets both), so the AR-side reports that join on
+  -- partner_id keep working unchanged.
+  customer_name  TEXT,
   destination    TEXT,
   package_name   TEXT,
   agent_id       TEXT,
@@ -343,6 +350,10 @@ CREATE TABLE IF NOT EXISTS bookings (
   created_at     TEXT NOT NULL,
   UNIQUE (org_id, ref)
 );
+-- Additive for databases that created `bookings` before `customer_name`
+-- existed: `CREATE TABLE IF NOT EXISTS` above is a no-op once the table is
+-- there, so the column has to be added onto the live table explicitly.
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_name TEXT;
 
 -- ---------------------------------------------------------------- documents
 -- ONE table for all four invoice-shaped documents, Odoo's move model:

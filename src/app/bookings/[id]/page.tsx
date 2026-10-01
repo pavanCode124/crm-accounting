@@ -172,7 +172,7 @@ export default async function BookingPage({ params, searchParams }: {
                 ? <Link key="c" href={`/sales/customers/${booking.partner_id}`} className="text-brand hover:underline">
                   {booking.partner_name}
                 </Link>
-                : '—'],
+                : (booking.customer_name ?? '—')],
               ['Destination', booking.destination ?? '—'],
               ['Package', booking.package_name ?? '—'],
               ['Agent', booking.agent_name ?? '—'],

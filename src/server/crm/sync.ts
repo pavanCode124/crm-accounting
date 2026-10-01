@@ -249,6 +249,7 @@ async function syncLeads(orgId: string, s: CrmSession, report: SyncReport, actor
         ref,
         title: `${lead.trip_type ?? 'Trip'} — ${name}`,
         partnerId,
+        customerName: name,
         destination: lead.city_country ?? null,
         pax: (lead.adults ?? 0) + (lead.children ?? 0) || 1,
         startDate: dateOnly(lead.travel_date),

@@ -59,7 +59,7 @@ export default async function BookingsPage({ searchParams }: { searchParams: Pro
                           {b.destination} · {b.pax} pax · {b.agent_name ?? 'unassigned'}
                         </div>
                       </Td>
-                      <Td>{b.partner_name ?? '—'}</Td>
+                      <Td>{b.customer_name ?? b.partner_name ?? '—'}</Td>
                       <Td>{fmtDate(b.start_date)}</Td>
                       <Td align="right"><Money value={p?.revenue ?? 0} /></Td>
                       <Td align="right"><Money value={p?.cost ?? 0} /></Td>

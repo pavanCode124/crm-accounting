@@ -115,7 +115,7 @@ async function BookingPayments({ orgId }: { orgId: string }) {
                   <RefLink href={`/bookings/${r.booking_id}`}>{r.ref}</RefLink>
                   <div className="text-[12px] text-ink-faint">{r.title}</div>
                 </Td>
-                <Td>{r.partner_name ?? '—'}</Td>
+                <Td>{r.customer_name ?? r.partner_name ?? '—'}</Td>
                 <Td align="right"><Money value={r.total} /></Td>
                 <Td align="right"><Money value={r.paid} /></Td>
                 <Td align="right"><Money value={r.balance} bold /></Td>

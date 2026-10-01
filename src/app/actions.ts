@@ -684,7 +684,7 @@ export async function createBookingAction(formData: FormData) {
   const r = await guard(async () => await createBooking(s.orgId, {
     ref: str(formData, 'ref'),
     title: str(formData, 'title'),
-    partnerId: opt(formData, 'partner_id'),
+    customerName: opt(formData, 'customer_name'),
     destination: opt(formData, 'destination'),
     packageName: opt(formData, 'package_name'),
     agentName: opt(formData, 'agent_name'),

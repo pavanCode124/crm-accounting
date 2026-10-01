@@ -479,7 +479,7 @@ async function seedDemo(orgId: string) {
   for (const [ref, title, dest, pkg, customer, agent, pax, offset, value] of bookings) {
     bkg[ref] = await createBooking(orgId, {
       ref, title, destination: dest, packageName: pkg,
-      partnerId: cust[customer], agentName: agent, branch: 'Hyderabad',
+      partnerId: cust[customer], customerName: customer, agentName: agent, branch: 'Hyderabad',
       pax, startDate: d(offset), endDate: d(offset + 5), sellValue: value,
     }, actor);
   }

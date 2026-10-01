@@ -1,6 +1,5 @@
 import { ctx } from '@/server/bootstrap';
 import { msg, type SearchParams } from '@/lib/range';
-import { partnerOptions } from '@/server/options';
 import { isoDate } from '@/lib/accounting';
 import { createBookingAction } from '@/app/actions';
 import { PageHeader, Card, Banner, Field, inputClass, btn, LinkButton } from '@/components/ui';
@@ -8,9 +7,8 @@ import { PageHeader, Card, Banner, Field, inputClass, btn, LinkButton } from '@/
 export const dynamic = 'force-dynamic';
 
 export default async function NewBookingPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  const s = await ctx();
+  await ctx();
   const m = await msg(await searchParams);
-  const customers = await partnerOptions(s.orgId, 'customer');
   const today = isoDate();
 
   return (
@@ -36,10 +34,7 @@ export default async function NewBookingPage({ searchParams }: { searchParams: P
 
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Customer">
-              <select name="partner_id" className={inputClass} defaultValue="">
-                <option value="">—</option>
-                {customers.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
-              </select>
+              <input name="customer_name" className={inputClass} placeholder="Rahul Mehta" />
             </Field>
             <Field label="Destination">
               <input name="destination" className={inputClass} placeholder="Bali" />

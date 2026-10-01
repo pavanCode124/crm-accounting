@@ -320,7 +320,8 @@ export async function upsertProduct(orgId: string, p: {
  * report shows nothing. The CRM sync path calls this too.
  */
 export async function createBooking(orgId: string, b: {
-  ref: string; title: string; partnerId?: string | null; destination?: string | null;
+  ref: string; title: string; partnerId?: string | null; customerName?: string | null;
+  destination?: string | null;
   packageName?: string | null; agentName?: string | null; branch?: string | null;
   pax?: number; startDate?: string | null; endDate?: string | null;
   sellValue?: number; status?: string;
@@ -338,11 +339,11 @@ export async function createBooking(orgId: string, b: {
       bookingId, b.partnerId ?? null,
     );
     await run(
-      `INSERT INTO bookings (id, org_id, ref, title, partner_id, destination, package_name,
+      `INSERT INTO bookings (id, org_id, ref, title, partner_id, customer_name, destination, package_name,
                              agent_name, branch, pax, start_date, end_date, sell_value, status,
                              analytic_id, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      bookingId, orgId, b.ref, b.title, b.partnerId ?? null, b.destination ?? null,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      bookingId, orgId, b.ref, b.title, b.partnerId ?? null, b.customerName ?? null, b.destination ?? null,
       b.packageName ?? null, b.agentName ?? null, b.branch ?? null, b.pax ?? 1,
       b.startDate ?? null, b.endDate ?? null, b.sellValue ?? 0, b.status ?? 'confirmed',
       analyticId, nowIso(),
@@ -354,7 +355,8 @@ export async function createBooking(orgId: string, b: {
 
 export async function getBooking(orgId: string, bookingId: string) {
   return await one<{
-    id: string; ref: string; title: string; partner_id: string | null; destination: string | null;
+    id: string; ref: string; title: string; partner_id: string | null; customer_name: string | null;
+    destination: string | null;
     package_name: string | null; agent_name: string | null; pax: number; status: string;
     start_date: string | null; end_date: string | null; sell_value: number; analytic_id: string | null;
   }>('SELECT * FROM bookings WHERE id=? AND org_id=?', bookingId, orgId);
