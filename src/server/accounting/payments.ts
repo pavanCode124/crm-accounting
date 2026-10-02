@@ -4,6 +4,7 @@ import { postEntry, reverseEntry, PostingError, type Actor } from './engine';
 import { receivableAccount, payableAccount, requireSetting } from './settings';
 import { refreshResidual, getDocument } from './documents';
 import { audit } from './audit';
+import { formatDocNumber } from '@/lib/accounting';
 
 /**
  * Money in and money out — plan sections 15, 16, 11 and 14.
@@ -69,6 +70,8 @@ export interface PaymentRow {
   method: string; reference: string | null; is_advance: number; state: string;
   unallocated: number; entry_id: string | null; note: string | null;
   created_at: string; posted_at: string | null;
+  /** The trip this money is for — joined by listPayments, absent elsewhere. */
+  trip_id?: string | null; trip_ref?: string | null; trip_title?: string | null;
 }
 
 /**
@@ -114,16 +117,18 @@ export async function createPayment(input: PaymentInput, actor: Actor = {}): Pro
 async function nextPaymentNumber(orgId: string, direction: string): Promise<string> {
   const code = direction === 'inbound' ? 'pay_in' : 'pay_out';
   const prefix = direction === 'inbound' ? 'RCPT' : 'PAY';
-  const seq = await one<{ next_no: number }>(
-    'SELECT next_no FROM sequences WHERE org_id = ? AND code = ? FOR UPDATE', orgId, code,
+  // Prefix and padding off the row — Settings → Numbering owns them once the
+  // series exists. `prefix` above only seeds a series that is not there yet.
+  const seq = await one<{ prefix: string; padding: number; next_no: number }>(
+    'SELECT prefix, padding, next_no FROM sequences WHERE org_id = ? AND code = ? FOR UPDATE', orgId, code,
   );
   if (!seq) {
     await run('INSERT INTO sequences (org_id, code, prefix, padding, next_no) VALUES (?,?,?,?,?)',
       orgId, code, prefix, 4, 2);
-    return `${prefix}-0001`;
+    return formatDocNumber(prefix, 4, 1);
   }
   await run('UPDATE sequences SET next_no = next_no + 1 WHERE org_id = ? AND code = ?', orgId, code);
-  return `${prefix}-${String(seq.next_no).padStart(4, '0')}`;
+  return formatDocNumber(seq.prefix, seq.padding, seq.next_no);
 }
 
 export async function postPayment(orgId: string, paymentId: string, actor: Actor = {}): Promise<string> {
@@ -390,9 +395,21 @@ export async function listPayments(orgId: string, f: {
   if (f.from) { clauses.push('p.pay_date >= ?'); params.push(f.from); }
   if (f.to) { clauses.push('p.pay_date <= ?'); params.push(f.to); }
   if (f.unallocatedOnly) clauses.push("p.unallocated > 0 AND p.state <> 'cancelled'");
+  // The trip comes off the payment when one was picked on the form, and off
+  // the document it was applied to when it was not. An advance taken for a
+  // trip and later applied to that trip's invoice should read the same on
+  // this screen either way round, and an accountant allocating a receipt is
+  // not going to go back and stamp the booking on it a second time.
   return await all<PaymentRow>(
-    `SELECT p.*, pt.name AS partner_name FROM payments p
+    `SELECT p.*, pt.name AS partner_name,
+            b.id AS trip_id, b.ref AS trip_ref, b.title AS trip_title
+       FROM payments p
        LEFT JOIN partners pt ON pt.id = p.partner_id
+       LEFT JOIN bookings b ON b.id = COALESCE(p.booking_id, (
+              SELECT d.booking_id FROM payment_allocations a
+                JOIN documents d ON d.id = a.document_id
+               WHERE a.payment_id = p.id AND d.booking_id IS NOT NULL
+               ORDER BY a.id LIMIT 1))
       WHERE ${clauses.join(' AND ')}
       ORDER BY p.pay_date DESC, p.created_at DESC LIMIT ${f.limit ?? 200}`,
     ...params,

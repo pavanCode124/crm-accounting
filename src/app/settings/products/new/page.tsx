@@ -43,10 +43,38 @@ export default async function NewProductPage({ searchParams }: { searchParams: P
             </Field>
           </div>
 
+          {/*
+            THE HSN IS WHY THIS FIELD IS WORTH THE ROW IT TAKES.
+
+            A GST tax invoice must carry an HSN (goods) or SAC (services) per
+            line — CGST Rule 46 — and it is a six-digit code nobody recalls
+            while typing an invoice. Holding it on the product is the only way
+            the invoice column gets filled in practice rather than in
+            principle: choosing the product on a line brings it along with the
+            price. For a travel agency these are mostly SACs — 9985 for a tour
+            operator, 996311 for hotel accommodation, 996425 for transport.
+          */}
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="HSN / SAC code"
+              hint="Printed on every invoice line this product fills. 998555 is tour-operator services.">
+              <input name="hsn_code" inputMode="numeric" className={inputClass} placeholder="998555" />
+            </Field>
+            <Field label="Variant" hint="Deluxe, twin-sharing, economy — what distinguishes this from the others of its kind.">
+              <input name="variant" className={inputClass} placeholder="Deluxe · twin sharing" />
+            </Field>
+          </div>
+
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Sale price">
               <input name="sale_price" inputMode="decimal" className={`${inputClass} text-right`} placeholder="0.00" />
             </Field>
+            <Field label="MRP / list price"
+              hint="The published price the sale price is discounted from. Printed beside it; it does not affect the tax or the total.">
+              <input name="mrp" inputMode="decimal" className={`${inputClass} text-right`} placeholder="0.00" />
+            </Field>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Typical cost" hint="What it usually costs to buy. Used for the margin column only.">
               <input name="cost_price" inputMode="decimal" className={`${inputClass} text-right`} placeholder="0.00" />
             </Field>

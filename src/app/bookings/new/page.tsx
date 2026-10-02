@@ -1,15 +1,26 @@
 import { ctx } from '@/server/bootstrap';
 import { msg, type SearchParams } from '@/lib/range';
 import { isoDate } from '@/lib/accounting';
+import { listAnalyticAccounts } from '@/server/accounting/analytics';
 import { createBookingAction } from '@/app/actions';
 import { PageHeader, Card, Banner, Field, inputClass, btn, LinkButton } from '@/components/ui';
 
 export const dynamic = 'force-dynamic';
 
 export default async function NewBookingPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  await ctx();
+  const s = await ctx();
   const m = await msg(await searchParams);
   const today = isoDate();
+  /*
+   * Branch and agent are SUGGESTED from the configured dimensions rather than
+   * typed blind. Free text made "Mumbai", "mumbai" and "Mum" three branches to
+   * a GROUP BY and one branch to the manager reading the report. A datalist
+   * keeps the field typable — a booking taken at a new desk should not wait on
+   * an admin — while making the configured spelling the path of least effort,
+   * which is what actually keeps the branch P&L from fragmenting.
+   */
+  const branches = await listAnalyticAccounts(s.orgId, 'BRANCH');
+  const agents = await listAnalyticAccounts(s.orgId, 'AGENT');
 
   return (
     <>
@@ -45,9 +56,22 @@ export default async function NewBookingPage({ searchParams }: { searchParams: P
             <Field label="Package">
               <input name="package_name" className={inputClass} />
             </Field>
-            <Field label="Agent">
-              <input name="agent_name" className={inputClass} />
+            <Field label="Agent" hint="Drives the agent performance report and the commission basis.">
+              <input name="agent_name" list="booking-agent-options" autoComplete="off" className={inputClass} />
+              <datalist id="booking-agent-options">
+                {agents.map((a) => <option key={a.id} value={a.name} />)}
+              </datalist>
             </Field>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Branch" hint="Configured under Settings → Branches & Agents.">
+              <input name="branch" list="booking-branch-options" autoComplete="off" className={inputClass} />
+              <datalist id="booking-branch-options">
+                {branches.map((b) => <option key={b.id} value={b.name} />)}
+              </datalist>
+            </Field>
+            <div />
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">

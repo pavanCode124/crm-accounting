@@ -1,185 +1,292 @@
 import Link from 'next/link';
 import { ctx } from '@/server/bootstrap';
 import { msg, type SearchParams } from '@/lib/range';
-import { allSettings } from '@/server/accounting/settings';
-import { accountOptions, journalOptions } from '@/server/options';
-import { listUsers } from '@/server/accounting/masters';
-import { ROLE_CAPS, FINANCE_CAPS, can, titleise } from '@/lib/accounting';
-import { saveSettingsAction, resetAction } from '@/app/actions';
+import { allSettings, type SettingKey } from '@/server/accounting/settings';
+import { getOrganisation, stateName } from '@/server/accounting/organisation';
+import { listBankAccounts } from '@/server/accounting/banking';
+import { listPaymentTerms, listAnalyticPlans } from '@/server/accounting/masters';
+import { listTaxes } from '@/server/accounting/tax';
+import { settlementAccountsReady } from '@/server/accounting/settlements';
+import { scalar } from '@/server/db';
+import { can, titleise } from '@/lib/accounting';
+import { resetAction } from '@/app/actions';
 import {
-  PageHeader, Card, Banner, Table, Th, Td, Field, inputClass, btn, Chip, DefList,
+  PageHeader, Card, Banner, Field, inputClass, btn, DefList, Chip,
 } from '@/components/ui';
 
 export const dynamic = 'force-dynamic';
 
 /**
- * Accounting settings.
+ * The configuration READINESS screen.
  *
- * This page is the reason the posting engine never names an account. Every
- * default below is a row in `org_settings`, and the engine asks for it by key
- * — so an agency that renumbers its chart, or keeps two advance accounts,
- * changes a dropdown here rather than a constant in a posting routine.
+ * -------------------------------------------------------------------------
+ * WHY A CHECKLIST RATHER THAN A FORM
+ * -------------------------------------------------------------------------
+ * Settings stopped being one page the moment this product had to serve more
+ * than the agency it was seeded for. Ten screens is the right shape for the
+ * job — but ten screens is also how an agency goes live with no cash account,
+ * no GSTIN and three unset posting defaults, and finds out one at a time, each
+ * time from an error in the middle of someone's work.
+ *
+ * So the landing screen answers one question: WHAT IS STILL UNSET. Each row is
+ * a thing that breaks something specific, named, with the screen that fixes it
+ * one click away. It is deliberately read-only: a hub that also edits is a hub
+ * people skim past.
  */
+
+interface Check {
+  label: string;
+  ok: boolean;
+  detail: string;
+  href: string;
+  /** A blocker stops work outright; a gap degrades a report or a document. */
+  severity: 'blocker' | 'gap';
+}
+
 export default async function SettingsPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
   const s = await ctx();
   const m = await msg(await searchParams);
-  const current = await allSettings(s.orgId);
-  const accounts = await accountOptions(s.orgId);
-  const journals = await journalOptions(s.orgId);
-  const users = await listUsers(s.orgId);
   const mayConfigure = can(s.role, 'coa.configure');
 
-  const accountKeys: Array<[string, string, string]> = [
-    ['account.receivable', 'Accounts receivable', 'Where a customer invoice puts what is owed.'],
-    ['account.payable', 'Accounts payable', 'Where a vendor bill puts what the agency owes.'],
-    ['account.customer_advance', 'Customer advances', 'A LIABILITY — money taken before the trip is invoiced.'],
-    ['account.supplier_advance', 'Supplier advances', 'An ASSET — money paid before the supplier bills.'],
-    ['account.customer_refund_payable', 'Customer refunds payable', 'Credits owed back on a cancellation.'],
-    ['account.tds_payable', 'TDS payable', 'Withholding deducted from suppliers, owed to the government.'],
-    ['account.retained_earnings', 'Retained earnings', 'Where the year-end close puts the profit.'],
-    ['account.commission_expense', 'Commission expense', ''],
-    ['account.commission_payable', 'Commission payable', ''],
-    ['account.employee_advance', 'Employee advances', 'Runs as a balance per employee.'],
-    ['account.bank_charges', 'Bank charges', ''],
-    ['account.fx_gain', 'Foreign exchange gain', ''],
-    ['account.fx_loss', 'Foreign exchange loss', ''],
-    ['account.opening_balance', 'Opening balance / capital', 'Carries a deliberate opening difference.'],
+  const org = await getOrganisation(s.orgId);
+  const current = await allSettings(s.orgId);
+  const banks = await listBankAccounts(s.orgId);
+  const terms = await listPaymentTerms(s.orgId);
+  const taxes = await listTaxes(s.orgId);
+  const plans = await listAnalyticPlans(s.orgId);
+  const products = await scalar('SELECT COUNT(*) FROM products WHERE org_id=? AND active=1', s.orgId);
+  const productsWithoutHsn = await scalar(
+    `SELECT COUNT(*) FROM products
+      WHERE org_id=? AND active=1 AND (hsn_code IS NULL OR hsn_code = '')`, s.orgId,
+  );
+  const channelReady = await settlementAccountsReady(s.orgId);
+  const years = await scalar('SELECT COUNT(*) FROM fiscal_years WHERE org_id=?', s.orgId);
+
+  /*
+   * The keys a posting genuinely cannot proceed without. Not every key in
+   * SettingKey — only those the common paths call `requireSetting` on, because
+   * listing all thirty would make the page noise and hide the four that matter.
+   */
+  const criticalKeys: Array<[SettingKey, string]> = [
+    ['account.receivable', 'customer invoices'],
+    ['account.payable', 'vendor bills'],
+    ['account.customer_advance', 'advances taken before a trip is invoiced'],
+    ['account.supplier_advance', 'advances paid to suppliers'],
+    ['journal.sale', 'posting an invoice'],
+    ['journal.purchase', 'posting a bill'],
+  ];
+  const unsetCritical = criticalKeys.filter(([k]) => !current[k]);
+
+  const branchCount = plans.find((p) => p.code === 'BRANCH')?.entries ?? 0;
+  const agentCount = plans.find((p) => p.code === 'AGENT')?.entries ?? 0;
+
+  const checks: Check[] = [
+    {
+      label: 'Agency identity',
+      ok: !!org?.gstin && !!org?.address,
+      detail: org?.gstin
+        ? `${org.gstin} · ${stateName(org.state_code) ?? 'state not set'}`
+        : 'No GSTIN or registered address — invoices print incomplete and the GST return cannot be filed.',
+      href: '/settings/organisation',
+      severity: 'gap',
+    },
+    {
+      label: 'Place of supply',
+      ok: !!org?.state_code,
+      detail: org?.state_code
+        ? `${org.state_code} — ${stateName(org.state_code)}`
+        : 'Unset, so CGST+SGST against IGST cannot be decided per invoice.',
+      href: '/settings/organisation',
+      severity: 'gap',
+    },
+    {
+      label: 'Bank accounts',
+      ok: banks.some((b) => !b.is_cash),
+      detail: banks.length
+        ? `${banks.filter((b) => !b.is_cash).length} bank · ${banks.filter((b) => b.is_cash).length} cash`
+        : 'No account for money to land in — no payment can be recorded at all.',
+      href: '/settings/bank-accounts',
+      severity: 'blocker',
+    },
+    {
+      label: 'Cash account',
+      ok: banks.some((b) => b.is_cash),
+      detail: banks.some((b) => b.is_cash)
+        ? banks.filter((b) => b.is_cash).map((b) => b.name).join(', ')
+        : 'Guides, tips and local transport are paid in cash and have nowhere to go.',
+      href: '/settings/bank-accounts',
+      severity: 'gap',
+    },
+    {
+      label: 'A default account',
+      ok: banks.some((b) => b.is_default),
+      detail: banks.find((b) => b.is_default)?.name
+        ?? 'Every money form opens on whichever account happens to sort first.',
+      href: '/settings/bank-accounts',
+      severity: 'gap',
+    },
+    {
+      label: 'Posting defaults',
+      ok: unsetCritical.length === 0,
+      detail: unsetCritical.length === 0
+        ? 'Every account and journal the engine needs is set.'
+        : `Unset: ${unsetCritical.map(([, what]) => what).join(', ')}.`,
+      href: '/settings/accounts',
+      severity: 'blocker',
+    },
+    {
+      label: 'Fiscal years',
+      ok: years > 0,
+      detail: years > 0
+        ? `${years} open, starting in ${new Date(2000, (org?.fy_start_month ?? 4) - 1, 1).toLocaleDateString('en-IN', { month: 'long' })}`
+        : 'No year is open, so nothing can be posted into a period.',
+      href: '/accounting/periods',
+      severity: 'blocker',
+    },
+    {
+      label: 'Taxes',
+      ok: taxes.length > 0,
+      detail: taxes.length ? `${taxes.length} rate(s) configured` : 'No GST or TDS rate is defined.',
+      href: '/taxes',
+      severity: 'gap',
+    },
+    {
+      label: 'Payment terms',
+      ok: terms.length > 0,
+      detail: terms.length
+        ? terms.map((t) => t.name).join(', ')
+        : 'Every invoice falls due on its own date, and the ageing report has one bucket.',
+      href: '/settings/payment-terms',
+      severity: 'gap',
+    },
+    {
+      label: 'Branches & agents',
+      ok: branchCount > 0 && agentCount > 0,
+      detail: `${branchCount} branch(es), ${agentCount} agent(s)`,
+      href: '/settings/dimensions',
+      severity: 'gap',
+    },
+    {
+      label: 'Products & services',
+      ok: products > 0,
+      detail: products > 0
+        ? `${products} on the list`
+        : 'Every invoice line is typed from scratch, with its account chosen by hand each time.',
+      href: '/settings/products',
+      severity: 'gap',
+    },
+    /*
+     * HSN COVERAGE, as a check of its own rather than folded into the one above.
+     *
+     * A list of products is a convenience; a product with no HSN is a DEFECT
+     * that propagates — every invoice line it fills prints without the code
+     * Rule 46 requires, and nobody notices until a return is scrutinised. It is
+     * counted here because it is invisible everywhere else: the invoice looks
+     * finished, the ledger balances, and the only symptom is a column that
+     * happens to be empty.
+     */
+    {
+      label: 'HSN / SAC codes',
+      ok: productsWithoutHsn === 0,
+      detail: products === 0
+        ? 'Nothing on the product list to classify yet.'
+        : productsWithoutHsn === 0
+          ? `All ${products} carry a code.`
+          : `${productsWithoutHsn} of ${products} have none, so an invoice line filled from them prints without the HSN a GST invoice requires.`,
+      href: '/settings/products',
+      severity: 'gap',
+    },
+    {
+      label: 'Channel settlement accounts',
+      ok: channelReady,
+      detail: channelReady
+        ? 'Commission, logistics, charges, recoveries and the TCS/TDS receivables are all set.'
+        : 'A marketplace payout cannot be posted: the commission, GST and withheld-tax accounts are not all configured.',
+      href: '/settings/accounts',
+      severity: 'gap',
+    },
   ];
 
-  const journalKeys: Array<[string, string]> = [
-    ['journal.sale', 'Customer invoices'],
-    ['journal.sale_refund', 'Customer credit notes'],
-    ['journal.purchase', 'Vendor bills'],
-    ['journal.purchase_refund', 'Vendor credit notes'],
-    ['journal.bank', 'Default bank'],
-    ['journal.cash', 'Default cash'],
-    ['journal.customer_payment', 'Customer payments'],
-    ['journal.vendor_payment', 'Supplier payments'],
-    ['journal.general', 'Miscellaneous / adjustments'],
-    ['journal.expense', 'Employee expenses'],
-  ];
+  const blockers = checks.filter((c) => !c.ok && c.severity === 'blocker');
+  const gaps = checks.filter((c) => !c.ok && c.severity === 'gap');
 
   return (
     <>
       <PageHeader
         title="Settings"
-        subtitle="Which account the engine reaches for when nothing more specific is set."
+        subtitle="What this agency has configured, and what is still waiting."
         accent="var(--color-sec-settings)"
-        actions={<Link href="/settings/products" className={btn.ghost}>Products & services →</Link>}
+        actions={<Link href="/settings/organisation" className={btn.primary}>Agency details →</Link>}
       />
       {m.error && <Banner tone="error">{m.error}</Banner>}
       {m.ok && <Banner tone="ok">{m.ok}</Banner>}
-      {!mayConfigure && (
-        <Banner tone="info">
-          Your role can read these settings but not change them. Configuring the chart of accounts
-          is an admin capability.
+
+      {blockers.length > 0 ? (
+        <Banner tone="error">
+          {blockers.length} setting{blockers.length === 1 ? '' : 's'} will stop work outright:{' '}
+          {blockers.map((b) => b.label).join(', ')}.
         </Banner>
+      ) : gaps.length > 0 ? (
+        <Banner tone="warn">
+          Ready to post. {gaps.length} optional setting{gaps.length === 1 ? '' : 's'} would make the
+          reports more useful.
+        </Banner>
+      ) : (
+        <Banner tone="ok">Fully configured.</Banner>
       )}
 
-      <form action={saveSettingsAction} className="grid gap-5 lg:grid-cols-2">
-        <Card title="Default accounts"
-          subtitle="Named here, never in the posting code — that is what makes the chart configurable.">
-          <div className="space-y-3">
-            {accountKeys.map(([key, label, hint]) => (
-              <Field key={key} label={label} hint={hint || undefined}>
-                <select name={`setting.${key}`} defaultValue={current[key] ?? ''}
-                  disabled={!mayConfigure} className={inputClass}>
-                  <option value="">— not set —</option>
-                  {accounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
-                </select>
-              </Field>
+      <div className="grid gap-5 lg:grid-cols-[1.6fr_1fr]">
+        <Card title="Configuration" padded={false}
+          subtitle="Each row names what breaks without it, not just that it is empty.">
+          <ul className="divide-y divide-line">
+            {checks.map((c) => (
+              <li key={c.label} className="flex items-start gap-3 px-5 py-3">
+                <span className={`mt-0.5 text-[15px] font-bold ${
+                  c.ok ? 'text-positive' : c.severity === 'blocker' ? 'text-negative' : 'text-warn'}`}>
+                  {c.ok ? '✓' : c.severity === 'blocker' ? '✕' : '!'}
+                </span>
+                <span className="flex-1">
+                  <Link href={c.href} className="text-[13.5px] font-bold text-brand hover:underline">
+                    {c.label}
+                  </Link>
+                  <span className="block text-[12.5px] text-ink-muted">{c.detail}</span>
+                </span>
+                {!c.ok && (
+                  <Chip state={c.severity === 'blocker' ? 'cancelled' : 'partial'}
+                    label={c.severity === 'blocker' ? 'Blocks posting' : 'Optional'} />
+                )}
+              </li>
             ))}
-          </div>
+          </ul>
         </Card>
 
         <div className="space-y-5">
-          <Card title="Default journals">
-            <div className="space-y-3">
-              {journalKeys.map(([key, label]) => (
-                <Field key={key} label={label}>
-                  <select name={`setting.${key}`} defaultValue={current[key] ?? ''}
-                    disabled={!mayConfigure} className={inputClass}>
-                    <option value="">— not set —</option>
-                    {journals.map((j) => <option key={j.id} value={j.id}>{j.label}</option>)}
-                  </select>
-                </Field>
-              ))}
-            </div>
-            {mayConfigure && (
-              <button className={`${btn.primary} mt-5 w-full`}>Save settings</button>
-            )}
-          </Card>
-
-          <Card title="Organisation">
+          <Card title="This agency">
             <DefList rows={[
-              ['Name', s.orgName],
+              ['Name', org?.name ?? s.orgName],
+              ['Legal name', org?.legal_name ?? '—'],
+              ['GSTIN', org?.gstin ?? '—'],
+              ['Place of supply', stateName(org?.state_code ?? null) ?? '—'],
               ['Currency', s.currency],
               ['Fiscal year starts', new Date(2000, s.fyStartMonth - 1, 1)
                 .toLocaleDateString('en-IN', { month: 'long' })],
               ['Signed in as', `${s.userName} · ${titleise(s.role)}`],
             ]} />
           </Card>
+
+          {mayConfigure && (
+            <Card title="Reset the books"
+              subtitle="Wipes every transaction and re-seeds the demo agency. There is no undo.">
+              <form action={resetAction} className="space-y-3">
+                <Field label="Type RESET to confirm">
+                  <input name="confirm" className={inputClass} placeholder="RESET" />
+                </Field>
+                <button className={btn.danger}>Reset and re-seed</button>
+              </form>
+            </Card>
+          )}
         </div>
-      </form>
-
-      <Card title="Finance permissions" className="mt-5" padded={false}
-        subtitle="What each role may do. Enforced on the server, not by hiding buttons.">
-        <Table>
-          <thead>
-            <tr>
-              <Th>Capability</Th>
-              {Object.keys(ROLE_CAPS).filter((r) => r !== 'service_role').map((r) => (
-                <Th key={r} align="center">{titleise(r)}</Th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {FINANCE_CAPS.map((cap) => (
-              <tr key={cap} className="hover:bg-canvas">
-                <Td><span className="font-semibold">{cap}</span></Td>
-                {Object.keys(ROLE_CAPS).filter((r) => r !== 'service_role').map((r) => (
-                  <Td key={r} align="center">
-                    {ROLE_CAPS[r].includes(cap)
-                      ? <span className="font-bold text-positive">✓</span>
-                      : <span className="text-ink-faint">·</span>}
-                  </Td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </Table>
-      </Card>
-
-      <Card title="Users" className="mt-5" padded={false}>
-        <Table>
-          <thead><tr><Th>Name</Th><Th>Email</Th><Th>Role</Th></tr></thead>
-          <tbody>
-            {users.map((u) => (
-              <tr key={u.id}>
-                <Td><span className="font-semibold">{u.name}</span></Td>
-                <Td><span className="text-ink-muted">{u.email ?? '—'}</span></Td>
-                <Td><Chip state="draft" label={titleise(u.role)} /></Td>
-              </tr>
-            ))}
-          </tbody>
-        </Table>
-        <p className="px-5 py-4 text-[12.5px] text-ink-faint">
-          Users and roles come from the CRM in production. Set <code>TRIPZO_USER</code> to an email
-          here to see the product as that role.
-        </p>
-      </Card>
-
-      {mayConfigure && (
-        <Card title="Reset the books" className="mt-5"
-          subtitle="Wipes every transaction and re-seeds the demo agency. There is no undo.">
-          <form action={resetAction} className="flex flex-wrap items-end gap-3">
-            <Field label="Type RESET to confirm">
-              <input name="confirm" className={`${inputClass} w-[200px]`} placeholder="RESET" />
-            </Field>
-            <button className={btn.danger}>Reset and re-seed</button>
-          </form>
-        </Card>
-      )}
+      </div>
     </>
   );
 }

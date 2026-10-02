@@ -5,6 +5,7 @@ import { generalLedger } from '@/server/accounting/reports';
 import { listAccounts, listJournals, listPartners } from '@/server/accounting/masters';
 import { listAnalyticAccounts, listBookings } from '@/server/accounting/analytics';
 import { fmtDate, titleise } from '@/lib/accounting';
+import { fmt } from '@/lib/money';
 import {
   PageHeader, Card, Table, Th, Td, Money, DrCrMoney, EmptyState, RefLink, inputClass, btn, StatTile,
 } from '@/components/ui';
@@ -93,6 +94,18 @@ export default async function GeneralLedgerPage({ searchParams }: { searchParams
             hint={closing === 0 ? 'Nil' : closing > 0 ? 'Debit' : 'Credit'} />
         )}
       </div>
+
+      {/* An extract is a slice of the ledger, not the ledger: filter on one
+          account or one partner and the two columns are not meant to agree.
+          Said plainly, because two unequal totals with no explanation read
+          like a broken report. */}
+      {debit !== credit && lines.length > 0 && (
+        <p className="mb-4 text-[13px] text-ink-muted">
+          Debits and credits differ by <span className="num font-semibold">{fmt(Math.abs(debit - credit))}</span>.
+          That is expected in a filtered extract — only the lines matching the filters above are counted,
+          and the other side of those entries sits outside them. Clear the filters to see a ledger that balances.
+        </p>
+      )}
 
       <Card padded={false}>
         {lines.length === 0 ? (

@@ -81,26 +81,62 @@ export default async function BankAccountPage({ params, searchParams }: {
           )}
         </Card>
 
-        <Card title="Import a statement"
-          subtitle="CSV from the bank. Date plus either an Amount column or a Debit/Credit pair.">
-          <form action={importStatementAction} className="space-y-3">
-            <input type="hidden" name="bank_account_id" value={id} />
-            <Field label="CSV file">
-              <input type="file" name="file" accept=".csv,text/csv"
-                className="w-full text-[13px] file:mr-3 file:rounded-[8px] file:border-0 file:bg-brand-soft file:px-3 file:py-1.5 file:text-[12.5px] file:font-bold file:text-brand" />
-            </Field>
-            <Field label="…or paste the rows" hint="Header row first — dd/mm/yyyy dates are understood.">
-              <textarea name="csv" rows={6} className={inputClass}
-                placeholder={'Date,Narration,Ref,Withdrawal,Deposit,Balance\n27/09/2026,UPI/RAHUL,UPI/1123,,75000,842000'} />
-            </Field>
-            <button className={`${btn.primary} w-full`}>Import</button>
-          </form>
-          <p className="mt-3 text-[12px] text-ink-faint">
-            Re-importing an overlapping statement is safe: a line with the same date, amount and
-            reference as one already here is skipped rather than duplicated.
-          </p>
-        </Card>
+        <div className="space-y-5">
+          <Card title="Account details"
+            subtitle="What you give a payer, and what the bank needs back.">
+            <dl className="space-y-2.5">
+              <Detail label="Bank" value={account.bank_name} />
+              <Detail label="Branch" value={account.branch_name} />
+              <Detail label="Account number" value={account.account_no} mono />
+              <Detail label="IFSC" value={account.ifsc} mono />
+              <Detail label="SWIFT" value={account.swift} mono />
+              <Detail label="UPI ID" value={account.upi_id} mono />
+              <Detail label="Currency" value={account.currency} />
+              <Detail label="Note" value={account.note} />
+            </dl>
+            <Link href="/settings/bank-accounts"
+              className="mt-3 inline-block text-[12px] font-bold text-ink-faint hover:text-brand">
+              Change these in Settings →
+            </Link>
+          </Card>
+
+          <Card title="Import a statement"
+            subtitle="CSV from the bank. Date plus either an Amount column or a Debit/Credit pair.">
+            <form action={importStatementAction} className="space-y-3">
+              <input type="hidden" name="bank_account_id" value={id} />
+              <Field label="CSV file">
+                <input type="file" name="file" accept=".csv,text/csv"
+                  className="w-full text-[13px] file:mr-3 file:rounded-[8px] file:border-0 file:bg-brand-soft file:px-3 file:py-1.5 file:text-[12.5px] file:font-bold file:text-brand" />
+              </Field>
+              <Field label="…or paste the rows" hint="Header row first — dd/mm/yyyy dates are understood.">
+                <textarea name="csv" rows={6} className={inputClass}
+                  placeholder={'Date,Narration,Ref,Withdrawal,Deposit,Balance\n27/09/2026,UPI/RAHUL,UPI/1123,,75000,842000'} />
+              </Field>
+              <button className={`${btn.primary} w-full`}>Import</button>
+            </form>
+            <p className="mt-3 text-[12px] text-ink-faint">
+              Re-importing an overlapping statement is safe: a line with the same date, amount and
+              reference as one already here is skipped rather than duplicated.
+            </p>
+          </Card>
+        </div>
       </div>
     </>
+  );
+}
+
+/**
+ * The account number is shown in full here, unlike the settings list: this
+ * page is where somebody comes to read it out to a payer, and a masked number
+ * would only send them to the bank's own app for it.
+ */
+function Detail({ label, value, mono }: { label: string; value?: string | null; mono?: boolean }) {
+  return (
+    <div className="flex items-baseline justify-between gap-4">
+      <dt className="text-[12px] font-bold uppercase tracking-wide text-ink-faint">{label}</dt>
+      <dd className={`text-right text-[13px] ${value ? 'font-semibold' : 'text-ink-faint'} ${mono ? 'num' : ''}`}>
+        {value || '—'}
+      </dd>
+    </div>
   );
 }

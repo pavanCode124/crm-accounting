@@ -31,6 +31,21 @@ export type SettingKey =
   | 'account.bank_charges'
   | 'account.commission_expense'
   | 'account.commission_payable'
+  /*
+   * CHANNEL SETTLEMENTS. What an OTA or a marketplace keeps out of a payout,
+   * and what it withholds on the agency's behalf. Separate keys rather than one
+   * "channel charges" bucket because the three are read differently: commission
+   * is a cost of sale and belongs beside the margin, shipping is logistics, and
+   * TCS/TDS are not costs at all — they are tax already paid, which has to be
+   * an ASSET the agency can set off at assessment rather than an expense that
+   * quietly reduces its profit and is then paid again.
+   */
+  | 'account.channel_commission'
+  | 'account.channel_shipping'
+  | 'account.channel_charges'
+  | 'account.channel_recovery'
+  | 'account.tcs_receivable'
+  | 'account.tds_receivable'
   | 'account.employee_advance'
   | 'account.rounding'
   | 'account.opening_balance'

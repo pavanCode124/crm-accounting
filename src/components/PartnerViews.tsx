@@ -6,6 +6,7 @@ import { listDocuments } from '@/server/accounting/documents';
 import { listPayments } from '@/server/accounting/payments';
 import { partnerBalance, partnerLedger } from '@/server/accounting/reports';
 import { listBookings } from '@/server/accounting/analytics';
+import { GST_STATES, stateName } from '@/server/accounting/organisation';
 import { savePartnerAction } from '@/app/actions';
 import {
   Card, Table, Th, Td, Money, Chip, EmptyState, RefLink, StatTile, Field, inputClass, btn, Tabs, DefList,
@@ -88,7 +89,40 @@ export async function PartnerList({ orgId, side, basePath, search }: {
           <Field label="Email"><input name="email" type="email" className={inputClass} /></Field>
           <Field label="Phone"><input name="phone" className={inputClass} /></Field>
           <Field label="GSTIN"><input name="gstin" className={inputClass} placeholder="36AABCW1234F1Z5" /></Field>
+          {/*
+            THE REGISTERED NAME, SEPARATELY FROM THE NAME WE FILE THEM UNDER.
+
+            An invoice has to carry the name on the GST registration, and that
+            is routinely not the name anyone here types — "Greenwood Holidays"
+            is registered as "GREENWOOD HOLIDAYS PRIVATE LIMITED". An invoice
+            carrying the friendly name does not match the portal's record, which
+            is what costs the customer their input credit.
+          */}
+          <Field label="Registered (GST) name" hint="As it appears on the registration, if it differs from the name above.">
+            <input name="gst_name" className={inputClass} placeholder="GREENWOOD HOLIDAYS PRIVATE LIMITED" />
+          </Field>
           <Field label="PAN"><input name="pan" className={inputClass} /></Field>
+          <Field label="City"><input name="city" className={inputClass} placeholder="Hyderabad" /></Field>
+          {/*
+            A CLOSED LIST, because the place of supply is compared as an exact
+            string: "07" and "7" are the same state to a person and two
+            different states to the posting engine. Blank is allowed and the
+            GSTIN fills it in — the first two digits of a GSTIN ARE the state.
+          */}
+          <Field label="State (place of supply)"
+            hint="Decides CGST+SGST against IGST on every invoice. Taken from the GSTIN when one is given.">
+            <select name="state_code" className={inputClass} defaultValue="">
+              <option value="">—</option>
+              {GST_STATES.map(([code, name]) =>
+                <option key={code} value={code}>{code} — {name}</option>)}
+            </select>
+          </Field>
+          <Field label="Billing address">
+            <textarea name="address" rows={2} className={inputClass} />
+          </Field>
+          <Field label="Shipping address" hint="Only when it differs from the billing address.">
+            <textarea name="shipping_address" rows={2} className={inputClass} />
+          </Field>
           <Field label="Payment terms">
             <select name="payment_terms_id" className={inputClass} defaultValue="">
               <option value="">—</option>
@@ -161,8 +195,15 @@ export async function PartnerDetail({ orgId, partnerId, side, basePath, tab = 'o
               ['Email', p.email ?? '—'],
               ['Phone', p.phone ?? '—'],
               ['GSTIN', p.gstin ?? '—'],
+              ...(p.gst_name ? [['Registered name', p.gst_name] as [string, string]] : []),
               ['PAN', p.pan ?? '—'],
+              // Shown always: it is a posting input, and an invoice raised
+              // against a partner with no state falls back to nothing and
+              // leaves the choice of tax entirely to whoever typed the line.
+              ['Place of supply', stateName(p.state_code) ?? '—'],
+              ['City', p.city ?? '—'],
               ['Address', p.address ?? '—'],
+              ...(p.shipping_address ? [['Ships to', p.shipping_address] as [string, string]] : []),
               ...(isCustomer
                 ? [['Credit limit', fmt(p.credit_limit)] as [string, string]]
                 : [['TDS section', p.tds_section ?? '—'] as [string, string]]),

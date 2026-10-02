@@ -27,7 +27,7 @@ export default async function Page({ searchParams }: { searchParams: Promise<Sea
       />
       {m.error && <Banner tone="error">{m.error}</Banner>}
       {m.ok && <Banner tone="ok">{m.ok}</Banner>}
-      <DocumentFilters action="/purchases/debit-notes" filter={filter} />
+      <DocumentFilters action="/purchases/debit-notes" filter={filter} docType="in_refund" />
       <DocumentList
         orgId={s.orgId}
         docType="in_refund"

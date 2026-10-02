@@ -2,12 +2,31 @@ import Link from 'next/link';
 import { fmtDate, titleise, isoDate } from '@/lib/accounting';
 import { listPayments, allocationsOfPayment } from '@/server/accounting/payments';
 import { listDocuments } from '@/server/accounting/documents';
-import { bankAccountOptions, journalOptions, partnerOptions, bookingOptions } from '@/server/options';
+import { bankAccountOptions, partnerOptions, bookingOptions } from '@/server/options';
 import { registerPaymentAction, allocateAction, reversePaymentAction } from '@/app/actions';
 import { fmt } from '@/lib/money';
 import {
   Card, Table, Th, Td, Money, Chip, EmptyState, RefLink, Field, inputClass, btn, StatTile, PartnerDatalist,
 } from './ui';
+
+/**
+ * The trip the money is for.
+ *
+ * Shown on both payment tables because "what was this advance against?" is the
+ * first thing asked of a receipt that settles no invoice — on the Advance rows
+ * the Applied-to column is empty by definition, so without this the screen
+ * says nothing about why the money arrived. The ref links to the booking; the
+ * title sits under it because BK-1023 means nothing on its own.
+ */
+function TripCell({ id, ref_, title }: { id?: string | null; ref_?: string | null; title?: string | null }) {
+  if (!id || !ref_) return <span className="text-ink-faint">—</span>;
+  return (
+    <>
+      <Link href={`/bookings/${id}`} className="font-semibold text-ink-muted hover:underline">{ref_}</Link>
+      {title && <div className="max-w-[180px] truncate text-[11.5px] text-ink-faint" title={title}>{title}</div>}
+    </>
+  );
+}
 
 /**
  * Money received, or money paid.
@@ -30,7 +49,6 @@ export async function PaymentsView({ orgId, direction }: { orgId: string; direct
 
   const today = isoDate();
   const banks = await bankAccountOptions(orgId);
-  const journals = await journalOptions(orgId, ['bank', 'cash']);
   const partners = await partnerOptions(orgId, inbound ? 'customer' : 'supplier');
   const bookings = await bookingOptions(orgId);
   const basePath = inbound ? '/sales' : '/purchases';
@@ -55,7 +73,10 @@ export async function PaymentsView({ orgId, direction }: { orgId: string; direct
               padded={false}>
               <Table>
                 <thead>
-                  <tr><Th>Payment</Th><Th>Partner</Th><Th>Date</Th><Th align="right">Unallocated</Th><Th>Apply to</Th></tr>
+                  <tr>
+                    <Th>Payment</Th><Th>Partner</Th><Th>Trip</Th><Th>Date</Th>
+                    <Th align="right">Unallocated</Th><Th>Apply to</Th>
+                  </tr>
                 </thead>
                 <tbody>
                   {unapplied.map((p) => {
@@ -67,6 +88,7 @@ export async function PaymentsView({ orgId, direction }: { orgId: string; direct
                           {!!p.is_advance && <div><Chip state="partial" label="Advance" /></div>}
                         </Td>
                         <Td>{p.partner_name}</Td>
+                        <Td><TripCell id={p.trip_id} ref_={p.trip_ref} title={p.trip_title} /></Td>
                         <Td>{fmtDate(p.pay_date)}</Td>
                         <Td align="right"><Money value={p.unallocated} bold dash={false} /></Td>
                         <Td>
@@ -104,7 +126,7 @@ export async function PaymentsView({ orgId, direction }: { orgId: string; direct
               <Table>
                 <thead>
                   <tr>
-                    <Th>Number</Th><Th>Partner</Th><Th>Date</Th><Th>Method</Th>
+                    <Th>Number</Th><Th>Partner</Th><Th>Trip</Th><Th>Date</Th><Th>Method</Th>
                     <Th>Applied to</Th><Th align="right">Amount</Th><Th>Status</Th><Th />
                   </tr>
                 </thead>
@@ -115,6 +137,7 @@ export async function PaymentsView({ orgId, direction }: { orgId: string; direct
                       <tr key={p.id} className="hover:bg-canvas">
                         <Td><span className="font-bold">{p.number}</span></Td>
                         <Td>{p.partner_name}</Td>
+                        <Td><TripCell id={p.trip_id} ref_={p.trip_ref} title={p.trip_title} /></Td>
                         <Td>{fmtDate(p.pay_date)}</Td>
                         <Td><span className="text-ink-muted">{titleise(p.method)}</span>
                           {p.reference && <div className="text-[11.5px] text-ink-faint">{p.reference}</div>}
@@ -176,12 +199,35 @@ export async function PaymentsView({ orgId, direction }: { orgId: string; direct
             <Field label="Date">
               <input type="date" name="pay_date" defaultValue={today} className={inputClass} />
             </Field>
-            <Field label={inbound ? 'Received into' : 'Paid from'}>
-              <select name="bank_account_id" className={inputClass}>
-                {banks.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+            {/*
+              * Grouped, and the whole list rather than a chosen three. These
+              * come from Settings → Bank & Cash, so an agency with eleven
+              * accounts sees eleven. Banks and cash are separated because they
+              * answer different questions — "which bank did it hit" and "whose
+              * float was it" — and a flat list of both invites the wrong pick.
+              *
+              * No hidden journal field: the journal is resolved from the chosen
+              * account on the server, so cash receipts can no longer be stamped
+              * into a bank journal. See registerPaymentAction.
+              */}
+            <Field label={inbound ? 'Received into' : 'Paid from'}
+              hint={banks.length === 0 ? 'No accounts configured yet — add one under Settings → Bank & Cash.' : undefined}>
+              <select name="bank_account_id" className={inputClass}
+                defaultValue={banks.find((b) => b.is_default)?.id ?? banks[0]?.id ?? ''}>
+                <optgroup label="Bank">
+                  {banks.filter((b) => !b.is_cash).map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {b.name}{b.account_no ? ` · ••••${b.account_no.slice(-4)}` : ''}
+                    </option>
+                  ))}
+                </optgroup>
+                <optgroup label="Cash">
+                  {banks.filter((b) => b.is_cash).map((b) => (
+                    <option key={b.id} value={b.id}>{b.name}</option>
+                  ))}
+                </optgroup>
               </select>
             </Field>
-            <input type="hidden" name="journal_id" value={journals[0]?.id ?? ''} />
             <Field label="Method">
               <select name="method" defaultValue="neft" className={inputClass}>
                 {['neft', 'upi', 'bank', 'card', 'cheque', 'cash', 'other'].map((m) =>

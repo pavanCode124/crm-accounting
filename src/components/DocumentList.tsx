@@ -17,6 +17,9 @@ export async function DocumentList({ orgId, docType, basePath, filter, emptyHint
   const docs = await listDocuments(orgId, { ...filter, docType });
   const today = isoDate();
   const isBill = docType.startsWith('in_');
+  // Only invoices and bills have an edit screen; a credit or debit note is
+  // raised from the document it corrects, never typed from scratch.
+  const editable = docType === 'out_invoice' || docType === 'in_invoice';
 
   const totals = docs.reduce(
     (t, d) => ({ total: t.total + d.total, residual: t.residual + d.residual }),
@@ -54,7 +57,13 @@ export async function DocumentList({ orgId, docType, basePath, filter, emptyHint
                     <RefLink href={`${basePath}/${d.id}`}>{d.number ?? 'Draft'}</RefLink>
                     {d.supplier_ref && <div className="text-[11.5px] text-ink-faint">{d.supplier_ref}</div>}
                   </Td>
-                  <Td><span className="font-semibold">{d.partner_name}</span></Td>
+                  <Td>
+                    {/* The name is what the eye goes to first, so it opens the
+                        document as well as the number does. */}
+                    <Link href={`${basePath}/${d.id}`} className="font-semibold hover:underline">
+                      {d.partner_name}
+                    </Link>
+                  </Td>
                   <Td>
                     {d.booking_id
                       ? <Link href={`/bookings/${d.booking_id}`} className="text-ink-muted hover:underline">{d.booking_ref}</Link>
@@ -72,9 +81,15 @@ export async function DocumentList({ orgId, docType, basePath, filter, emptyHint
                   <Td align="right"><Money value={d.total} dash={false} /></Td>
                   <Td align="right"><Money value={d.residual} bold /></Td>
                   <Td>
-                    <div className="flex flex-wrap gap-1.5">
+                    <div className="flex flex-wrap items-center gap-1.5">
                       <Chip state={d.state} />
                       {d.state === 'posted' && <Chip state={d.payment_state} />}
+                      {/* A draft is still being written; take it straight back
+                          to the editor rather than via the document. */}
+                      {editable && d.state === 'draft' && (
+                        <Link href={`${basePath}/${d.id}/edit`}
+                          className="text-[12px] font-bold text-brand hover:underline">Edit</Link>
+                      )}
                     </div>
                   </Td>
                 </tr>
@@ -95,13 +110,30 @@ export async function DocumentList({ orgId, docType, basePath, filter, emptyHint
   );
 }
 
-/** The filter strip above the list: search, state, and a date window. */
-export function DocumentFilters({ action, filter }: {
-  action: string; filter: { search?: string; state?: string; paymentState?: string; from?: string; to?: string };
+/**
+ * The filter strip above the list: search, state, a date window — and the
+ * export.
+ *
+ * THE EXPORT IS A SECOND SUBMIT BUTTON ON THE SAME FORM, retargeted with
+ * `formAction`, and that is the whole reason it lives here rather than beside
+ * the New Invoice button in the page header.
+ *
+ * An export has to hold exactly the rows that were on screen. A separate link
+ * in the header would have to reconstruct the filter from the URL, which means
+ * two places deciding what "the current view" means and one of them eventually
+ * being wrong — and the reader has no way to notice, because the file looks
+ * complete either way. Submitting the same form sends the same fields by
+ * construction: whatever the user typed is what the workbook contains.
+ */
+export function DocumentFilters({ action, filter, docType }: {
+  action: string;
+  filter: { search?: string; state?: string; paymentState?: string; from?: string; to?: string };
+  docType?: DocType;
 }) {
   return (
     <form action={action} method="get"
       className="no-print mb-5 flex flex-wrap items-end gap-2 rounded-card border border-line bg-surface px-4 py-3">
+      {docType && <input type="hidden" name="type" value={docType} />}
       <label className="block min-w-[220px] flex-1">
         <span className="mb-1 block text-[11px] font-bold uppercase tracking-[0.06em] text-ink-faint">Search</span>
         <input name="q" defaultValue={filter.search} placeholder="Number, customer, supplier reference…"
@@ -134,6 +166,17 @@ export function DocumentFilters({ action, filter }: {
         <input type="date" name="to" defaultValue={filter.to} className={`${inputClass} w-[160px]`} />
       </label>
       <button className={btn.ghost}>Filter</button>
+      <button
+        className={btn.ghost}
+        formAction="/api/exports/documents"
+        // A new tab, so the list the user filtered is still there when the
+        // download finishes. Navigating the page itself to a file download
+        // leaves some browsers on a blank document with no way back.
+        formTarget="_blank"
+        title="Download these rows as an Excel workbook, item by item, with the HSN and the tax split per line."
+      >
+        Export to Excel
+      </button>
     </form>
   );
 }

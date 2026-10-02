@@ -72,7 +72,13 @@ export type SearchParams = Record<string, string | string[] | undefined>;
 
 export async function one(params: SearchParams, key: string): Promise<string | undefined> {
   const v = params[key];
-  return Array.isArray(v) ? v[0] : v;
+  const s = Array.isArray(v) ? v[0] : v;
+  // An EMPTY string is "not filtered", not "filtered to empty". A GET form
+  // submits every select it owns, so the "All" option arrives as `state=` —
+  // and a caller doing `state ?? null` would then pass '' to the query and ask
+  // the database for rows whose state is the empty string, of which there are
+  // none. That is how picking a journal with State on "All" emptied the page.
+  return s === undefined || s === '' ? undefined : s;
 }
 
 /** The `?ok=` / `?error=` banner a server action redirects back with. */

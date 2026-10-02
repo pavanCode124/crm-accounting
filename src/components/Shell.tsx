@@ -94,7 +94,7 @@ function Masthead({ user, sections, pathname }: {
         <form action="/search" className="ml-2 hidden min-w-0 flex-1 md:block md:max-w-md">
           <input
             name="q"
-            placeholder="Search invoices, bills, customers, bookings…"
+            placeholder="Search invoices, bills, customers, bookings, screens…"
             className="w-full rounded-[10px] px-3.5 py-1.5 text-[13px] text-white outline-none placeholder:text-[var(--nav-text-dim)] focus:border-brand"
             style={{ background: 'var(--nav-input)', border: '1px solid var(--nav-line)' }}
           />

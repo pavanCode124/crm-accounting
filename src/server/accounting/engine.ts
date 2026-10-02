@@ -245,6 +245,14 @@ async function writeLine(input: PostingInput, entryId: string, l: PostingLine, s
     l.taxId ?? null, Math.round(l.taxBase ?? 0), l.bookingId ?? null, input.date, state,
   );
 
+  const kind = (await one<{ kind: string }>('SELECT kind FROM accounts WHERE id = ?', l.accountId))?.kind ?? '';
+  // Only P&L lines carry analytic weight. Tagging the receivable side of an
+  // invoice to a trip would double-count it: the revenue line already is the
+  // trip's income, and the receivable is merely how it was financed.
+  if (!isPl(kind)) return;
+
+  const spread = [...(l.analytic ?? (l.analyticId ? [{ analyticId: l.analyticId, bps: 10000 }] : []))];
+
   /*
    * A LINE TAGGED TO A TRIP IS TAGGED TO THE TRIP'S ANALYTIC ACCOUNT, ALWAYS.
    *
@@ -261,29 +269,55 @@ async function writeLine(input: PostingInput, entryId: string, l: PostingLine, s
    * depreciation, hand-typed journal — passes through here, and a fallback in
    * any one screen would have to be repeated in the other six.
    *
-   * An analytic given explicitly always wins: a split across two trips, or a
-   * line deliberately tagged to a department instead, is a decision, and this
-   * only fills a blank.
+   * THE TRIP TAG IS ADDED ALONGSIDE, NOT INSTEAD OF. The analytic box on a
+   * line is one flat list across every plan — trips, departments, branches,
+   * agents — so picking AGENT-3 on a hotel bill used to be read as "this line
+   * is not on a trip" and knocked the trip tag out, silently. The two are
+   * different questions about the same rupee, and the schema has always
+   * allowed one row per plan. Only an analytic FROM THE TRIP'S OWN PLAN is a
+   * decision about which trip this is, and only that one wins — which is what
+   * keeps a deliberate split across two trips working.
    */
-  let spread = l.analytic ?? (l.analyticId ? [{ analyticId: l.analyticId, bps: 10000 }] : []);
-  if (!spread.length && l.bookingId) {
-    const fromBooking = (await one<{ analytic_id: string | null }>(
-      'SELECT analytic_id FROM bookings WHERE id = ? AND org_id = ?', l.bookingId, input.orgId,
-    ))?.analytic_id;
-    if (fromBooking) spread = [{ analyticId: fromBooking, bps: 10000 }];
+  if (l.bookingId) {
+    const trip = await one<{ analytic_id: string | null; plan_id: string | null }>(
+      `SELECT b.analytic_id, an.plan_id
+         FROM bookings b LEFT JOIN analytic_accounts an ON an.id = b.analytic_id
+        WHERE b.id = ? AND b.org_id = ?`, l.bookingId, input.orgId,
+    );
+    if (trip?.analytic_id && trip.plan_id) {
+      const tagged = spread.length
+        ? await scalar(
+          `SELECT COUNT(*) FROM analytic_accounts
+            WHERE plan_id = ? AND id IN (${spread.map(() => '?').join(',')})`,
+          trip.plan_id, ...spread.map((a) => a.analyticId),
+        )
+        : 0;
+      if (!tagged) spread.push({ analyticId: trip.analytic_id, bps: 10000 });
+    }
   }
   if (!spread.length) return;
 
-  const totalBps = spread.reduce((s, a) => s + a.bps, 0);
-  if (totalBps !== 10000) {
-    throw new PostingError(`Analytic distribution must total 100% (got ${(totalBps / 100).toFixed(2)}%).`);
-  }
+  /*
+   * 100% PER PLAN, not 100% across all of them. A line that is wholly on the
+   * Goa trip AND wholly in the Leisure department is 10000 bps twice, and
+   * summing the two to 20000 would reject a perfectly ordinary posting.
+   */
+  const planOf = new Map<string, string>();
+  for (const r of await all<{ id: string; plan_id: string }>(
+    `SELECT id, plan_id FROM analytic_accounts WHERE id IN (${spread.map(() => '?').join(',')})`,
+    ...spread.map((a) => a.analyticId),
+  )) planOf.set(r.id, r.plan_id);
 
-  const kind = (await one<{ kind: string }>('SELECT kind FROM accounts WHERE id = ?', l.accountId))?.kind ?? '';
-  // Only P&L lines carry analytic weight. Tagging the receivable side of an
-  // invoice to a trip would double-count it: the revenue line already is the
-  // trip's income, and the receivable is merely how it was financed.
-  if (!isPl(kind)) return;
+  const byPlan = new Map<string, number>();
+  for (const a of spread) {
+    const plan = planOf.get(a.analyticId) ?? a.analyticId;
+    byPlan.set(plan, (byPlan.get(plan) ?? 0) + a.bps);
+  }
+  for (const total of byPlan.values()) {
+    if (total !== 10000) {
+      throw new PostingError(`Analytic distribution must total 100% per plan (got ${(total / 100).toFixed(2)}%).`);
+    }
+  }
 
   // Signed so that trip profitability is a straight SUM: cost positive,
   // revenue negative, profit = -SUM.

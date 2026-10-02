@@ -5,6 +5,7 @@ import {
   type AccountKind,
 } from '@/lib/accounting';
 import { profitForPeriod } from './engine';
+import { getSetting } from './settings';
 
 /**
  * Every financial report in the product.
@@ -401,26 +402,65 @@ export async function partnerBalance(orgId: string, partnerId: string, asOf = is
 // ---------------------------------------------------------------------------
 
 /**
- * Output tax, input tax and what is payable — the numbers a GSTR return needs.
+ * Output tax, input tax, tax withheld and what is payable.
+ *
  * Taken from the tax lines themselves, so it ties to the ledger rather than
  * being recomputed from invoice totals and quietly disagreeing with it.
+ *
+ * THREE sections, not two, because GST and TDS are two different liabilities
+ * to two different departments on two different due dates, and netting one
+ * against the other is simply wrong:
+ *
+ *   - GST: output tax less input credit, filed in GSTR-3B by the 20th.
+ *   - TDS/TCS: deducted from a supplier and deposited by the 7th on a separate
+ *     challan, with no offset against GST whatsoever.
+ *
+ * A withholding tax row carries `scope='purchase'` (it is chosen on a bill), so
+ * it HAS to be split off by `tax_group` BEFORE the scope filter runs, or it
+ * lands in input credit and silently reduces the GST cheque.
  */
 export async function taxReport(orgId: string, p: Period) {
-  const rows = await all<{ tax_id: string; name: string; tax_group: string; scope: string; base: number; amount: number }>(
-    `SELECT l.tax_id, t.name, t.tax_group, t.scope,
+  const rows = await all<{ tax_id: string; name: string; tax_group: string; scope: string; rate_bps: number; base: number; amount: number }>(
+    `SELECT l.tax_id, t.name, t.tax_group, t.scope, t.rate_bps,
             COALESCE(SUM(l.tax_base),0) AS base,
             COALESCE(SUM(l.credit - l.debit),0) AS amount
        FROM journal_entry_lines l JOIN taxes t ON t.id = l.tax_id
       WHERE l.org_id = ? AND l.state='posted' AND l.entry_date BETWEEN ? AND ? AND l.tax_id IS NOT NULL
-      GROUP BY l.tax_id, t.name, t.tax_group, t.scope ORDER BY t.scope, t.name`,
+      GROUP BY l.tax_id, t.name, t.tax_group, t.scope, t.rate_bps ORDER BY t.scope, t.name`,
     orgId, p.from, p.to,
   );
+
+  const isWithholding = (r: { tax_group: string }) => r.tax_group === 'tds' || r.tax_group === 'tcs';
+  const gst = rows.filter((r) => !isWithholding(r));
+
   // Output tax is a credit (positive above); input tax is a debit (negative).
-  const output = rows.filter((r) => r.scope === 'sale');
-  const input = rows.filter((r) => r.scope === 'purchase').map((r) => ({ ...r, amount: -r.amount }));
+  const output = gst.filter((r) => r.scope === 'sale');
+  const input = gst.filter((r) => r.scope === 'purchase').map((r) => ({ ...r, amount: -r.amount }));
+  // Withheld tax is credited to TDS Payable, so it is already positive.
+  const withheld = rows.filter(isWithholding);
+
   const outputTotal = output.reduce((s, r) => s + r.amount, 0);
   const inputTotal = input.reduce((s, r) => s + r.amount, 0);
-  return { output, input, outputTotal, inputTotal, netPayable: outputTotal - inputTotal };
+  const withheldTotal = withheld.reduce((s, r) => s + r.amount, 0);
+
+  // What is deducted in a period and what is still sitting undeposited are two
+  // different numbers: a challan paid in April clears March's deduction. The
+  // closing balance of TDS Payable is the one that answers "what do we owe?".
+  const tdsAccount = await getSetting(orgId, 'account.tds_payable');
+  const withheldUnpaid = tdsAccount
+    ? await scalar(
+      `SELECT COALESCE(SUM(credit - debit),0) FROM journal_entry_lines
+        WHERE org_id=? AND state='posted' AND account_id=? AND entry_date<=?`,
+      orgId, tdsAccount, p.to,
+    )
+    : 0;
+
+  return {
+    output, input, withheld,
+    outputTotal, inputTotal, withheldTotal, withheldUnpaid,
+    // GST only. TDS is deposited separately and never nets against it.
+    netPayable: outputTotal - inputTotal,
+  };
 }
 
 // ---------------------------------------------------------------------------

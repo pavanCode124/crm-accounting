@@ -11,6 +11,9 @@ import { createAsset, confirmAsset, runDepreciation, createDeferral, runDeferral
 import { importStatement } from './accounting/banking';
 import { postEntry } from './accounting/engine';
 import { allocate } from './accounting/payments';
+import {
+  createSettlement, postSettlement, saveCharge as saveSettlementCharge,
+} from './accounting/settlements';
 
 /**
  * The opening set of books, and a worked example on top of it.
@@ -103,10 +106,20 @@ export async function seed() {
   await tx(async () => {
     // ----------------------------------------------------------- the agency
     await run(
-      `INSERT INTO organizations (id, name, currency, country, gstin, pan, fy_start_month, address, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
-      orgId, 'Wander Travels', 'INR', 'IN', '36AABCW1234F1Z5', 'AABCW1234F', 4,
-      'Road No. 12, Banjara Hills, Hyderabad 500034', nowIso(),
+      `INSERT INTO organizations (id, name, legal_name, currency, country, gstin, pan, state_code,
+                                  fy_start_month, address, city, email, phone, website,
+                                  invoice_terms, invoice_footer, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      orgId, 'Wander Travels', 'Wander Travels Private Limited', 'INR', 'IN',
+      // 36 is Telangana, and it is the GSTIN's own first two digits — the pair
+      // has to agree or `updateOrganisation` refuses the save. It is also what
+      // decides CGST+SGST against IGST on every invoice this agency raises.
+      '36AABCW1234F1Z5', 'AABCW1234F', '36', 4,
+      'Road No. 12, Banjara Hills, Hyderabad 500034', 'Hyderabad',
+      'accounts@wandertravels.in', '+91 40 4000 1234', 'https://wandertravels.in',
+      'Cancellation within 15 days of departure attracts 50% of the package value. '
+      + 'Visa fees and airline penalties are non-refundable.',
+      'Subject to Hyderabad jurisdiction', nowIso(),
     );
 
     const users: Array<[string, string, string, string]> = [
@@ -152,6 +165,18 @@ export async function seed() {
       ['170000', 'Input CGST', 'asset_current'],
       ['170100', 'Input SGST', 'asset_current'],
       ['170200', 'Input IGST', 'asset_current'],
+      /*
+       * TAX ALREADY PAID ON THE AGENCY'S BEHALF, AND IT IS AN ASSET.
+       *
+       * A marketplace that remits a payout has already collected TCS and
+       * withheld TDS out of it. Both are income tax the agency has effectively
+       * paid in advance and will set off at assessment — so booking them as
+       * expenses (the easy mistake, because they arrive looking like
+       * deductions) understates the profit AND loses the set-off, and the
+       * agency pays the same tax twice.
+       */
+      ['171000', 'TCS Receivable', 'asset_current'],
+      ['171100', 'TDS Receivable (Income Tax)', 'asset_current'],
       // Liabilities
       ['200000', 'Accounts Payable', 'liability_payable', true],
       ['210000', 'Output CGST', 'liability_tax'],
@@ -178,6 +203,10 @@ export async function seed() {
       ['408000', 'Commission Income', 'income'],
       ['409000', 'Other Travel Revenue', 'income_other'],
       ['410000', 'Foreign Exchange Gain', 'income_other'],
+      // What a channel pays BACK: a reimbursement for inventory it lost, a
+      // credit note reversing its own charge. Not revenue from a traveller, so
+      // it is kept out of the trip revenue accounts the margin is read from.
+      ['411000', 'Channel Recoveries', 'income_other'],
       // Direct trip costs
       ['500000', 'Hotel Cost', 'expense_direct'],
       ['501000', 'Flight Cost', 'expense_direct'],
@@ -199,6 +228,19 @@ export async function seed() {
       ['608000', 'Professional Fees', 'expense_operating'],
       ['610000', 'Agent Commission', 'expense_operating'],
       ['611000', 'Foreign Exchange Loss', 'expense_operating'],
+      /*
+       * WHAT A SALES CHANNEL KEEPS, in three accounts rather than one.
+       *
+       * They are read differently. Commission scales with what was sold and
+       * belongs beside the gross margin; shipping and return fees are logistics
+       * and scale with order COUNT; storage and advertising are neither — they
+       * are what the channel charges whether anything sold or not. One bucket
+       * hides exactly the comparison an agency makes when it decides whether a
+       * channel is worth selling through.
+       */
+      ['612000', 'Channel Commission', 'expense_operating'],
+      ['612100', 'Channel Shipping & Returns', 'expense_operating'],
+      ['612200', 'Channel Charges — Storage, Ads & Other', 'expense_operating'],
       ['609000', 'Depreciation', 'expense_depreciation'],
     ];
     for (const [code, name, kind, reconcilable] of chart) {
@@ -239,6 +281,9 @@ export async function seed() {
     await run('UPDATE journals SET bank_account_id=? WHERE id=?', 'bnk_hdfc', jrn.BNK);
     await run('UPDATE journals SET bank_account_id=? WHERE id=?', 'bnk_icici', jrn.COL);
     await run('UPDATE journals SET bank_account_id=? WHERE id=?', 'bnk_cash', jrn.CSH);
+    // The default is what every money form opens on. Without one the first
+    // account alphabetically becomes the default by accident.
+    await run('UPDATE bank_accounts SET is_default=1 WHERE id=?', 'bnk_hdfc');
 
     // ------------------------------------------------------- payment terms
     const terms: Array<[string, string, number]> = [
@@ -350,6 +395,12 @@ export async function seed() {
       ['account.bank_charges', acc['606000']],
       ['account.commission_expense', acc['610000']],
       ['account.commission_payable', acc['245000']],
+      ['account.channel_commission', acc['612000']],
+      ['account.channel_shipping', acc['612100']],
+      ['account.channel_charges', acc['612200']],
+      ['account.channel_recovery', acc['411000']],
+      ['account.tcs_receivable', acc['171000']],
+      ['account.tds_receivable', acc['171100']],
       ['account.employee_advance', acc['135000']],
       ['account.rounding', acc['409000']],
       ['account.opening_balance', acc['300000']],
@@ -368,22 +419,37 @@ export async function seed() {
     for (const [key, value] of settings) await setSetting(orgId, key, value);
 
     // ------------------------------------------------------------ products
-    const products: Array<[string, string, number, number, string, string]> = [
-      ['Bali 5D/4N Package', 'package', 150_000_00, 112_000_00, acc['400000'], acc['507000']],
-      ['Dubai 4D/3N Package', 'package', 95_000_00, 71_000_00, acc['400000'], acc['507000']],
-      ['Goa Weekend Package', 'package', 32_000_00, 22_000_00, acc['400000'], acc['507000']],
-      ['Hotel Booking', 'hotel', 0, 0, acc['401000'], acc['500000']],
-      ['Flight Ticket', 'flight', 0, 0, acc['402000'], acc['501000']],
-      ['Visa Processing', 'visa', 10_000_00, 6_500_00, acc['403000'], acc['503000']],
-      ['Airport Transfer', 'transport', 5_000_00, 3_200_00, acc['404000'], acc['502000']],
-      ['Sightseeing Tour', 'sightseeing', 8_000_00, 5_000_00, acc['405000'], acc['504000']],
-      ['Service Fee', 'fee', 2_500_00, 0, acc['406000'], acc['505000']],
+    /*
+     * EVERY SEEDED PRODUCT CARRIES ITS SAC, and that is not decoration.
+     *
+     * A GST tax invoice must state an HSN (goods) or SAC (services) per line —
+     * CGST Rule 46 — and these are the real codes for what a travel agency
+     * sells: 998555 tour-operator services, 996311 hotel accommodation, 996425
+     * road transport of passengers, 998599 other support services. Seeding them
+     * means the demo books produce a COMPLIANT invoice rather than one that
+     * looks right until an auditor reads it, and it is also the only way the
+     * HSN column on the exported statement has anything in it out of the box.
+     *
+     * The MRP is the published price the sale price discounts from, which is
+     * what the statement's "MRP" column wants beside the selling price.
+     */
+    const products: Array<[string, string, number, number, string, string, string, number, string]> = [
+      ['Bali 5D/4N Package', 'package', 150_000_00, 112_000_00, acc['400000'], acc['507000'], '998555', 169_000_00, 'Deluxe · twin sharing'],
+      ['Dubai 4D/3N Package', 'package', 95_000_00, 71_000_00, acc['400000'], acc['507000'], '998555', 109_000_00, 'Standard · twin sharing'],
+      ['Goa Weekend Package', 'package', 32_000_00, 22_000_00, acc['400000'], acc['507000'], '998555', 38_000_00, 'Beach resort · twin sharing'],
+      ['Hotel Booking', 'hotel', 0, 0, acc['401000'], acc['500000'], '996311', 0, 'Per room, per night'],
+      ['Flight Ticket', 'flight', 0, 0, acc['402000'], acc['501000'], '996425', 0, 'Economy'],
+      ['Visa Processing', 'visa', 10_000_00, 6_500_00, acc['403000'], acc['503000'], '998599', 12_000_00, 'Tourist, single entry'],
+      ['Airport Transfer', 'transport', 5_000_00, 3_200_00, acc['404000'], acc['502000'], '996412', 6_000_00, 'Sedan · up to 3 pax'],
+      ['Sightseeing Tour', 'sightseeing', 8_000_00, 5_000_00, acc['405000'], acc['504000'], '998555', 9_500_00, 'Full day · guided'],
+      ['Service Fee', 'fee', 2_500_00, 0, acc['406000'], acc['505000'], '998599', 0, null as unknown as string],
     ];
-    for (const [name, category, sale, cost, income, expense] of products) {
+    for (const [name, category, sale, cost, income, expense, hsn, mrp, variant] of products) {
       await upsertProduct(orgId, {
         name, category, salePrice: sale, costPrice: cost,
         incomeAccountId: income, expenseAccountId: expense,
         saleTaxId: tax.sale_500, purchaseTaxId: tax.purchase_1800,
+        hsnCode: hsn, mrp, variant: variant ?? null,
       });
     }
 
@@ -435,19 +501,29 @@ async function seedDemo(orgId: string) {
   }, actor);
 
   // -------------------------------------------------------------- partners
-  const customers: Array<[string, string, string, string, number]> = [
-    ['Rahul Mehta', 'b2c', 'rahul.mehta@gmail.com', '+91 98490 11223', 0],
-    ['Sneha Reddy', 'b2c', 'sneha.reddy@gmail.com', '+91 99590 44556', 0],
-    ['Infosys Travel Desk', 'b2b', 'travel@infosys-demo.in', '+91 80 4000 1111', 10_00_000_00],
-    ['Skyline Holidays (Reseller)', 'reseller', 'ops@skylineholidays.in', '+91 44 2233 4455', 5_00_000_00],
-    ['Arun Prakash', 'b2c', 'arun.p@outlook.com', '+91 97000 77889', 0],
+  /*
+   * EVERY DEMO CUSTOMER HAS A CITY AND A STATE, and that is load-bearing rather
+   * than set dressing. The state is the PLACE OF SUPPLY: against the agency's
+   * own it decides CGST+SGST versus IGST, and it is what the exported statement
+   * prints in its "Customer State" column. Seeded books whose customers had no
+   * state produced invoices with no place of supply, which looked complete and
+   * were not — and gave the export an empty column to show for the feature.
+   */
+  const customers: Array<[string, string, string, string, number, string, string]> = [
+    ['Rahul Mehta', 'b2c', 'rahul.mehta@gmail.com', '+91 98490 11223', 0, 'Hyderabad', '36'],
+    ['Sneha Reddy', 'b2c', 'sneha.reddy@gmail.com', '+91 99590 44556', 0, 'Secunderabad', '36'],
+    ['Infosys Travel Desk', 'b2b', 'travel@infosys-demo.in', '+91 80 4000 1111', 10_00_000_00, 'Bengaluru', '29'],
+    ['Skyline Holidays (Reseller)', 'reseller', 'ops@skylineholidays.in', '+91 44 2233 4455', 5_00_000_00, 'Chennai', '33'],
+    ['Arun Prakash', 'b2c', 'arun.p@outlook.com', '+91 97000 77889', 0, 'Pune', '27'],
   ];
   const cust: Record<string, string> = {};
-  for (const [name, type, email, phone, limit] of customers) {
+  for (const [name, type, email, phone, limit, city, state] of customers) {
     cust[name] = await upsertPartner(orgId, {
       name, isCustomer: true, partnerType: type, email, phone,
       creditLimit: limit, paymentTermsId: limit ? 'pt_30' : 'pt_imm',
       gstin: type === 'b2b' ? '29AAACI1681G1ZR' : null,
+      gstName: type === 'b2b' ? 'INFOSYS LIMITED' : null,
+      city, stateCode: state,
     }, actor);
   }
 
@@ -678,6 +754,118 @@ async function seedDemo(orgId: string) {
     amount: 1_50_000_00, method: 'neft', reference: 'Advance — Bali Oct block',
     isAdvance: true,
   }, actor);
+
+  // ------------------------------------------- a channel settlement cycle
+  /*
+   * WHY THE DEMO SHIPS A WORKED PAYOUT CYCLE.
+   *
+   * The settlement screen and the three-sheet export are the hardest part of
+   * this product to understand from an empty state: a cycle with no orders in
+   * it looks identical whether the feature works or the dates are wrong. One
+   * posted cycle, with its commission, its GST, its storage charge, its TCS and
+   * TDS and one returned order, makes the whole thing legible in a single
+   * screen — and it is the fixture the exported workbook is checked against.
+   *
+   * Every figure below goes through the same services the screens call, so if
+   * the arithmetic here is wrong the seed fails rather than the demo quietly
+   * showing a statement that does not balance.
+   */
+  const channel = await upsertPartner(orgId, {
+    name: 'Wanderly Marketplace',
+    isCustomer: true,
+    partnerType: 'agency',
+    email: 'seller.payouts@wanderly-demo.in',
+    gstin: '29AAFCG9846E1Z7',
+    gstName: 'WANDERLY TECHNOLOGIES PRIVATE LIMITED',
+    city: 'Bengaluru',
+    stateCode: '29',
+    paymentTermsId: 'pt_15',
+  }, actor);
+
+  /*
+   * Three sales and one cancellation, all through the channel and all inside
+   * one fortnight — which is the cycle length most channels remit on. Each
+   * carries the order reference the channel identifies it by, because that
+   * reference is the only field common to both documents when the agency's
+   * statement and the channel's are put side by side.
+   */
+  /*
+   * EACH LINE NAMES A REAL PRODUCT, and that is not tidiness.
+   *
+   * The statement's Item ID, Variant Description and three category columns are
+   * all read off the product behind the line. A free-typed line fills none of
+   * them, so a seed that typed its descriptions would leave five columns of the
+   * exported workbook empty and the feature looking broken rather than unused.
+   * The HSN and the MRP come from the product too — the line snapshots them,
+   * which is the behaviour worth demonstrating.
+   */
+  const product = async (name: string) =>
+    (await one<{ id: string; hsn_code: string | null; mrp: number; income_account_id: string | null }>(
+      'SELECT id, hsn_code, mrp, income_account_id FROM products WHERE org_id=? AND name=?',
+      orgId, name,
+    ))!;
+
+  const channelOrders: Array<[string, string, string, number, number]> = [
+    ['WDL-1917427960', 'Goa Weekend Package', 'Goa Weekend — 2 pax', 2000, 32_000_00],
+    ['WDL-1920736750', 'Bali 5D/4N Package', 'Bali 5D/4N — 2 pax', 2000, 1_50_000_00],
+    ['WDL-1921044112', 'Airport Transfer', 'Airport Transfer — Goa', 1000, 5_000_00],
+  ];
+  const channelDocs: string[] = [];
+  for (const [[orderRef, productName, label, qty, price], i]
+    of channelOrders.map((o, i) => [o, i] as const)) {
+    const p = await product(productName);
+    const docId = await createDocument({
+      orgId, docType: 'out_invoice', partnerId: channel,
+      journalId: await jrn('SAL'), docDate: d(-18 + i), paymentTermsId: 'pt_15',
+      // The channel is in Karnataka and the agency in Telangana, so this is an
+      // inter-state supply — which is exactly the case the place-of-supply
+      // field exists to decide.
+      placeOfSupply: '29',
+      orderRef, orderDate: d(-19 + i),
+      lines: [{
+        name: label, productId: p.id, hsnCode: p.hsn_code, mrp: p.mrp,
+        qtyMilli: qty, unitPrice: price,
+        accountId: p.income_account_id ?? await acc('400000'),
+        taxId: gstSale5,
+      }],
+    }, actor);
+    await postDocument(orgId, docId, actor);
+    channelDocs.push(docId);
+  }
+
+  // One of them is cancelled, so the cycle has something on its returns sheet.
+  const channelReturn = await createCreditNote(orgId, channelDocs[2], {
+    date: d(-12), bps: 10000, reason: 'Traveller cancelled — transfer not used',
+  }, actor);
+  await postDocument(orgId, channelReturn, actor);
+
+  const cycle = await createSettlement({
+    orgId,
+    partnerId: channel,
+    cycleFrom: d(-20),
+    cycleTo: d(-6),
+    // The terms a mid-sized marketplace actually settles on: six per cent of
+    // the fare, GST at 18% on its own fee, a flat shipping charge per order,
+    // and 1% TDS under 194-O.
+    commissionBps: 600,
+    chargeGstBps: 1800,
+    shippingCharge: 50_00,
+    returnCharge: 50_00,
+    tcsBps: 0,
+    tdsBps: 100,
+    previousUnsettled: 0,
+    payDate: d(-4),
+    utr: 'CMS5643191908',
+    bankAccountId: 'bnk_icici',
+    note: 'Wanderly payout cycle — statement WDL/PAY/2026/0417',
+  }, actor);
+
+  // The cycle-level charges: what the channel bills whether anything sold or
+  // not. Entered as the statement shows them, GST left to the cycle's rate.
+  for (const [code, amount] of [['storage', 2_556_00], ['ads', 1_200_00]] as const) {
+    await saveSettlementCharge(orgId, cycle, { code, amount }, actor);
+  }
+  await postSettlement(orgId, cycle, actor);
 
   // ------------------------------------------------- running the agency
   // Sized so the demo agency runs at a realistic small profit rather than a

@@ -1,10 +1,11 @@
 import 'server-only';
 import { all, one, run, scalar, tx, id, nowIso } from '../db';
-import { DOC_TYPES, type DocType, addDays } from '@/lib/accounting';
+import { DOC_TYPES, type DocType, addDays, formatDocNumber } from '@/lib/accounting';
 import { computeLine, computeWithholding } from './tax';
 import { postEntry, reverseEntry, PostingError, type Actor, type PostingLine } from './engine';
 import { receivableAccount, payableAccount, requireSetting } from './settings';
 import { audit } from './audit';
+import { searchTokens } from '@/lib/search';
 
 /**
  * Customer invoices, vendor bills and both kinds of credit note.
@@ -39,6 +40,20 @@ export interface DocLineInput {
   taxId?: string | null;
   accountId: string;
   analyticId?: string | null;
+  /**
+   * HSN or SAC — required on a GST tax invoice by Rule 46 of the CGST Rules,
+   * and snapshotted onto the line rather than read off the product at print
+   * time: a product reclassified next year must not change what this invoice
+   * said it was selling.
+   */
+  hsnCode?: string | null;
+  /**
+   * The list price the discount comes off, for the MRP column. It is
+   * PRESENTATION ONLY — the tax and the total are computed from `unitPrice`,
+   * never from this — but a statement that shows a selling price with no MRP
+   * beside it cannot be checked against the channel's own.
+   */
+  mrp?: number;
 }
 
 export interface DocInput {
@@ -57,6 +72,24 @@ export interface DocInput {
   /** Vendor bills only: the TDS section to withhold under. */
   withholdingTaxId?: string | null;
   note?: string | null;
+  /**
+   * The GST state code the supply is made to.
+   *
+   * A POSTING INPUT, not a label: compared against the agency's own state it is
+   * what makes a supply intra-state (CGST+SGST) or inter-state (IGST), and it
+   * is the one field on a tax invoice that a customer's accountant checks
+   * first. Left unset it falls back to the partner's own state — see
+   * `derivePlaceOfSupply` — and is then SNAPSHOTTED, so a customer who moves
+   * states does not retrospectively change the tax on invoices already raised.
+   */
+  placeOfSupply?: string | null;
+  /** Recorded from the Invoice Registration Portal, never generated here. */
+  irn?: string | null;
+  irnAckNo?: string | null;
+  irnAckDate?: string | null;
+  /** The customer's or channel's own order reference, and when it was placed. */
+  orderRef?: string | null;
+  orderDate?: string | null;
   lines: DocLineInput[];
 }
 
@@ -67,9 +100,17 @@ export interface DocRow {
   doc_date: string; due_date: string | null; supplier_ref: string | null;
   currency: string; rate_e6: number; state: string; payment_state: string;
   untaxed: number; tax_total: number; total: number; residual: number;
-  withheld_tax: number; entry_id: string | null; reversal_of: string | null;
+  withheld_tax: number; withholding_tax_id: string | null;
+  payment_terms_id: string | null; entry_id: string | null; reversal_of: string | null;
   reversed_by: string | null; note: string | null;
+  place_of_supply: string | null; irn: string | null;
+  irn_ack_no: string | null; irn_ack_date: string | null;
+  order_ref: string | null; order_date: string | null;
   created_by: string | null; created_at: string; posted_by: string | null; posted_at: string | null;
+  /** Joined from the partner, for the printed header and the export. */
+  partner_gstin?: string | null; partner_gst_name?: string | null;
+  partner_city?: string | null; partner_state_code?: string | null;
+  partner_address?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,13 +125,18 @@ export async function createDocument(input: DocInput, actor: Actor = {}): Promis
       `INSERT INTO documents
          (id, org_id, doc_type, partner_id, journal_id, booking_id, analytic_id,
           doc_date, due_date, payment_terms_id, supplier_ref, currency, rate_e6,
-          state, payment_state, note, created_by, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'draft','not_paid',?,?,?)`,
+          state, payment_state, withholding_tax_id, note,
+          place_of_supply, irn, irn_ack_no, irn_ack_date, order_ref, order_date,
+          created_by, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'draft','not_paid',?,?,?,?,?,?,?,?,?,?)`,
       docId, input.orgId, input.docType, input.partnerId, input.journalId,
       input.bookingId ?? null, input.analyticId ?? null, input.docDate, due,
       input.paymentTermsId ?? null, input.supplierRef ?? null,
       input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
-      input.note ?? null, actor.id ?? null, nowIso(),
+      input.withholdingTaxId ?? null, input.note ?? null,
+      await derivePlaceOfSupply(input), input.irn ?? null, input.irnAckNo ?? null,
+      input.irnAckDate ?? null, input.orderRef ?? null, input.orderDate ?? null,
+      actor.id ?? null, nowIso(),
     );
     await replaceLines(input.orgId, docId, input.lines, input.analyticId ?? null);
     await recomputeTotals(input.orgId, docId, input.withholdingTaxId ?? null);
@@ -110,17 +156,46 @@ export async function updateDocument(docId: string, input: DocInput, actor: Acto
     if (doc.state !== 'draft') throw new PostingError('A posted document cannot be edited. Reverse it or raise a credit note.');
     await run(
       `UPDATE documents SET partner_id=?, journal_id=?, booking_id=?, analytic_id=?,
-              doc_date=?, due_date=?, payment_terms_id=?, supplier_ref=?, currency=?, rate_e6=?, note=?
+              doc_date=?, due_date=?, payment_terms_id=?, supplier_ref=?, currency=?, rate_e6=?,
+              withholding_tax_id=?, note=?, place_of_supply=?, irn=?, irn_ack_no=?,
+              irn_ack_date=?, order_ref=?, order_date=?
          WHERE id=? AND org_id=?`,
       input.partnerId, input.journalId, input.bookingId ?? null, input.analyticId ?? null,
       input.docDate, input.dueDate ?? await deriveDueDate(input), input.paymentTermsId ?? null,
       input.supplierRef ?? null, input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
-      input.note ?? null, docId, input.orgId,
+      input.withholdingTaxId ?? null, input.note ?? null,
+      await derivePlaceOfSupply(input), input.irn ?? null, input.irnAckNo ?? null,
+      input.irnAckDate ?? null, input.orderRef ?? null, input.orderDate ?? null,
+      docId, input.orgId,
     );
     await replaceLines(input.orgId, docId, input.lines, input.analyticId ?? null);
-    await recomputeTotals(input.orgId, docId, input.withholdingTaxId ?? null);
+    // '' rather than null: null means "leave the withheld amount alone", and an
+    // edit that clears the TDS dropdown has to clear the deduction with it.
+    await recomputeTotals(input.orgId, docId, input.withholdingTaxId ?? '');
     await audit(input.orgId, actor, 'modified', 'document', docId, 'Draft edited');
   });
+}
+
+/**
+ * The place of supply, from the form if it was given and from the partner if
+ * it was not.
+ *
+ * WHY A FALLBACK AT ALL. The field is new, and every partner synced from the
+ * CRM or created by typing a name into an invoice has a state only if someone
+ * filled one in. Requiring it on the form would have blocked the one path that
+ * matters most — raising the first invoice against a traveller who does not
+ * exist as a master record yet — so the partner's own state is read instead,
+ * and the result is stored on the document either way. Nothing is derived at
+ * READ time: the snapshot is the point.
+ */
+async function derivePlaceOfSupply(input: DocInput): Promise<string | null> {
+  const given = (input.placeOfSupply ?? '').trim();
+  if (given) return given;
+  const p = await one<{ state_code: string | null; gstin: string | null }>(
+    'SELECT state_code, gstin FROM partners WHERE id = ? AND org_id = ?',
+    input.partnerId, input.orgId,
+  );
+  return p?.state_code ?? (p?.gstin ? p.gstin.slice(0, 2) : null);
 }
 
 async function deriveDueDate(input: DocInput): Promise<string> {
@@ -133,21 +208,80 @@ async function deriveDueDate(input: DocInput): Promise<string> {
 }
 
 async function replaceLines(orgId: string, docId: string, lines: DocLineInput[], docAnalytic: string | null) {
+  // The split table hangs off the lines, so it goes first: deleting the lines
+  // cascades it away anyway, but the order makes that independent of the
+  // cascade being configured, which is the sort of thing a schema edit breaks
+  // silently.
+  await run('DELETE FROM document_line_taxes WHERE document_id = ?', docId);
   await run('DELETE FROM document_lines WHERE document_id = ?', docId);
   // Sequential, not Promise.all: these inserts share the posting transaction's
   // one connection, and `seq` must land in the order the accountant typed.
   for (const [i, l] of lines.entries()) {
     const amounts = await computeLine(orgId, l);
+    const lineId = l.id ?? id('dl');
     await run(
       `INSERT INTO document_lines
          (id, org_id, document_id, seq, product_id, name, qty_milli, unit_price,
-          discount_bps, tax_id, account_id, analytic_id, subtotal, tax_amount, total)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      l.id ?? id('dl'), orgId, docId, i, l.productId ?? null, l.name,
+          discount_bps, tax_id, account_id, analytic_id, subtotal, tax_amount, total,
+          hsn_code, mrp)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      lineId, orgId, docId, i, l.productId ?? null, l.name,
       l.qtyMilli, l.unitPrice, l.discountBps ?? 0, l.taxId ?? null, l.accountId,
       l.analyticId ?? docAnalytic, amounts.subtotal, amounts.taxAmount, amounts.total,
+      (l.hsnCode ?? '').trim() || null, l.mrp ?? 0,
     );
+
+    /*
+     * KEEP THE SPLIT, DO NOT RECOMPUTE IT LATER.
+     *
+     * `computeLine` already worked out what each tax component comes to in
+     * order to decide what to post; this writes it down. Deriving it again at
+     * report time would read TODAY's tax rows, so a GST rate changed in
+     * October would silently restate every invoice raised in September — and
+     * the restated figures would not match the returns already filed.
+     *
+     * `tax_group` is denormalised for the same reason: a column headed CGST on
+     * a statement has to stay CGST even after that tax row is retired.
+     */
+    for (const split of amounts.splits) {
+      await run(
+        `INSERT INTO document_line_taxes
+           (id, org_id, document_id, line_id, tax_id, tax_name, tax_group, rate_bps,
+            base, amount, account_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        id('dlt'), orgId, docId, lineId, split.taxId, split.name,
+        normaliseTaxGroup(split.name, split.group), split.rateBps,
+        split.base, split.amount, split.accountId,
+      );
+    }
   }
+}
+
+/**
+ * Which statement column a tax component belongs in.
+ *
+ * The `taxes` table's own `tax_group` is modelled for POSTING: a CGST+SGST pair
+ * is one parent of group `cgst_sgst` with two children that are both plain
+ * `gst`, because what the ledger needs to know is "this is GST and here is its
+ * account". A statement needs the opposite — which of CGST, SGST, IGST or cess
+ * this particular component IS — and the children only differ by name.
+ *
+ * So the name decides, and the group is the fallback. Matching on the name is
+ * uncomfortable and it is still the right answer: the seed names them "CGST
+ * 9%" and "SGST 9%" precisely because that is what the invoice prints, and a
+ * second column duplicating the distinction would be one more thing to get out
+ * of step with the one the reader can see.
+ */
+function normaliseTaxGroup(name: string, group: string | null | undefined): string {
+  const n = name.toUpperCase();
+  if (n.includes('CESS')) return 'cess';
+  if (n.includes('IGST')) return 'igst';
+  if (n.includes('CGST')) return 'cgst';
+  if (n.includes('SGST') || n.includes('UTGST')) return 'sgst';
+  if (group === 'igst') return 'igst';
+  if (group === 'cess') return 'cess';
+  if (group === 'tcs' || group === 'tds') return group;
+  return group ?? 'other';
 }
 
 /**
@@ -235,6 +369,11 @@ export async function postDocument(orgId: string, docId: string, actor: Actor = 
           accountId: split.accountId,
           label: split.name,
           partnerId: doc.partner_id,
+          // Tagged to the trip like every other line of this entry, so a
+          // booking-filtered ledger still balances. No analytic tag, though:
+          // GST is collected for the government, and putting it through the
+          // analytic account would inflate the trip's margin.
+          bookingId: doc.booking_id,
           taxId: split.taxId,
           taxBase: split.base,
         };
@@ -261,11 +400,21 @@ export async function postDocument(orgId: string, docId: string, actor: Actor = 
     // --- TDS withheld on a vendor bill -------------------------------------
     // The agency owes this to the government rather than to the supplier, so it
     // splits off the payable rather than reducing the expense.
+    //
+    // Tagged with `taxId`/`taxBase` exactly like a GST split. Without the tag
+    // the line is invisible to the tax report — the money sat correctly in TDS
+    // Payable, but nothing told the agency what to deposit by the 7th, and a
+    // 26Q return had to be assembled by reading the ledger by hand. The base is
+    // the UNTAXED value, which is what `computeWithholding` deducted on: the
+    // government does not withhold tax on its own GST.
     if (doc.withheld_tax > 0 && !isSale) {
       postings.push({
         accountId: await requireSetting(orgId, 'account.tds_payable'),
         partnerId: doc.partner_id,
+        bookingId: doc.booking_id,
         label: 'TDS withheld',
+        taxId: doc.withholding_tax_id,
+        taxBase: doc.untaxed,
         ...(flip ? { debit: doc.withheld_tax } : { credit: doc.withheld_tax }),
       });
     }
@@ -301,16 +450,25 @@ async function takeDocumentNumber(orgId: string, doc: DocRow): Promise<string> {
   const prefix = doc.doc_type === 'out_invoice' ? 'INV'
     : doc.doc_type === 'out_refund' ? 'CN'
       : doc.doc_type === 'in_invoice' ? 'BILL' : 'DN';
-  const existing = await one<{ next_no: number }>(
-    'SELECT next_no FROM sequences WHERE org_id = ? AND code = ? FOR UPDATE', orgId, seqCode,
+  /*
+   * The PREFIX AND PADDING COME OFF THE ROW, not off the constant above.
+   *
+   * The constant is only the seed for a series that does not exist yet. Once
+   * the row is there, Settings → Numbering owns it — an agency migrating in at
+   * INV-04417, or filing under "TRZ/25-26/", changes it there and the next
+   * document issued honours it. Reading the constant here instead is what made
+   * that screen decorative.
+   */
+  const existing = await one<{ prefix: string; padding: number; next_no: number }>(
+    'SELECT prefix, padding, next_no FROM sequences WHERE org_id = ? AND code = ? FOR UPDATE', orgId, seqCode,
   );
   if (!existing) {
     await run('INSERT INTO sequences (org_id, code, prefix, padding, next_no) VALUES (?,?,?,?,?)',
       orgId, seqCode, prefix, 4, 2);
-    return `${prefix}-0001`;
+    return formatDocNumber(prefix, 4, 1);
   }
   await run('UPDATE sequences SET next_no = next_no + 1 WHERE org_id = ? AND code = ?', orgId, seqCode);
-  return `${prefix}-${String(existing.next_no).padStart(4, '0')}`;
+  return formatDocNumber(existing.prefix, existing.padding, existing.next_no);
 }
 
 /**
@@ -325,6 +483,42 @@ export async function reverseDocument(orgId: string, docId: string, date: string
     const doc = await getDocument(orgId, docId);
     if (!doc) throw new PostingError('Unknown document.');
     if (doc.state !== 'posted') throw new PostingError('Only a posted document can be reversed.');
+
+    /*
+     * NOT WHILE MONEY IS STILL POINTING AT IT.
+     *
+     * A reversal mirrors the document's own entry and nothing else — the
+     * payments that settled it are separate entries this never touches. So
+     * reversing a SETTLED document used to leave the control account holding
+     * the payment's debit with no credit against it: a bill paid in full and
+     * then reversed put Accounts Payable into a debit balance, while the
+     * allocation row went on tying a live payment to a cancelled document, and
+     * the supplier statement and the ageing report stopped agreeing with the
+     * ledger.
+     *
+     * The settlement has to be undone first, deliberately, because only the
+     * person doing it knows which it was: money that is coming back (reverse
+     * the payment) or money that stays with the partner (unallocate it and
+     * leave it on account). A document that has been paid and is genuinely
+     * wrong is a credit note, not a reversal.
+     */
+    const settled = await all<{ number: string | null; amount: number }>(
+      `SELECT COALESCE(p.number, c.number) AS number, a.amount
+         FROM payment_allocations a
+         LEFT JOIN payments p ON p.id = a.payment_id
+         LEFT JOIN documents c ON c.id = a.credit_doc_id
+        WHERE a.document_id = ? ORDER BY a.id`, docId,
+    );
+    if (settled.length) {
+      const total = settled.reduce((t, x) => t + x.amount, 0);
+      const names = settled.map((x) => x.number ?? '?').join(', ');
+      throw new PostingError(
+        `${(total / 100).toFixed(2)} is still allocated to this document from ${names}. ` +
+        'Unallocate it first — or reverse the payment if the money is coming back — ' +
+        'then reverse this document. To cancel a document that has genuinely been paid, raise a credit note instead.',
+      );
+    }
+
     if (doc.entry_id) await reverseEntry(orgId, doc.entry_id, date, actor, reason);
     await run(`UPDATE documents SET state='cancelled', payment_state='reversed' WHERE id=? AND org_id=?`, docId, orgId);
     await audit(orgId, actor, 'reversed', 'document', docId, reason ?? 'Reversed');
@@ -353,7 +547,8 @@ export async function createCreditNote(
     const lines = await all<{
       name: string; account_id: string; analytic_id: string | null;
       subtotal: number; tax_id: string | null; product_id: string | null;
-    }>(`SELECT name, account_id, analytic_id, subtotal, tax_id, product_id
+      hsn_code: string | null; mrp: number;
+    }>(`SELECT name, account_id, analytic_id, subtotal, tax_id, product_id, hsn_code, mrp
           FROM document_lines WHERE document_id = ? ORDER BY seq`, sourceDocId);
 
     const creditType: DocType = doc.doc_type === 'out_invoice' ? 'out_refund' : 'in_refund';
@@ -368,6 +563,20 @@ export async function createCreditNote(
       dueDate: opts.date,
       currency: doc.currency,
       rateE6: doc.rate_e6,
+      /*
+       * THE CREDIT NOTE INHERITS THE INVOICE'S STATUTORY DETAIL.
+       *
+       * A credit note is a tax document in its own right and has to carry the
+       * same place of supply and the same HSN per line as the invoice it
+       * reverses — the place of supply because it decides the tax being
+       * reversed, which must be the tax that was charged, and the HSN because
+       * the return nets the two against each other line for line. Taking them
+       * from the partner's record instead would silently get both wrong for
+       * any customer whose details have changed since.
+       */
+      placeOfSupply: doc.place_of_supply,
+      orderRef: doc.order_ref,
+      orderDate: doc.order_date,
       note: `${opts.reason ?? 'Credit note'} — against ${doc.number}`,
       lines: lines.map((l) => ({
         name: l.name,
@@ -377,6 +586,8 @@ export async function createCreditNote(
         taxId: l.tax_id,
         accountId: l.account_id,
         analyticId: l.analytic_id,
+        hsnCode: l.hsn_code,
+        mrp: Math.round((l.mrp * bps) / 10000),
       })),
     }, actor);
 
@@ -425,7 +636,10 @@ export async function refreshResidual(orgId: string, docId: string) {
 
 export async function getDocument(orgId: string, docId: string): Promise<DocRow | null> {
   return await one<DocRow>(
-    `SELECT d.*, p.name AS partner_name, b.ref AS booking_ref
+    `SELECT d.*, p.name AS partner_name, b.ref AS booking_ref,
+            p.gstin AS partner_gstin, p.gst_name AS partner_gst_name,
+            p.city AS partner_city, p.state_code AS partner_state_code,
+            p.address AS partner_address
        FROM documents d
        LEFT JOIN partners p ON p.id = d.partner_id
        LEFT JOIN bookings b ON b.id = d.booking_id
@@ -433,22 +647,81 @@ export async function getDocument(orgId: string, docId: string): Promise<DocRow 
   );
 }
 
-export async function documentLines(docId: string) {
-  return await all<{
-    id: string; seq: number; name: string; product_id: string | null;
-    qty_milli: number; unit_price: number; discount_bps: number;
-    tax_id: string | null; tax_name: string | null; account_id: string;
-    account_code: string; account_name: string; analytic_id: string | null;
-    analytic_name: string | null; subtotal: number; tax_amount: number; total: number;
-  }>(
+export interface DocLineRow {
+  id: string; seq: number; name: string; product_id: string | null;
+  qty_milli: number; unit_price: number; discount_bps: number;
+  tax_id: string | null; tax_name: string | null; account_id: string;
+  account_code: string; account_name: string; analytic_id: string | null;
+  analytic_name: string | null; subtotal: number; tax_amount: number; total: number;
+  hsn_code: string | null; mrp: number;
+  /** The product's variant description, for the line as it prints. */
+  variant: string | null;
+  product_category: string | null;
+}
+
+export async function documentLines(docId: string): Promise<DocLineRow[]> {
+  return await all<DocLineRow>(
     `SELECT dl.*, t.name AS tax_name, a.code AS account_code, a.name AS account_name,
-            an.name AS analytic_name
+            an.name AS analytic_name, pr.variant, pr.category AS product_category
        FROM document_lines dl
        LEFT JOIN taxes t ON t.id = dl.tax_id
        LEFT JOIN accounts a ON a.id = dl.account_id
        LEFT JOIN analytic_accounts an ON an.id = dl.analytic_id
+       LEFT JOIN products pr ON pr.id = dl.product_id
       WHERE dl.document_id = ? ORDER BY dl.seq`, docId,
   );
+}
+
+export interface LineTaxRow {
+  id: string; line_id: string; tax_id: string | null; tax_name: string;
+  tax_group: string; rate_bps: number; base: number; amount: number;
+}
+
+/**
+ * The stored per-component tax split for a document, keyed by line.
+ *
+ * A Map rather than a flat list because every caller wants it that way — the
+ * printed invoice, the GST column of a settlement statement and the tax report
+ * all walk the lines and ask "what tax did THIS one carry".
+ */
+export async function documentLineTaxes(docId: string): Promise<Map<string, LineTaxRow[]>> {
+  const rows = await all<LineTaxRow>(
+    `SELECT id, line_id, tax_id, tax_name, tax_group, rate_bps, base, amount
+       FROM document_line_taxes WHERE document_id = ? ORDER BY line_id, tax_group`, docId,
+  );
+  const byLine = new Map<string, LineTaxRow[]>();
+  for (const r of rows) {
+    const list = byLine.get(r.line_id);
+    if (list) list.push(r);
+    else byLine.set(r.line_id, [r]);
+  }
+  return byLine;
+}
+
+/**
+ * Sum one line's tax by component group — the IGST / CGST / SGST / CESS columns
+ * a statement and a GSTR-1 both want, with the rate that produced each.
+ *
+ * A group can legitimately appear twice on one line (two cess components, say),
+ * so the amounts add and the rate is the sum of the rates: 2.5% CGST twice is
+ * 5% of CGST, which is what the column has to read for the value beside it to
+ * make sense.
+ */
+export function taxByGroup(taxes: LineTaxRow[] | undefined) {
+  const out = {
+    igst: 0, cgst: 0, sgst: 0, cess: 0, other: 0,
+    igstBps: 0, cgstBps: 0, sgstBps: 0, cessBps: 0,
+  };
+  for (const t of taxes ?? []) {
+    switch (t.tax_group) {
+      case 'igst': out.igst += t.amount; out.igstBps += t.rate_bps; break;
+      case 'cgst': out.cgst += t.amount; out.cgstBps += t.rate_bps; break;
+      case 'sgst': out.sgst += t.amount; out.sgstBps += t.rate_bps; break;
+      case 'cess': out.cess += t.amount; out.cessBps += t.rate_bps; break;
+      default: out.other += t.amount;
+    }
+  }
+  return out;
 }
 
 export interface DocFilter {
@@ -484,14 +757,22 @@ export async function listDocuments(orgId: string, f: DocFilter = {}): Promise<D
     params.push(f.overdueOn);
   }
   if (f.search) {
-    clauses.push('(d.number LIKE ? OR p.name LIKE ? OR d.supplier_ref LIKE ?)');
-    const like = `%${f.search}%`;
-    params.push(like, like, like);
+    // The ORDER REFERENCE is searchable too, and it is the field people
+    // actually have in hand: a traveller or a channel quotes the order number
+    // they placed, not the invoice number this system assigned afterwards.
+    for (const token of searchTokens(f.search)) {
+      clauses.push('(d.number ILIKE ? OR p.name ILIKE ? OR d.supplier_ref ILIKE ? OR d.order_ref ILIKE ? OR d.irn ILIKE ?)');
+      const like = `%${token}%`;
+      params.push(like, like, like, like, like);
+    }
   }
 
   const limit = f.limit ?? 200;
   return await all<DocRow>(
-    `SELECT d.*, p.name AS partner_name, b.ref AS booking_ref
+    `SELECT d.*, p.name AS partner_name, b.ref AS booking_ref,
+            p.gstin AS partner_gstin, p.gst_name AS partner_gst_name,
+            p.city AS partner_city, p.state_code AS partner_state_code,
+            p.address AS partner_address
        FROM documents d
        LEFT JOIN partners p ON p.id = d.partner_id
        LEFT JOIN bookings b ON b.id = d.booking_id

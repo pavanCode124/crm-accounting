@@ -151,11 +151,12 @@ export function Th({ children, align = 'left', width, colSpan }: {
   );
 }
 
-export function Td({ children, align = 'left', className = '', colSpan }: {
-  children?: ReactNode; align?: 'left' | 'right' | 'center'; className?: string; colSpan?: number;
+export function Td({ children, align = 'left', className = '', colSpan, rowSpan }: {
+  children?: ReactNode; align?: 'left' | 'right' | 'center'; className?: string;
+  colSpan?: number; rowSpan?: number;
 }) {
   return (
-    <td colSpan={colSpan}
+    <td colSpan={colSpan} rowSpan={rowSpan}
       className={`border-b border-line px-4 py-2.5 align-top ${ALIGN[align]} ${className}`}>
       {children}
     </td>

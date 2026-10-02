@@ -90,6 +90,18 @@ export function bpsToPct(bps: number): string {
 }
 
 /**
+ * A rate on a summary panel, where nil means "this was not charged".
+ *
+ * "0%" and "—" say different things about a commission: the first is a rate
+ * that was agreed and came to nothing, the second is a charge that does not
+ * apply to this channel at all. On a panel of six rates, five of them usually
+ * nil, the dash is what lets the reader find the one that matters.
+ */
+export function bpsOrDash(bps: number): string {
+  return bps ? bpsToPct(bps) : '—';
+}
+
+/**
  * Margin as a percentage of revenue, to one decimal.
  * Revenue of zero is 0% and not NaN — a trip that sold nothing has no margin,
  * and "NaN%" on a dashboard destroys trust in every other number beside it.

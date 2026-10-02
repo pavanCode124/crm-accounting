@@ -4,6 +4,7 @@ import { one, type SearchParams } from '@/lib/range';
 import { listDocuments } from '@/server/accounting/documents';
 import { listPartners } from '@/server/accounting/masters';
 import { listBookings } from '@/server/accounting/analytics';
+import { searchNav } from '@/lib/nav';
 import { fmtDate } from '@/lib/accounting';
 import { PageHeader, Card, Table, Th, Td, Money, Chip, EmptyState, RefLink } from '@/components/ui';
 
@@ -12,10 +13,17 @@ export const dynamic = 'force-dynamic';
 /**
  * Search.
  *
- * Deliberately narrow: documents, partners and bookings, which is what the
- * search bar is actually used for — "where is INV-0004", "what does Rahul
- * owe", "open BK-1025". A full-text index over journal narrations would be
- * more impressive and would answer none of those faster.
+ * Deliberately narrow: screens, documents, partners and bookings, which is
+ * what the search bar is actually used for — "where is INV-0004", "what does
+ * Rahul owe", "open BK-1025", "take me to trip profitability". A full-text
+ * index over journal narrations would be more impressive and would answer none
+ * of those faster.
+ *
+ * SCREENS COME FIRST because a query that names one is unambiguous: nobody
+ * types "trip profitability" hoping for an invoice. They are also the only
+ * result that costs nothing to produce — the menu registry is already in
+ * memory — so the bar stops returning "nothing matched" for the easiest
+ * question it gets.
  */
 export default async function SearchPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
   const s = await ctx();
@@ -30,18 +38,37 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
     );
   }
 
+  const screens = searchNav(q, s.role);
   const documents = await listDocuments(s.orgId, { search: q, limit: 30 });
   const partners = await listPartners(s.orgId, { search: q, limit: 20 });
   const bookings = await listBookings(s.orgId, { search: q, limit: 20 });
-  const nothing = !documents.length && !partners.length && !bookings.length;
+  const nothing = !screens.length && !documents.length && !partners.length && !bookings.length;
 
   return (
     <>
       <PageHeader title={`Search — ${q}`}
-        subtitle={`${documents.length + partners.length + bookings.length} result(s)`} />
+        subtitle={`${screens.length + documents.length + partners.length + bookings.length} result(s)`} />
 
       {nothing && (
-        <Card><EmptyState title="Nothing matched." hint="Try a document number, a name, or a booking reference." /></Card>
+        <Card><EmptyState title="Nothing matched." hint="Try a document number, a name, a booking reference, or the name of a screen." /></Card>
+      )}
+
+      {screens.length > 0 && (
+        <Card title="Screens" padded={false} className="mb-5">
+          <Table>
+            <thead><tr><Th>Screen</Th><Th>Section</Th></tr></thead>
+            <tbody>
+              {screens.map((n) => (
+                <tr key={n.href} className="hover:bg-canvas">
+                  <Td>
+                    <Link href={n.href} className="font-bold text-brand hover:underline">{n.label}</Link>
+                  </Td>
+                  <Td><span className="text-ink-muted">{n.section}</span></Td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+        </Card>
       )}
 
       {documents.length > 0 && (

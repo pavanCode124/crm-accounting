@@ -280,3 +280,25 @@ export function ageingBucket(overdueDays: number): string {
   for (const b of AGEING_BUCKETS) if (overdueDays >= b.from && overdueDays <= b.to) return b.key;
   return 'b4';
 }
+
+/**
+ * Render a document number from its series.
+ *
+ * ONE RULE, IN ONE PLACE, because four routines used to each hardcode their
+ * own — `INV-0001`, `RCPT-0001`, `EXP-0001` — reading neither the prefix nor
+ * the padding stored on the sequence. That made the numbering configuration a
+ * screen whose values changed nothing for three of the four series, which is a
+ * worse failure than having no screen: the agency believes it has renumbered.
+ *
+ * THE SEPARATOR IS DERIVED, not stored. A prefix ending in a letter or digit
+ * gets a hyphen, so "INV" stays "INV-0001" and nothing already issued changes
+ * shape. A prefix ending in punctuation already carries its own separator, so
+ * "TRZ/25-26/" becomes "TRZ/25-26/0001" rather than the "/-0001" a fixed
+ * hyphen would produce — and that group-format case is the main reason an
+ * agency edits a prefix at all.
+ */
+export function formatDocNumber(prefix: string, padding: number, n: number): string {
+  const body = String(n).padStart(Math.max(1, padding), '0');
+  const sep = /[A-Za-z0-9]$/.test(prefix) ? '-' : '';
+  return `${prefix}${sep}${body}`;
+}

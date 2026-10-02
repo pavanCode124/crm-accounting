@@ -47,6 +47,11 @@ that was meant to reach Supabase and lost its variable shows demo books instead
 of an error page. The amber strip is the only thing distinguishing the two;
 that is what it is for.
 
+> **Deploying?** An in-memory database on a serverless host re-seeds on every
+> cold start, so nothing you enter survives. See *Deploying it* below — the
+> amber strip on a deployed site always means the environment variables did not
+> take.
+
 | Command | What it does |
 |---|---|
 | `npm run dev` | Dev server on port 3100 |
@@ -185,6 +190,116 @@ discovers them by surprise:
   Trial Balance and Balance Sheet are the assertions.
 - **The CRM session.** `src/server/auth.ts` is the seam, and it currently
   resolves the seeded organisation rather than a Supabase session.
+
+---
+
+## Deploying it
+
+Any Node host works. The notes below are for **Vercel**, because that is where
+this app is deployed and because its serverless model has one failure mode worth
+spelling out.
+
+### The amber strip on a deployment means a missing variable
+
+Demo mode is the **absence** of `TRIPZO_DATABASE_URL`, not a flag. A deployment
+with that variable unset does not error — it runs on the embedded in-memory
+Postgres and seeds sample books. On a laptop that is the point. On a serverless
+host it is useless: every instance has its own memory and is recycled
+constantly, so each cold start re-seeds from scratch and anything entered is
+gone. The strip says *"changes are lost on restart"*, and on serverless the
+restarts are continuous.
+
+So: **amber strip on a deployed site = the environment variables did not take.**
+Nothing else causes it.
+
+### Environment variables
+
+Set these in *Project → Settings → Environment Variables*, for **Production**
+(and Preview, if previews should reach a database):
+
+| Variable | Value |
+|---|---|
+| `TRIPZO_DATABASE_URL` | the Supabase Postgres string — see below |
+| `TRIPZO_SEED_DEMO` | `0` |
+| `TRIPZO_SUPABASE_URL` | `https://supa.tripzocrm.cloud` |
+| `TRIPZO_SUPABASE_ANON_KEY` | from `tripzo-crm-mobile/.env` |
+| `TRIPZO_BACKEND_URL` | `https://api.tripzocrm.cloud` |
+
+Then **redeploy**. Variables are read at build time and bundled into the
+deployment, so saving them in the dashboard changes nothing until a new
+deployment is made.
+
+`TRIPZO_SEED_DEMO=0` is not optional on a real deployment. Without it the first
+request against the agency's own database seeds a season of invented trading
+alongside the chart of accounts, and separating the two afterwards is tedious.
+With it you get the configuration — chart of accounts, journals, GST and TDS,
+analytic plans — and an empty ledger.
+
+A blank field in the dashboard sets an empty string, not an unset variable.
+`connectionString()` trims and checks for emptiness precisely because of this:
+an empty connection string does not fail, it makes libpq quietly default to a
+Postgres on localhost, which reads as "demo mode is broken" when demo mode was
+simply never entered.
+
+### Use the session pooler, port 5432
+
+```
+postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
+```
+
+Two things in `src/server/db.ts` decide this, and both break on the
+**transaction** pooler at port 6543:
+
+- The schema bootstrap takes `pg_advisory_lock` in one statement and releases it
+  in another. Transaction pooling can route those to different backends, so the
+  lock protects nothing and the unlock errors.
+- The pool sets `options: -c search_path=accounting`, a startup parameter that
+  transaction pooling does not carry reliably. Without it every query fails with
+  *relation does not exist*.
+
+The direct address (`db.<ref>.supabase.co:5432`) satisfies both too, but is
+IPv6-only on newer Supabase projects and a Vercel function cannot reach it.
+Session pooling gives the same semantics over IPv4.
+
+`TRIPZO_DB_POOL_MAX` defaults to 5 and rarely needs changing. It is per
+instance, not per deployment: raise it and a busy afternoon is how a Postgres
+runs out of backends while every individual function looks idle.
+
+### What `vercel.json` sets, and why
+
+- **`regions: ["icn1"]`** — Seoul, matching the Supabase project's own region
+  (`ap-northeast-2`). This app is chatty with Postgres: one posting is a
+  multi-statement transaction and one page is several queries, and every one of
+  them pays the round trip. The function belongs in the same region as the
+  database rather than wherever the default put it. **Change this if the
+  database moves** — the two must agree, and a mismatch costs a few hundred
+  milliseconds on every query rather than failing visibly.
+- **`framework: "nextjs"`** — stated rather than detected, so a deployment from
+  an unusual working tree cannot guess wrong.
+
+Two things deliberately **not** in `vercel.json`:
+
+- `maxDuration` lives on the route instead, as `export const maxDuration = 60`
+  in `src/app/settings/crm-sync/page.tsx`. A sync is several round trips to the
+  CRM plus a few hundred draft documents and will exceed the default ten
+  seconds. No other route needs the headroom, and a blanket ceiling would hide a
+  slow page rather than surface it.
+- `outputFileTracingIncludes` lives in `next.config.ts`, because it is a Next
+  concern rather than a host one. `src/server/schema.sql` is read with
+  `readFileSync` at runtime and Next traces `import`s, not file paths — without
+  that entry the file is left out of the bundle and the first request fails with
+  ENOENT instead of creating the tables.
+
+### Checking that a deployment is real
+
+1. The amber strip is **gone**.
+2. `/accounting/chart-of-accounts` lists the chart, and with
+   `TRIPZO_SEED_DEMO=0` every balance is nil.
+3. Raise an invoice, post it from **Review & Post**, then hard-reload. It is
+   still there — which is the whole difference from demo mode.
+4. `/reports/trial-balance?range=all` says debits equal credits.
+
+---
 
 ## Connecting it to TripzoCRM
 

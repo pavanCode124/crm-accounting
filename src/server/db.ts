@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { Pool, types as pgTypes, type PoolClient } from 'pg';
+import { formatDocNumber } from '@/lib/accounting';
 
 /**
  * The database handle, and the only place that opens it.
@@ -418,8 +419,8 @@ export async function nextNumber(orgId: string, code: string, fallbackPrefix = '
   if (!seq) {
     await run('INSERT INTO sequences (org_id, code, prefix, padding, next_no) VALUES (?,?,?,?,?)',
       orgId, code, fallbackPrefix, 5, 2);
-    return `${fallbackPrefix}-${String(1).padStart(5, '0')}`;
+    return formatDocNumber(fallbackPrefix, 5, 1);
   }
   await run('UPDATE sequences SET next_no = next_no + 1 WHERE org_id = ? AND code = ?', orgId, code);
-  return `${seq.prefix}-${String(seq.next_no).padStart(seq.padding, '0')}`;
+  return formatDocNumber(seq.prefix, seq.padding, seq.next_no);
 }

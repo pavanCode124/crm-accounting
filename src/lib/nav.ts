@@ -1,4 +1,5 @@
-import type { FinanceCap } from './accounting';
+import { can, type FinanceCap } from './accounting';
+import { searchTokens } from './search';
 
 /**
  * THE ONE MENU REGISTRY.
@@ -19,6 +20,14 @@ export interface NavItem {
   cap?: FinanceCap;
   /** Matched as a prefix so a detail page keeps its parent highlighted. */
   match?: string;
+  /**
+   * Extra words the search bar should find this screen by.
+   *
+   * The label is what the menu calls a screen; these are what a person calls
+   * it out loud. An accountant asks for "P&L" and a manager asks for "margin
+   * by trip", and neither phrase appears in the menu text.
+   */
+  keywords?: string[];
 }
 
 /**
@@ -42,36 +51,47 @@ export const NAV: NavSection[] = [
     key: 'overview',
     label: 'Overview',
     items: [
-      { label: 'Finance Overview', href: '/' },
-      { label: 'Bookings', href: '/bookings', match: '/bookings' },
+      { label: 'Finance Overview', href: '/', keywords: ['dashboard', 'home', 'kpi'] },
+      { label: 'Bookings', href: '/bookings', match: '/bookings', keywords: ['trips', 'tours', 'reservations'] },
     ],
   },
   {
     key: 'sales',
     label: 'Sales',
     items: [
-      { label: 'Invoices', href: '/sales/invoices', match: '/sales/invoices', cap: 'finance.view' },
-      { label: 'Payments Received', href: '/sales/payments', match: '/sales/payments' },
-      { label: 'Credit Notes', href: '/sales/credit-notes', match: '/sales/credit-notes' },
-      { label: 'Customers', href: '/sales/customers', match: '/sales/customers' },
+      { label: 'Invoices', href: '/sales/invoices', match: '/sales/invoices', cap: 'finance.view', keywords: ['sales', 'billing', 'receivable', 'tax invoice'] },
+      { label: 'Payments Received', href: '/sales/payments', match: '/sales/payments', keywords: ['receipts', 'collections', 'customer payments'] },
+      /*
+       * UNDER SALES, not under Banking, and that placement is an argument.
+       *
+       * A channel settlement arrives as one bank credit, which makes it look
+       * like a banking screen. It is not: what it settles is a month of
+       * INVOICES, and the question it answers is "did the channel pay us what
+       * it owed for what we sold" — a receivables question. Filed under Banking
+       * it would be found by whoever reconciles the statement and missed by
+       * whoever chases the money.
+       */
+      { label: 'Channel Settlements', href: '/settlements', match: '/settlements', cap: 'payment.create', keywords: ['ota', 'payout', 'remittance', 'marketplace'] },
+      { label: 'Credit Notes', href: '/sales/credit-notes', match: '/sales/credit-notes', keywords: ['refund', 'cancellation', 'sales return'] },
+      { label: 'Customers', href: '/sales/customers', match: '/sales/customers', keywords: ['clients', 'travellers', 'debtors', 'partners'] },
     ],
   },
   {
     key: 'purchases',
     label: 'Purchases',
     items: [
-      { label: 'Vendor Bills', href: '/purchases/bills', match: '/purchases/bills' },
-      { label: 'Payments Made', href: '/purchases/payments', match: '/purchases/payments' },
-      { label: 'Debit Notes', href: '/purchases/debit-notes', match: '/purchases/debit-notes' },
-      { label: 'Suppliers', href: '/purchases/suppliers', match: '/purchases/suppliers' },
+      { label: 'Vendor Bills', href: '/purchases/bills', match: '/purchases/bills', keywords: ['purchase invoices', 'supplier bills', 'payable'] },
+      { label: 'Payments Made', href: '/purchases/payments', match: '/purchases/payments', keywords: ['supplier payments', 'outgoing', 'disbursements'] },
+      { label: 'Debit Notes', href: '/purchases/debit-notes', match: '/purchases/debit-notes', keywords: ['purchase return', 'vendor credit'] },
+      { label: 'Suppliers', href: '/purchases/suppliers', match: '/purchases/suppliers', keywords: ['vendors', 'hotels', 'creditors', 'partners'] },
     ],
   },
   {
     key: 'banking',
     label: 'Banking',
     items: [
-      { label: 'Bank Accounts', href: '/banking', match: '/banking' },
-      { label: 'Reconciliation', href: '/banking/reconcile', match: '/banking/reconcile', cap: 'bank.reconcile' },
+      { label: 'Bank Accounts', href: '/banking', match: '/banking', keywords: ['cash', 'statements', 'balances'] },
+      { label: 'Reconciliation', href: '/banking/reconcile', match: '/banking/reconcile', cap: 'bank.reconcile', keywords: ['reconcile', 'match statement', 'brs'] },
     ],
   },
   {
@@ -85,13 +105,13 @@ export const NAV: NavSection[] = [
        * anything enters the ledger. Sorting it under J for Journal, between
        * two configuration screens, buried the daily job under the annual one.
        */
-      { label: 'Review & Post', href: '/accounting/review', match: '/accounting/review' },
-      { label: 'Chart of Accounts', href: '/accounting/chart-of-accounts', match: '/accounting/chart-of-accounts' },
-      { label: 'Journal Entries', href: '/accounting/entries', match: '/accounting/entries' },
+      { label: 'Review & Post', href: '/accounting/review', match: '/accounting/review', keywords: ['approve', 'drafts', 'posting'] },
+      { label: 'Chart of Accounts', href: '/accounting/chart-of-accounts', match: '/accounting/chart-of-accounts', keywords: ['coa', 'ledgers', 'account codes'] },
+      { label: 'Journal Entries', href: '/accounting/entries', match: '/accounting/entries', keywords: ['vouchers', 'manual entry', 'double entry'] },
       { label: 'Journals', href: '/accounting/journals', match: '/accounting/journals' },
-      { label: 'Accounting Periods', href: '/accounting/periods', match: '/accounting/periods' },
-      { label: 'Opening Balances', href: '/accounting/opening-balances', cap: 'coa.configure' },
-      { label: 'Audit Trail', href: '/accounting/audit', match: '/accounting/audit' },
+      { label: 'Accounting Periods', href: '/accounting/periods', match: '/accounting/periods', keywords: ['year end', 'close books', 'lock period'] },
+      { label: 'Opening Balances', href: '/accounting/opening-balances', cap: 'coa.configure', keywords: ['migration', 'carry forward'] },
+      { label: 'Audit Trail', href: '/accounting/audit', match: '/accounting/audit', keywords: ['history', 'who changed', 'log'] },
     ],
   },
   {
@@ -108,53 +128,53 @@ export const NAV: NavSection[] = [
     key: 'books',
     label: 'Books',
     items: [
-      { label: 'Day Book', href: '/reports/day-book', match: '/reports/day-book', cap: 'reports.view' },
-      { label: 'Ledger Account', href: '/reports/ledger-account', match: '/reports/ledger-account', cap: 'reports.view' },
-      { label: 'General Ledger', href: '/reports/general-ledger', match: '/reports/general-ledger', cap: 'reports.view' },
+      { label: 'Day Book', href: '/reports/day-book', match: '/reports/day-book', cap: 'reports.view', keywords: ['daily register', 'transactions'] },
+      { label: 'Ledger Account', href: '/reports/ledger-account', match: '/reports/ledger-account', cap: 'reports.view', keywords: ['account statement', 't account'] },
+      { label: 'General Ledger', href: '/reports/general-ledger', match: '/reports/general-ledger', cap: 'reports.view', keywords: ['gl', 'all accounts'] },
       { label: 'Cash Book', href: '/reports/cash-book', match: '/reports/cash-book', cap: 'reports.view' },
       { label: 'Bank Book', href: '/reports/bank-book', match: '/reports/bank-book', cap: 'reports.view' },
-      { label: 'Trial Balance', href: '/reports/trial-balance', match: '/reports/trial-balance', cap: 'reports.view' },
+      { label: 'Trial Balance', href: '/reports/trial-balance', match: '/reports/trial-balance', cap: 'reports.view', keywords: ['tb', 'debits credits'] },
     ],
   },
   {
     key: 'taxes',
     label: 'Taxes',
     items: [
-      { label: 'Taxes & TDS', href: '/taxes', match: '/taxes' },
-      { label: 'Tax Report', href: '/reports/tax' },
+      { label: 'Taxes & TDS', href: '/taxes', match: '/taxes', keywords: ['gst', 'tcs', 'withholding', 'hsn', 'sac'] },
+      { label: 'Tax Report', href: '/reports/tax', keywords: ['gstr', 'gst return', 'output tax', 'input credit'] },
     ],
   },
   {
     key: 'analytics',
     label: 'Analytics',
     items: [
-      { label: 'Trip Profitability', href: '/analytics/trips', match: '/analytics/trips', cap: 'profitability.view' },
-      { label: 'Packages', href: '/analytics/packages', cap: 'profitability.view' },
-      { label: 'Agents', href: '/analytics/agents', cap: 'profitability.view' },
-      { label: 'Cost Centres', href: '/analytics/cost-centres', cap: 'profitability.view' },
+      { label: 'Trip Profitability', href: '/analytics/trips', match: '/analytics/trips', cap: 'profitability.view', keywords: ['margin', 'trip margin', 'profit per trip', 'tour profit'] },
+      { label: 'Packages', href: '/analytics/packages', cap: 'profitability.view', keywords: ['package margin', 'itinerary profit'] },
+      { label: 'Agents', href: '/analytics/agents', cap: 'profitability.view', keywords: ['agent performance', 'sales rep'] },
+      { label: 'Cost Centres', href: '/analytics/cost-centres', cap: 'profitability.view', keywords: ['departments', 'branches', 'analytic'] },
     ],
   },
   {
     key: 'operations',
     label: 'Operations',
     items: [
-      { label: 'Expenses', href: '/expenses', match: '/expenses' },
-      { label: 'Commissions', href: '/commissions' },
-      { label: 'Budgets', href: '/budgets', match: '/budgets', cap: 'budget.manage' },
-      { label: 'Assets & Deferrals', href: '/assets', match: '/assets' },
-      { label: 'CRM Sync', href: '/settings/crm-sync', match: '/settings/crm-sync', cap: 'coa.configure' },
+      { label: 'Expenses', href: '/expenses', match: '/expenses', keywords: ['claims', 'reimbursement', 'spend'] },
+      { label: 'Commissions', href: '/commissions', keywords: ['agent commission', 'incentive', 'brokerage'] },
+      { label: 'Budgets', href: '/budgets', match: '/budgets', cap: 'budget.manage', keywords: ['forecast', 'plan vs actual'] },
+      { label: 'Assets & Deferrals', href: '/assets', match: '/assets', keywords: ['depreciation', 'prepaid', 'amortisation'] },
+      { label: 'CRM Sync', href: '/settings/crm-sync', match: '/settings/crm-sync', cap: 'coa.configure', keywords: ['integration', 'tripzocrm', 'import bookings'] },
     ],
   },
   {
     key: 'reports',
     label: 'Reports',
     items: [
-      { label: 'Profit & Loss', href: '/reports/profit-and-loss', cap: 'reports.view' },
-      { label: 'Balance Sheet', href: '/reports/balance-sheet', cap: 'reports.view' },
-      { label: 'Cash Flow', href: '/reports/cash-flow', cap: 'reports.view' },
-      { label: 'AR Ageing', href: '/reports/ar-ageing', cap: 'reports.view' },
-      { label: 'AP Ageing', href: '/reports/ap-ageing', cap: 'reports.view' },
-      { label: 'Travel Reports', href: '/reports/travel', cap: 'reports.view' },
+      { label: 'Profit & Loss', href: '/reports/profit-and-loss', cap: 'reports.view', keywords: ['p&l', 'pnl', 'income statement', 'profitability'] },
+      { label: 'Balance Sheet', href: '/reports/balance-sheet', cap: 'reports.view', keywords: ['assets liabilities', 'financial position'] },
+      { label: 'Cash Flow', href: '/reports/cash-flow', cap: 'reports.view', keywords: ['cashflow', 'liquidity'] },
+      { label: 'AR Ageing', href: '/reports/ar-ageing', cap: 'reports.view', keywords: ['receivable ageing', 'overdue customers', 'aging'] },
+      { label: 'AP Ageing', href: '/reports/ap-ageing', cap: 'reports.view', keywords: ['payable ageing', 'overdue suppliers', 'aging'] },
+      { label: 'Travel Reports', href: '/reports/travel', cap: 'reports.view', keywords: ['pax', 'destination', 'occupancy'] },
     ],
   },
 ];
@@ -169,4 +189,51 @@ export function sectionFor(pathname: string): NavSection | null {
     }
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Searching the menu
+// ---------------------------------------------------------------------------
+
+export interface NavHit extends NavItem {
+  /** The section the screen lives under, so a hit says where it was found. */
+  section: string;
+}
+
+/**
+ * Screens matching a query.
+ *
+ * A finance app has sixty-odd screens and no reader memorises which section a
+ * report hangs under. Typing "trip profitability" into the bar and being told
+ * nothing matched is the search bar failing at the easiest question it gets —
+ * the answer is a menu entry, and the menu is right here.
+ *
+ * Capability filtering is the same rule the masthead applies: a screen a role
+ * cannot open is a screen search must not offer, or the hit is a link to a
+ * forbidden page.
+ */
+export function searchNav(q: string, role: string): NavHit[] {
+  const tokens = searchTokens(q).map((t) => t.toLowerCase());
+  if (!tokens.length) return [];
+
+  const scored: Array<{ hit: NavHit; score: number }> = [];
+  for (const s of NAV) {
+    for (const i of s.items) {
+      if (i.cap && !can(role, i.cap as FinanceCap)) continue;
+      const label = i.label.toLowerCase();
+      const haystack = [label, s.label.toLowerCase(), ...(i.keywords ?? [])].join(' ');
+      if (!tokens.every((t) => haystack.includes(t))) continue;
+
+      // Label hits beat keyword hits, and a label that STARTS with what was
+      // typed beats one that merely contains it, so "tax" offers Taxes & TDS
+      // before Trip Profitability's "tax invoice" neighbours.
+      const joined = tokens.join(' ');
+      const score = label === joined ? 0 : label.startsWith(joined) ? 1 : label.includes(joined) ? 2
+        : tokens.every((t) => label.includes(t)) ? 3 : 4;
+      scored.push({ hit: { ...i, section: s.label }, score });
+    }
+  }
+  return scored
+    .sort((a, b) => a.score - b.score || a.hit.label.localeCompare(b.hit.label))
+    .map((x) => x.hit);
 }

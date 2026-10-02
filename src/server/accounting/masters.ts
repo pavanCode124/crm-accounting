@@ -2,6 +2,7 @@ import 'server-only';
 import { all, one, run, scalar, tx, id, nowIso } from '../db';
 import { audit } from './audit';
 import type { Actor } from './engine';
+import { searchTokens } from '@/lib/search';
 
 /**
  * Configuration records: accounts, journals, partners, taxes, products,
@@ -203,6 +204,22 @@ export interface PartnerRow {
   email: string | null; phone: string | null; gstin: string | null; pan: string | null;
   address: string | null; credit_limit: number; tds_section: string | null;
   payment_terms_id: string | null; active: number;
+  /**
+   * The GST identity as it has to be PRINTED, which is not the name the agency
+   * files a partner under: "Greenwood Holidays Pvt Ltd" is registered as
+   * "GREENWOOD HOLIDAYS PRIVATE LIMITED" and an invoice carrying the friendly
+   * name does not match the portal's record of it.
+   */
+  gst_name: string | null;
+  city: string | null;
+  /**
+   * The customer's GST state code — the PLACE OF SUPPLY, and the other half of
+   * the comparison that decides CGST+SGST against IGST. The agency's own state
+   * was already stored; without this one the engine had nothing to compare it
+   * to and the choice of tax was left entirely to whoever picked it on the line.
+   */
+  state_code: string | null;
+  shipping_address: string | null;
   receivable?: number; payable?: number;
 }
 
@@ -214,9 +231,11 @@ export async function listPartners(orgId: string, opts: {
   if (opts.side === 'customer') clauses.push('p.is_customer = 1');
   if (opts.side === 'supplier') clauses.push('p.is_supplier = 1');
   if (opts.search) {
-    clauses.push('(p.name LIKE ? OR p.email LIKE ? OR p.phone LIKE ? OR p.gstin LIKE ?)');
-    const like = `%${opts.search}%`;
-    params.push(like, like, like, like);
+    for (const token of searchTokens(opts.search)) {
+      clauses.push('(p.name ILIKE ? OR p.email ILIKE ? OR p.phone ILIKE ? OR p.gstin ILIKE ?)');
+      const like = `%${token}%`;
+      params.push(like, like, like, like);
+    }
   }
   return await all<PartnerRow>(
     `SELECT p.*,
@@ -242,16 +261,33 @@ export async function upsertPartner(orgId: string, p: {
   gstin?: string | null; pan?: string | null; address?: string | null;
   creditLimit?: number; tdsSection?: string | null; paymentTermsId?: string | null;
   crmLeadId?: string | null;
+  gstName?: string | null; city?: string | null; stateCode?: string | null;
+  shippingAddress?: string | null;
 }, actor: Actor = {}) {
   return await tx(async () => {
+    /*
+     * A GSTIN CARRIES ITS OWN STATE in its first two digits, and the place of
+     * supply decides the tax. So a GSTIN with no state code beside it fills one
+     * in rather than leaving the engine with half a comparison — the same rule
+     * `updateOrganisation` applies to the agency's own registration, and for
+     * the same reason. A state typed by hand that disagrees with the GSTIN is
+     * left alone and shown back on screen: one of the two is a typo, and this
+     * is not the layer that should decide which.
+     */
+    const gstin = (p.gstin ?? '').trim().toUpperCase() || null;
+    const stateCode = (p.stateCode ?? '').trim() || (gstin ? gstin.slice(0, 2) : null);
+
     if (p.id) {
       await run(
         `UPDATE partners SET name=?, is_customer=?, is_supplier=?, partner_type=?, email=?, phone=?,
-                gstin=?, pan=?, address=?, credit_limit=?, tds_section=?, payment_terms_id=?
+                gstin=?, pan=?, address=?, credit_limit=?, tds_section=?, payment_terms_id=?,
+                gst_name=?, city=?, state_code=?, shipping_address=?
            WHERE id=? AND org_id=?`,
         p.name, p.isCustomer ? 1 : 0, p.isSupplier ? 1 : 0, p.partnerType ?? 'b2c',
-        p.email ?? null, p.phone ?? null, p.gstin ?? null, p.pan ?? null, p.address ?? null,
-        p.creditLimit ?? 0, p.tdsSection ?? null, p.paymentTermsId ?? null, p.id, orgId,
+        p.email ?? null, p.phone ?? null, gstin, p.pan ?? null, p.address ?? null,
+        p.creditLimit ?? 0, p.tdsSection ?? null, p.paymentTermsId ?? null,
+        p.gstName ?? null, p.city ?? null, stateCode, p.shippingAddress ?? null,
+        p.id, orgId,
       );
       await audit(orgId, actor, 'modified', 'partner', p.id, p.name);
       return p.id;
@@ -260,12 +296,14 @@ export async function upsertPartner(orgId: string, p: {
     await run(
       `INSERT INTO partners (id, org_id, name, is_customer, is_supplier, partner_type, crm_lead_id,
                              email, phone, gstin, pan, address, credit_limit, tds_section,
-                             payment_terms_id, active, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)`,
+                             payment_terms_id, gst_name, city, state_code, shipping_address,
+                             active, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)`,
       partnerId, orgId, p.name, p.isCustomer ? 1 : 0, p.isSupplier ? 1 : 0,
       p.partnerType ?? 'b2c', p.crmLeadId ?? null, p.email ?? null, p.phone ?? null,
-      p.gstin ?? null, p.pan ?? null, p.address ?? null, p.creditLimit ?? 0,
-      p.tdsSection ?? null, p.paymentTermsId ?? null, nowIso(),
+      gstin, p.pan ?? null, p.address ?? null, p.creditLimit ?? 0,
+      p.tdsSection ?? null, p.paymentTermsId ?? null,
+      p.gstName ?? null, p.city ?? null, stateCode, p.shippingAddress ?? null, nowIso(),
     );
     await audit(orgId, actor, 'created', 'partner', partnerId, p.name);
     return partnerId;
@@ -318,33 +356,50 @@ export async function listProducts(orgId: string) {
     id: string; name: string; code: string | null; category: string;
     sale_price: number; cost_price: number; income_account_id: string | null;
     expense_account_id: string | null; sale_tax_id: string | null; purchase_tax_id: string | null;
+    hsn_code: string | null; mrp: number; variant: string | null;
   }>('SELECT * FROM products WHERE org_id=? AND active=1 ORDER BY category, name', orgId);
 }
 
+/**
+ * `hsnCode`, `mrp` and `variant` are what the product contributes to a PRINTED
+ * invoice rather than to its arithmetic.
+ *
+ * The HSN (or SAC, for a service — the column is one field because the invoice
+ * prints one) is required on a GST tax invoice by Rule 46 of the CGST Rules,
+ * and it belongs on the product because it is a property of what is being sold,
+ * not of the sale. It is copied ONTO the line when the product is chosen and
+ * read back from the line thereafter, like the price and the tax: a reclassified
+ * product must not change what an invoice issued last year said it was.
+ */
 export async function upsertProduct(orgId: string, p: {
   id?: string; name: string; code?: string | null; category: string;
   salePrice?: number; costPrice?: number; incomeAccountId?: string | null;
   expenseAccountId?: string | null; saleTaxId?: string | null; purchaseTaxId?: string | null;
+  hsnCode?: string | null; mrp?: number; variant?: string | null;
 }, actor: Actor = {}) {
   return await tx(async () => {
     if (p.id) {
       await run(
         `UPDATE products SET name=?, code=?, category=?, sale_price=?, cost_price=?,
-                income_account_id=?, expense_account_id=?, sale_tax_id=?, purchase_tax_id=?
+                income_account_id=?, expense_account_id=?, sale_tax_id=?, purchase_tax_id=?,
+                hsn_code=?, mrp=?, variant=?
            WHERE id=? AND org_id=?`,
         p.name, p.code ?? null, p.category, p.salePrice ?? 0, p.costPrice ?? 0,
         p.incomeAccountId ?? null, p.expenseAccountId ?? null,
-        p.saleTaxId ?? null, p.purchaseTaxId ?? null, p.id, orgId,
+        p.saleTaxId ?? null, p.purchaseTaxId ?? null,
+        p.hsnCode ?? null, p.mrp ?? 0, p.variant ?? null, p.id, orgId,
       );
       return p.id;
     }
     const productId = id('prd');
     await run(
       `INSERT INTO products (id, org_id, name, code, category, sale_price, cost_price,
-                             income_account_id, expense_account_id, sale_tax_id, purchase_tax_id, active)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,1)`,
+                             income_account_id, expense_account_id, sale_tax_id, purchase_tax_id,
+                             hsn_code, mrp, variant, active)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)`,
       productId, orgId, p.name, p.code ?? null, p.category, p.salePrice ?? 0, p.costPrice ?? 0,
       p.incomeAccountId ?? null, p.expenseAccountId ?? null, p.saleTaxId ?? null, p.purchaseTaxId ?? null,
+      p.hsnCode ?? null, p.mrp ?? 0, p.variant ?? null,
     );
     await audit(orgId, actor, 'created', 'product', productId, p.name);
     return productId;
@@ -432,9 +487,16 @@ export async function createBudget(orgId: string, b: {
 }
 
 // ------------------------------------------------------------- payment terms
-export async function listPaymentTerms(orgId: string) {
-  return await all<{ id: string; name: string; days: number; note: string | null }>(
-    'SELECT * FROM payment_terms WHERE org_id=? ORDER BY days', orgId,
+export async function listPaymentTerms(orgId: string, opts: { includeArchived?: boolean } = {}) {
+  // Archived terms are excluded by default so they stop being OFFERED, while
+  // the settings screen passes `includeArchived` to show what was retired —
+  // every document already on one keeps pointing at it either way.
+  return await all<{ id: string; name: string; days: number; note: string | null; active: number; used?: number }>(
+    `SELECT t.*,
+            (SELECT COUNT(*) FROM documents d WHERE d.payment_terms_id = t.id) AS used
+       FROM payment_terms t
+      WHERE t.org_id = ? ${opts.includeArchived ? '' : 'AND t.active = 1'}
+      ORDER BY t.active DESC, t.days`, orgId,
   );
 }
 
@@ -442,4 +504,186 @@ export async function listUsers(orgId: string) {
   return await all<{ id: string; name: string; email: string | null; role: string }>(
     'SELECT id, name, email, role FROM users WHERE org_id=? AND active=1 ORDER BY name', orgId,
   );
+}
+
+// -------------------------------------------------------- payment terms CRUD
+/**
+ * Payment terms are a CONTRACT, not a label.
+ *
+ * `days` is what the invoice's due date is computed from, which is what the AR
+ * ageing report buckets on, which is what the collections call is made off.
+ * A travel agency selling to corporates on 45 days and to walk-ins on receipt
+ * needs both, and needs to add "60 days — Govt tenders" in year two without a
+ * deployment.
+ */
+export async function upsertPaymentTerm(orgId: string, t: {
+  id?: string; name: string; days: number; note?: string | null;
+}, actor: Actor = {}) {
+  const name = t.name.trim();
+  if (!name) throw new Error('A payment term needs a name.');
+  if (!Number.isFinite(t.days) || t.days < 0 || t.days > 3650) {
+    throw new Error('Days must be between 0 and 3650.');
+  }
+  if (t.id) {
+    await run('UPDATE payment_terms SET name=?, days=?, note=? WHERE id=? AND org_id=?',
+      name, Math.round(t.days), t.note ?? null, t.id, orgId);
+    await audit(orgId, actor, 'modified', 'payment_term', t.id, `${name} — ${t.days} day(s)`);
+    return t.id;
+  }
+  const termId = id('pt');
+  await run('INSERT INTO payment_terms (id, org_id, name, days, note, active) VALUES (?,?,?,?,?,1)',
+    termId, orgId, name, Math.round(t.days), t.note ?? null);
+  await audit(orgId, actor, 'created', 'payment_term', termId, `${name} — ${t.days} day(s)`);
+  return termId;
+}
+
+/**
+ * Retire a term rather than delete it. An invoice posted on "30 days nett"
+ * still points at this row, and its due date has to keep meaning something
+ * when somebody opens it next year.
+ */
+export async function archivePaymentTerm(orgId: string, termId: string, actor: Actor = {}) {
+  const inUse = await scalar(
+    'SELECT COUNT(*) FROM documents WHERE org_id=? AND payment_terms_id=? AND state=?',
+    orgId, termId, 'draft',
+  );
+  if (inUse > 0) {
+    throw new Error(`${inUse} draft document(s) still use this term. Change them first.`);
+  }
+  await run('UPDATE payment_terms SET active=0 WHERE id=? AND org_id=?', termId, orgId);
+  await audit(orgId, actor, 'modified', 'payment_term', termId, 'Archived');
+}
+
+// ------------------------------------------------------------- numbering
+export interface SequenceRow {
+  code: string; prefix: string; padding: number; next_no: number;
+}
+
+export async function listSequences(orgId: string): Promise<SequenceRow[]> {
+  return await all<SequenceRow>(
+    'SELECT code, prefix, padding, next_no FROM sequences WHERE org_id=? ORDER BY code', orgId,
+  );
+}
+
+/**
+ * Change a document series.
+ *
+ * ------------------------------------------------------------------------
+ * WHY THE NEXT NUMBER CAN ONLY GO FORWARD
+ * ------------------------------------------------------------------------
+ * A statutory invoice series has to be unbroken and unique. Winding the
+ * counter BACK hands the next invoice a number that is already printed on one
+ * sitting in a customer's inbox and in last quarter's GST return — two
+ * different invoices, same number, which is the specific thing the series
+ * exists to prevent. Winding it forward merely leaves a gap, which is
+ * explainable, so that direction is allowed.
+ *
+ * The PREFIX, by contrast, may change freely. Agencies genuinely do move from
+ * "INV" to "TRZ/25-26/" at a year end, and the numbers already issued keep the
+ * prefix they were issued with because the number is stored on the document,
+ * not derived from this row.
+ */
+export async function updateSequence(orgId: string, s: {
+  code: string; prefix: string; padding: number; nextNo: number;
+}, actor: Actor = {}) {
+  const current = await one<SequenceRow>(
+    'SELECT code, prefix, padding, next_no FROM sequences WHERE org_id=? AND code=?', orgId, s.code,
+  );
+  if (!current) throw new Error(`There is no "${s.code}" series.`);
+
+  const prefix = s.prefix.trim();
+  if (!prefix) throw new Error('A series needs a prefix.');
+  if (prefix.length > 20) throw new Error('Keep the prefix to 20 characters or fewer.');
+
+  const padding = Math.max(1, Math.min(10, Math.round(s.padding)));
+  const nextNo = Math.round(s.nextNo);
+  if (!Number.isFinite(nextNo) || nextNo < 1) throw new Error('The next number must be 1 or more.');
+  if (nextNo < current.next_no) {
+    throw new Error(
+      `The ${s.code} series is already at ${current.next_no}. It can be moved forward, leaving a gap, ` +
+      'but never back — reusing a number would put two different documents under one reference.',
+    );
+  }
+
+  await run('UPDATE sequences SET prefix=?, padding=?, next_no=? WHERE org_id=? AND code=?',
+    prefix, padding, nextNo, orgId, s.code);
+  await audit(orgId, actor, 'modified', 'sequence', s.code,
+    `${prefix}${String(nextNo).padStart(padding, '0')} next`);
+}
+
+// ------------------------------------------------- analytic dimensions
+/**
+ * Branches, departments and agents — the dimensions every amount is cut by.
+ *
+ * They are `analytic_accounts` under their plan, which is deliberate and is
+ * what makes "Mumbai branch made ₹4.2L this quarter" RECONCILE to the P&L
+ * rather than merely resemble it: the figure comes off the same GL lines the
+ * P&L is built from, tagged, instead of off a parallel column somebody kept.
+ *
+ * A travel agency with eight branches and forty agents cannot have those
+ * arrive by seed script, which is the only way they can arrive today.
+ */
+export interface AnalyticPlanRow { id: string; code: string; name: string; entries?: number }
+
+export async function listAnalyticPlans(orgId: string): Promise<AnalyticPlanRow[]> {
+  return await all<AnalyticPlanRow>(
+    `SELECT p.*, (SELECT COUNT(*) FROM analytic_accounts a WHERE a.plan_id = p.id AND a.active = 1) AS entries
+       FROM analytic_plans p WHERE p.org_id = ? ORDER BY p.code`, orgId,
+  );
+}
+
+export async function upsertAnalyticAccount(orgId: string, a: {
+  id?: string; planCode: string; code: string; name: string;
+}, actor: Actor = {}) {
+  return await tx(async () => {
+    const name = a.name.trim();
+    const code = a.code.trim().toUpperCase();
+    if (!name) throw new Error('A name is required.');
+    if (!code) throw new Error('A short code is required — it is what reports group on.');
+
+    const plan = await one<{ id: string; name: string }>(
+      'SELECT id, name FROM analytic_plans WHERE org_id=? AND code=?', orgId, a.planCode,
+    );
+    if (!plan) throw new Error(`There is no "${a.planCode}" plan. Run the seed.`);
+
+    const clash = await one<{ id: string }>(
+      'SELECT id FROM analytic_accounts WHERE org_id=? AND plan_id=? AND UPPER(code)=? AND id <> ?',
+      orgId, plan.id, code, a.id ?? '',
+    );
+    if (clash) throw new Error(`${plan.name} already has a "${code}".`);
+
+    if (a.id) {
+      await run('UPDATE analytic_accounts SET code=?, name=? WHERE id=? AND org_id=?',
+        code, name, a.id, orgId);
+      await audit(orgId, actor, 'modified', 'analytic_account', a.id, `${code} — ${name}`);
+      return a.id;
+    }
+    const analyticId = id('ana');
+    await run(
+      `INSERT INTO analytic_accounts (id, org_id, plan_id, code, name, active) VALUES (?,?,?,?,?,1)`,
+      analyticId, orgId, plan.id, code, name,
+    );
+    await audit(orgId, actor, 'created', 'analytic_account', analyticId, `${plan.name}: ${code} — ${name}`);
+    return analyticId;
+  });
+}
+
+/**
+ * Archive a dimension. Refused while GL lines are still tagged with it, because
+ * the figure on last quarter's branch report is the sum of those lines and an
+ * archived dimension drops out of the list the report is built from — the
+ * number would change retrospectively with nothing to point at.
+ */
+export async function archiveAnalyticAccount(orgId: string, analyticId: string, actor: Actor = {}) {
+  const tagged = await scalar(
+    'SELECT COUNT(*) FROM analytic_distributions WHERE org_id=? AND analytic_id=?', orgId, analyticId,
+  );
+  if (tagged > 0) {
+    throw new Error(
+      `${tagged} posted line(s) are tagged to this. Archiving it would change what every report ` +
+      'that groups on it already says. Rename it instead if it has been superseded.',
+    );
+  }
+  await run('UPDATE analytic_accounts SET active=0 WHERE id=? AND org_id=?', analyticId, orgId);
+  await audit(orgId, actor, 'modified', 'analytic_account', analyticId, 'Archived');
 }

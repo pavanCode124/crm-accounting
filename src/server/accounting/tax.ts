@@ -89,6 +89,17 @@ export interface TaxSplit {
   accountId: string | null;
   base: number;
   amount: number;
+  /**
+   * The component's own rate and group, carried out of the engine rather than
+   * looked up again by the caller.
+   *
+   * They are what a tax invoice and a GST return PRINT — "CGST 2.5% 10.69" is
+   * three facts, and the first two were being thrown away the moment the third
+   * was computed. Re-reading them from the `taxes` table afterwards reads
+   * today's rate, which is the wrong one for any document already raised.
+   */
+  rateBps: number;
+  group: string;
 }
 
 export interface LineAmounts {
@@ -123,6 +134,10 @@ export async function computeLine(orgId: string, line: LineInput): Promise<LineA
     accountId: c.account_id,
     base: subtotal,
     amount: c.computation === 'fixed' ? c.rate_bps : pct(subtotal, c.rate_bps),
+    // A fixed-amount tax has no percentage to print, and reporting its rupees
+    // as a rate would be a nonsense figure in a "%" column.
+    rateBps: c.computation === 'fixed' ? 0 : c.rate_bps,
+    group: c.tax_group,
   }));
 
   const taxAmount = splits.reduce((s, x) => s + x.amount, 0);

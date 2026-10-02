@@ -15,6 +15,7 @@ import {
 import { draftEntry, postDraft, postEntry, reverseEntry } from '@/server/accounting/engine';
 import {
   importStatement, parseStatementCsv, matchToPayment, reconcileAsPayment, reconcileToAccount, transfer,
+  upsertBankAccount, setDefaultBankAccount, archiveBankAccount,
 } from '@/server/accounting/banking';
 import { setPeriodState, closeFiscalYear, postOpeningBalances, createFiscalYear } from '@/server/accounting/periods';
 import {
@@ -25,9 +26,18 @@ import { createAsset, confirmAsset, runDepreciation, createDeferral, runDeferral
 import {
   upsertAccount, setAccountReconcilable, upsertJournal, upsertPartner, createBooking,
   upsertProduct, createBudget, resolvePartnerByName, findPartnerIdByName,
+  upsertPaymentTerm, archivePaymentTerm, updateSequence,
+  upsertAnalyticAccount, archiveAnalyticAccount,
 } from '@/server/accounting/masters';
+import { updateOrganisation } from '@/server/accounting/organisation';
+import {
+  createSettlement, updateSettlement, postSettlement, reverseSettlement, pullDocuments,
+  removeDocument as removeSettlementDocument, saveCharge as saveSettlementCharge,
+  removeCharge as removeSettlementCharge,
+} from '@/server/accounting/settlements';
 import { setSetting, type SettingKey } from '@/server/accounting/settings';
 import { resetAndSeed } from '@/server/seed';
+import { journalOfBankAccount } from '@/server/options';
 import { run, id } from '@/server/db';
 import { connect as connectCrm, disconnect as disconnectCrm } from '@/server/crm/connection';
 import { syncFromCrm, forgetSyncLinks } from '@/server/crm/sync';
@@ -56,6 +66,17 @@ type Result = { ok?: string; error?: string };
 function str(f: FormData, k: string): string { return String(f.get(k) ?? '').trim(); }
 function opt(f: FormData, k: string): string | null { const v = str(f, k); return v === '' ? null : v; }
 function money(f: FormData, k: string): number { return toMinor(str(f, k) || '0'); }
+/**
+ * A percentage typed on a form, as the basis points the schema stores.
+ *
+ * Rounded, not truncated: a commission of 6.185% typed into a field that stores
+ * hundredths of a percent has to become 619 rather than 618, or the figure the
+ * agency agreed and the figure the ledger applies differ on every order of
+ * every cycle, always in the channel's favour.
+ */
+function bps(f: FormData, k: string): number {
+  return Math.round(parseFloat(str(f, k) || '0') * 100) || 0;
+}
 function bool(f: FormData, k: string): boolean { return f.get(k) === 'on' || f.get(k) === 'true'; }
 
 /** Run a service call and turn any failure into a message the user can act on. */
@@ -110,6 +131,13 @@ function readLines(f: FormData) {
   const accounts = f.getAll('line_account').map(String);
   const analytics = f.getAll('line_analytic').map(String);
 
+  // Parallel arrays again, for the same reason. `getAll` returns one entry per
+  // input of that name REGARDLESS of whether it was filled, so the HSN and MRP
+  // columns stay aligned with the rows beside them even when most are blank —
+  // which is the usual case, and the case a sparse encoding would misalign.
+  const hsns = f.getAll('line_hsn').map(String);
+  const mrps = f.getAll('line_mrp').map(String);
+
   return names.map((name, i) => ({
     name: name.trim(),
     qtyMilli: qtyToMilli(qtys[i] || '1'),
@@ -118,6 +146,8 @@ function readLines(f: FormData) {
     taxId: taxes[i] || null,
     accountId: accounts[i] || '',
     analyticId: analytics[i] || null,
+    hsnCode: (hsns[i] ?? '').trim() || null,
+    mrp: toMinor(mrps[i] || '0'),
   })).filter((l) => l.name && l.accountId && (l.unitPrice !== 0 || l.qtyMilli !== 0));
 }
 
@@ -128,8 +158,12 @@ export async function saveDocumentAction(formData: FormData) {
   const listPath = isBill ? '/purchases/bills' : '/sales/invoices';
   const existing = opt(formData, 'id');
 
+  // A bounced form goes back to the screen it came from — the edit screen for
+  // a draft being changed, the new-document screen otherwise.
+  const formPath = existing ? `${listPath}/${existing}/edit` : `${listPath}/new`;
+
   const lines = readLines(formData);
-  if (!lines.length) back(`${listPath}/new`, { error: 'Add at least one line with a description and an account.' });
+  if (!lines.length) back(formPath, { error: 'Add at least one line with a description and an account.' });
 
   const r = await guard(async () => {
     // Typed, not chosen from a dropdown: a name with no match on this side
@@ -153,12 +187,18 @@ export async function saveDocumentAction(formData: FormData) {
       rateE6: Math.round(parseFloat(str(formData, 'rate') || '1') * 1_000_000),
       withholdingTaxId: opt(formData, 'withholding_tax_id'),
       note: opt(formData, 'note'),
+      placeOfSupply: opt(formData, 'place_of_supply'),
+      irn: opt(formData, 'irn'),
+      irnAckNo: opt(formData, 'irn_ack_no'),
+      irnAckDate: opt(formData, 'irn_ack_date'),
+      orderRef: opt(formData, 'order_ref'),
+      orderDate: opt(formData, 'order_date'),
       lines,
     };
     if (existing) { await updateDocument(existing, input, actorOf(s)); return existing; }
     return await createDocument(input, actorOf(s));
   });
-  if (r.error) back(`${listPath}/new`, r);
+  if (r.error) back(formPath, r);
 
   const docId = r.value!;
   if (bool(formData, 'post_now')) {
@@ -220,14 +260,39 @@ export async function registerPaymentAction(formData: FormData) {
   const listPath = direction === 'inbound' ? '/sales/payments' : '/purchases/payments';
 
   const r = await guard(async () => {
-    const partnerId = await resolvePartnerByName(s.orgId, str(formData, 'partner_name'), side, actorOf(s));
+    /*
+     * A document's own settle form knows the partner already and sends its id;
+     * the standalone payment form has only a typed name. Taking the id first
+     * is what keeps "Pay out" on a posted bill working — it has no name field
+     * to read, so resolving by name alone failed it with "Supplier is required".
+     */
+    const partnerId = opt(formData, 'partner_id')
+      ?? await resolvePartnerByName(s.orgId, str(formData, 'partner_name'), side, actorOf(s));
+    /*
+     * THE JOURNAL FOLLOWS THE ACCOUNT, and is resolved here rather than sent
+     * by the form.
+     *
+     * The form used to post a fixed `journal_id` — the first bank or cash
+     * journal in the list — alongside whichever account the person picked. The
+     * GL side was right, because `postPayment` reads the account off the bank
+     * account; the JOURNAL was whatever sorted first. So a receipt into petty
+     * cash was stamped with a bank journal's entry number and appeared in the
+     * bank book instead of the cash book, and the two statements an auditor
+     * reconciles disagreed by exactly the cash takings.
+     */
+    const bankAccountId = opt(formData, 'bank_account_id');
+    const journalId = await journalOfBankAccount(s.orgId, bankAccountId)
+      ?? str(formData, 'journal_id');
+    if (!journalId) {
+      throw new Error('This account has no journal to post through. Set one under Settings → Bank & Cash.');
+    }
     return await createPayment({
       orgId: s.orgId,
       direction,
       side,
       partnerId,
-      journalId: str(formData, 'journal_id'),
-      bankAccountId: opt(formData, 'bank_account_id'),
+      journalId,
+      bankAccountId,
       bookingId: opt(formData, 'booking_id'),
       payDate: str(formData, 'pay_date') || isoDate(),
       amount,
@@ -517,7 +582,7 @@ export async function commissionAction(formData: FormData) {
     return await createCommission(s.orgId, {
       agentName: str(formData, 'agent_name'),
       bookingId: str(formData, 'booking_id'),
-      basis: str(formData, 'basis') === 'margin' ? 'margin' : 'revenue',
+      basis: str(formData, 'basis') === 'revenue' ? 'revenue' : 'profit',
       rateBps: Math.round(parseFloat(str(formData, 'rate') || '0') * 100),
       fixedAmount: money(formData, 'fixed_amount'),
       dueDate: opt(formData, 'due_date'),
@@ -650,6 +715,10 @@ export async function savePartnerAction(formData: FormData) {
     creditLimit: money(formData, 'credit_limit'),
     tdsSection: opt(formData, 'tds_section'),
     paymentTermsId: opt(formData, 'payment_terms_id'),
+    gstName: opt(formData, 'gst_name'),
+    city: opt(formData, 'city'),
+    stateCode: opt(formData, 'state_code'),
+    shippingAddress: opt(formData, 'shipping_address'),
   }, actorOf(s)));
   back(side === 'supplier' ? '/purchases/suppliers' : '/sales/customers', r.error ? r : { ok: 'Saved.' });
 }
@@ -694,6 +763,9 @@ export async function saveProductAction(formData: FormData) {
     expenseAccountId: opt(formData, 'expense_account_id'),
     saleTaxId: opt(formData, 'sale_tax_id'),
     purchaseTaxId: opt(formData, 'purchase_tax_id'),
+    hsnCode: opt(formData, 'hsn_code'),
+    mrp: money(formData, 'mrp'),
+    variant: opt(formData, 'variant'),
   }, actorOf(s)));
   back(r.error ? '/settings/products/new' : '/settings/products',
     r.error ? r : { ok: 'Product created.' });
@@ -745,7 +817,7 @@ export async function saveSettingsAction(formData: FormData) {
       await setSetting(s.orgId, key.slice('setting.'.length) as SettingKey, value);
     }
   });
-  back('/settings', r.error ? r : { ok: 'Settings saved.' });
+  back('/settings/accounts', r.error ? r : { ok: 'Defaults saved.' });
 }
 
 /**
@@ -819,3 +891,242 @@ export async function crmForgetLinksAction(formData: FormData) {
 }
 
 void ctx;
+
+// ---------------------------------------------------------------------------
+// Configuration — the agency, its accounts, its series, its dimensions
+// ---------------------------------------------------------------------------
+/*
+ * Everything below exists because the alternative was a seed script. A product
+ * that serves one agency can be configured by whoever deploys it; a product
+ * that serves fifty cannot, and every one of these actions replaces a row that
+ * used to be typed into src/server/seed.ts by hand.
+ */
+
+export async function saveOrganisationAction(formData: FormData) {
+  const s = await requireCap('coa.configure');
+  const r = await guard(async () => await updateOrganisation(s.orgId, {
+    name: str(formData, 'name'),
+    legalName: opt(formData, 'legal_name'),
+    gstin: opt(formData, 'gstin'),
+    pan: opt(formData, 'pan'),
+    stateCode: opt(formData, 'state_code'),
+    country: opt(formData, 'country'),
+    currency: str(formData, 'currency') || undefined,
+    fyStartMonth: Number(str(formData, 'fy_start_month') || '0') || undefined,
+    address: opt(formData, 'address'),
+    city: opt(formData, 'city'),
+    email: opt(formData, 'email'),
+    phone: opt(formData, 'phone'),
+    website: opt(formData, 'website'),
+    invoiceTerms: opt(formData, 'invoice_terms'),
+    invoiceFooter: opt(formData, 'invoice_footer'),
+  }, actorOf(s)));
+  back('/settings/organisation', r.error ? r : { ok: 'Agency details saved.' });
+}
+
+export async function saveBankAccountAction(formData: FormData) {
+  const s = await requireCap('coa.configure');
+  const r = await guard(async () => await upsertBankAccount(s.orgId, {
+    id: opt(formData, 'id') ?? undefined,
+    name: str(formData, 'name'),
+    bankName: opt(formData, 'bank_name'),
+    accountNo: opt(formData, 'account_no'),
+    ifsc: opt(formData, 'ifsc'),
+    branchName: opt(formData, 'branch_name'),
+    swift: opt(formData, 'swift'),
+    upiId: opt(formData, 'upi_id'),
+    note: opt(formData, 'note'),
+    currency: str(formData, 'currency') || 'INR',
+    isCash: str(formData, 'kind') === 'cash',
+    isDefault: bool(formData, 'is_default'),
+  }, actorOf(s)));
+  back('/settings/bank-accounts', r.error ? r : {
+    ok: opt(formData, 'id')
+      ? 'Account updated.'
+      : 'Account added, with its ledger account and its own journal.',
+  });
+}
+
+export async function setDefaultBankAccountAction(formData: FormData) {
+  const s = await requireCap('coa.configure');
+  const r = await guard(async () => await setDefaultBankAccount(s.orgId, str(formData, 'id'), actorOf(s)));
+  back('/settings/bank-accounts', r.error ? r : { ok: 'Default account changed.' });
+}
+
+export async function archiveBankAccountAction(formData: FormData) {
+  const s = await requireCap('coa.configure');
+  const r = await guard(async () => await archiveBankAccount(s.orgId, str(formData, 'id'), actorOf(s)));
+  back('/settings/bank-accounts', r.error ? r : { ok: 'Account archived. Its history is untouched.' });
+}
+
+export async function savePaymentTermAction(formData: FormData) {
+  const s = await requireCap('coa.configure');
+  const r = await guard(async () => await upsertPaymentTerm(s.orgId, {
+    id: opt(formData, 'id') ?? undefined,
+    name: str(formData, 'name'),
+    days: Number(str(formData, 'days') || '0'),
+    note: opt(formData, 'note'),
+  }, actorOf(s)));
+  back('/settings/payment-terms', r.error ? r : { ok: 'Payment term saved.' });
+}
+
+export async function archivePaymentTermAction(formData: FormData) {
+  const s = await requireCap('coa.configure');
+  const r = await guard(async () => await archivePaymentTerm(s.orgId, str(formData, 'id'), actorOf(s)));
+  back('/settings/payment-terms', r.error ? r : { ok: 'Term archived.' });
+}
+
+/**
+ * Save every series on the Numbering screen in one submit.
+ *
+ * One form, not one per row: the prefixes an agency changes at a year end are
+ * changed TOGETHER, and saving them one at a time is how half a chart ends up
+ * on the new financial year and half on the old.
+ */
+export async function saveNumberingAction(formData: FormData) {
+  const s = await requireCap('coa.configure');
+  const codes = formData.getAll('seq_code').map(String);
+  const prefixes = formData.getAll('seq_prefix').map(String);
+  const paddings = formData.getAll('seq_padding').map(String);
+  const nexts = formData.getAll('seq_next').map(String);
+  const r = await guard(async () => {
+    for (let i = 0; i < codes.length; i += 1) {
+      await updateSequence(s.orgId, {
+        code: codes[i],
+        prefix: prefixes[i] ?? '',
+        padding: Number(paddings[i] || '5'),
+        nextNo: Number(nexts[i] || '1'),
+      }, actorOf(s));
+    }
+  });
+  back('/settings/numbering', r.error ? r : { ok: 'Numbering saved.' });
+}
+
+export async function saveAnalyticAction(formData: FormData) {
+  const s = await requireCap('coa.configure');
+  const r = await guard(async () => await upsertAnalyticAccount(s.orgId, {
+    id: opt(formData, 'id') ?? undefined,
+    planCode: str(formData, 'plan_code'),
+    code: str(formData, 'code'),
+    name: str(formData, 'name'),
+  }, actorOf(s)));
+  back('/settings/dimensions', r.error ? r : { ok: 'Saved.' });
+}
+
+export async function archiveAnalyticAction(formData: FormData) {
+  const s = await requireCap('coa.configure');
+  const r = await guard(async () => await archiveAnalyticAccount(s.orgId, str(formData, 'id'), actorOf(s)));
+  back('/settings/dimensions', r.error ? r : { ok: 'Archived.' });
+}
+
+// ---------------------------------------------------------------------------
+// Settlements — channel payout cycles
+// ---------------------------------------------------------------------------
+
+/**
+ * WHICH CAPABILITY A SETTLEMENT NEEDS, and why it is the payment ones.
+ *
+ * Drafting a cycle moves nothing, so it sits with `payment.create` beside
+ * receiving a receipt — which is what it is, a receipt with its deductions
+ * written down. POSTING one books commission, GST, TCS and TDS and discharges
+ * every invoice in the cycle, so it takes `payment.approve`: it is the single
+ * largest entry this product writes from one click, and an agent who may raise
+ * an invoice should not be the person who decides what a channel kept.
+ */
+export async function saveSettlementAction(formData: FormData) {
+  const s = await requireCap('payment.create');
+  const existing = opt(formData, 'id');
+  const formPath = existing ? `/settlements/${existing}` : '/settlements/new';
+
+  const r = await guard(async () => {
+    const partnerId = await resolvePartnerByName(
+      s.orgId, str(formData, 'partner_name'), 'customer', actorOf(s),
+    );
+    const input = {
+      orgId: s.orgId,
+      partnerId,
+      cycleFrom: str(formData, 'cycle_from') || isoDate(),
+      cycleTo: str(formData, 'cycle_to') || isoDate(),
+      commissionBps: bps(formData, 'commission_pct'),
+      chargeGstBps: bps(formData, 'charge_gst_pct'),
+      shippingCharge: money(formData, 'shipping_charge'),
+      returnCharge: money(formData, 'return_charge'),
+      tcsBps: bps(formData, 'tcs_pct'),
+      tdsBps: bps(formData, 'tds_pct'),
+      previousUnsettled: money(formData, 'previous_unsettled'),
+      payDate: opt(formData, 'pay_date'),
+      utr: opt(formData, 'utr'),
+      bankAccountId: opt(formData, 'bank_account_id'),
+      journalId: await journalOfBankAccount(s.orgId, opt(formData, 'bank_account_id')),
+      note: opt(formData, 'note'),
+    };
+    if (existing) { await updateSettlement(existing, input, actorOf(s)); return existing; }
+    return await createSettlement(input, actorOf(s));
+  });
+  if (r.error) back(formPath, r);
+  back(`/settlements/${r.value}`, { ok: 'Saved.' });
+}
+
+export async function postSettlementAction(formData: FormData) {
+  const s = await requireCap('payment.approve');
+  const settlementId = str(formData, 'id');
+  const r = await guard(async () => await postSettlement(s.orgId, settlementId, actorOf(s)));
+  back(`/settlements/${settlementId}`, r.error ? r : { ok: 'Settlement posted to the ledger.' });
+}
+
+export async function reverseSettlementAction(formData: FormData) {
+  const s = await requireCap('payment.approve');
+  const settlementId = str(formData, 'id');
+  const r = await guard(async () => await reverseSettlement(
+    s.orgId, settlementId, str(formData, 'date') || isoDate(), actorOf(s),
+    opt(formData, 'reason') ?? undefined,
+  ));
+  back(`/settlements/${settlementId}`, r.error ? r : { ok: 'Reversed.' });
+}
+
+export async function refillSettlementAction(formData: FormData) {
+  const s = await requireCap('payment.create');
+  const settlementId = str(formData, 'id');
+  const r = await guard(async () => await pullDocuments(s.orgId, settlementId, actorOf(s)));
+  back(`/settlements/${settlementId}`, r.error ? r : { ok: 'Orders refreshed from the ledger.' });
+}
+
+export async function removeSettlementOrderAction(formData: FormData) {
+  const s = await requireCap('payment.create');
+  const settlementId = str(formData, 'settlement_id');
+  const r = await guard(async () => await removeSettlementDocument(
+    s.orgId, settlementId, str(formData, 'row_id'), actorOf(s),
+  ));
+  back(`/settlements/${settlementId}`, r.error ? r : { ok: 'Order removed.' });
+}
+
+/**
+ * Save one charge row.
+ *
+ * An EMPTY amount deletes the row rather than storing a nil charge, because the
+ * form draws every charge the catalogue knows and most of them are blank in any
+ * given cycle. Keeping twenty zero rows per settlement would make the ledger's
+ * audit trail unreadable and the statement no different.
+ */
+export async function saveSettlementChargeAction(formData: FormData) {
+  const s = await requireCap('payment.create');
+  const settlementId = str(formData, 'settlement_id');
+  const amount = money(formData, 'amount');
+  const existing = opt(formData, 'id');
+  const r = await guard(async () => {
+    if (!amount && existing) return await removeSettlementCharge(s.orgId, settlementId, existing, actorOf(s));
+    if (!amount) return undefined;
+    const gst = str(formData, 'gst_amount');
+    return await saveSettlementCharge(s.orgId, settlementId, {
+      id: existing,
+      code: str(formData, 'code'),
+      amount,
+      // Blank means "work the GST out at the cycle's rate"; a typed figure,
+      // zero included, is the channel's own and is taken as stated.
+      gstAmount: gst === '' ? null : toMinor(gst),
+      accountId: opt(formData, 'account_id'),
+      note: opt(formData, 'note'),
+    }, actorOf(s));
+  });
+  back(`/settlements/${settlementId}`, r.error ? r : { ok: 'Charge saved.' });
+}

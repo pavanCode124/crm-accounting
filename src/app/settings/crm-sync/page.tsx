@@ -11,6 +11,15 @@ import {
 export const dynamic = 'force-dynamic';
 
 /**
+ * A sync is several round trips to the CRM and a few hundred draft documents,
+ * which is well past the ten seconds a serverless function gets by default.
+ * The ceiling applies to the server actions invoked from this page too, which
+ * is the one that actually matters — `crmSyncAction` is the long call, not the
+ * render.
+ */
+export const maxDuration = 60;
+
+/**
  * Settings → CRM Sync.
  *
  * The screen that stops this app inventing its own agency. Everything the

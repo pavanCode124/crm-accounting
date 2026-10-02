@@ -1,8 +1,8 @@
 import { ctx } from '@/server/bootstrap';
 import { msg, type SearchParams } from '@/lib/range';
-import { listCommissions } from '@/server/accounting/expenses';
+import { listCommissions, commissionBasisLabel } from '@/server/accounting/expenses';
 import { bookingOptions } from '@/server/options';
-import { fmtDate, isoDate, titleise } from '@/lib/accounting';
+import { fmtDate, isoDate } from '@/lib/accounting';
 import { bpsToPct } from '@/lib/money';
 import { commissionAction } from '@/app/actions';
 import {
@@ -68,7 +68,7 @@ export default async function CommissionsPage({ searchParams }: { searchParams: 
                         ? <RefLink href={`/bookings/${r.booking_id}`}>{r.booking_ref}</RefLink>
                         : <span className="text-ink-faint">—</span>}
                     </Td>
-                    <Td><Chip state="draft" label={titleise(r.basis)} /></Td>
+                    <Td><Chip state="draft" label={commissionBasisLabel(r.basis)} /></Td>
                     <Td align="right"><span className="num">{r.rate_bps ? bpsToPct(r.rate_bps) : 'fixed'}</span></Td>
                     <Td align="right"><Money value={r.base_amount} /></Td>
                     <Td align="right"><Money value={r.amount} bold dash={false} /></Td>
@@ -101,10 +101,11 @@ export default async function CommissionsPage({ searchParams }: { searchParams: 
                 {bookings.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}
               </select>
             </Field>
-            <Field label="Basis" hint="Margin rewards profitable selling; revenue rewards volume.">
+            <Field label="Basis"
+              hint="Profit is revenue less every cost tagged to the trip — the same figure Trip Profitability shows. It rewards selling profitably; revenue rewards volume.">
               <select name="basis" className={inputClass} defaultValue="revenue">
                 <option value="revenue">Revenue from the trip</option>
-                <option value="margin">Gross margin on the trip</option>
+                <option value="profit">Profit from the trip</option>
               </select>
             </Field>
             <Field label="Rate %">
@@ -119,8 +120,9 @@ export default async function CommissionsPage({ searchParams }: { searchParams: 
             <button className={`${btn.primary} w-full`}>Calculate</button>
           </form>
           <p className="mt-3 text-[12px] text-ink-faint">
-            The base is read from the trip&rsquo;s analytic account, so a commission can only be
-            calculated on revenue the ledger has actually recognised.
+            The base is read from the trip&rsquo;s analytic account, so a commission is only ever
+            calculated on what the ledger has actually recognised. A trip whose supplier bills are
+            not in yet will show a profit that is too high, and a commission on it will be too.
           </p>
         </Card>
       </div>

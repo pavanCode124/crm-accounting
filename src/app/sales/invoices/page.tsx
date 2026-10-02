@@ -27,7 +27,7 @@ export default async function InvoicesPage({ searchParams }: { searchParams: Pro
       />
       {m.error && <Banner tone="error">{m.error}</Banner>}
       {m.ok && <Banner tone="ok">{m.ok}</Banner>}
-      <DocumentFilters action="/sales/invoices" filter={filter} />
+      <DocumentFilters action="/sales/invoices" filter={filter} docType="out_invoice" />
       <DocumentList
         orgId={s.orgId}
         docType="out_invoice"

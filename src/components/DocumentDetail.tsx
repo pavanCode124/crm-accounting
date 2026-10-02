@@ -1,13 +1,15 @@
 import Link from 'next/link';
 import { DOC_TYPES, fmtDate, titleise, isoDate, daysBetween } from '@/lib/accounting';
+import { stateName } from '@/server/accounting/organisation';
 import { fmt, qtyFromMilli, bpsToPct } from '@/lib/money';
-import { getDocument, documentLines } from '@/server/accounting/documents';
-import { allocationsFor } from '@/server/accounting/payments';
+import { getDocument, documentLines, documentLineTaxes } from '@/server/accounting/documents';
+import { allocationsFor, listPayments } from '@/server/accounting/payments';
 import { auditFor } from '@/server/accounting/audit';
 import { journalEntry } from '@/server/accounting/reports';
 import { bankAccountOptions, journalOptions } from '@/server/options';
 import {
   postDocumentAction, reverseDocumentAction, creditNoteAction, registerPaymentAction, unallocateAction,
+  allocateAction,
 } from '@/app/actions';
 import {
   PageHeader, Card, Table, Th, Td, Money, Chip, DefList, btn, inputClass, Field, Banner, RefLink,
@@ -30,6 +32,7 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
 
   const meta = DOC_TYPES[doc.doc_type];
   const lines = await documentLines(docId);
+  const lineTaxes = await documentLineTaxes(docId);
   const allocations = await allocationsFor(docId);
   const trail = await auditFor('document', docId);
   const entry = doc.entry_id ? await journalEntry(orgId, doc.entry_id) : null;
@@ -42,6 +45,26 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
     ? (isBill ? 'outbound' : 'inbound')
     : (isBill ? 'inbound' : 'outbound');
   const settleVerb = payDirection === 'inbound' ? 'Record a receipt' : 'Pay out';
+  /*
+   * MONEY ALREADY WITH THIS PARTNER, SHOWN WHERE IT IS ABOUT TO BE SPENT.
+   *
+   * An advance paid before the bill arrived sits unallocated against the
+   * supplier. Settling the bill from here used to offer only a fresh payment,
+   * so the full amount went out a second time and the advance was left
+   * floating — the supplier's account carried a debit nobody had written off
+   * and the books disagreed with what was actually paid. Offering the advance
+   * on the same card is what lets it be applied first, with the Pay out
+   * default then falling to whatever is genuinely still owed.
+   */
+  const advances = doc.state === 'posted' && doc.residual > 0 && doc.partner_id
+    ? await listPayments(orgId, {
+      partnerId: doc.partner_id, side: meta.side, direction: payDirection, unallocatedOnly: true,
+    })
+    : [];
+  const advanceTotal = advances.reduce((t, p) => t + p.unallocated, 0);
+  // Applying the advances covers this much of the bill; the rest is the
+  // payment that still has to leave the bank.
+  const afterAdvances = Math.max(0, doc.residual - advanceTotal);
   const overdueDays = doc.residual > 0 && doc.due_date ? daysBetween(doc.due_date, today) : 0;
 
   return (
@@ -56,6 +79,14 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
             {doc.state === 'posted' && overdueDays > 0 && (
               <Chip state="overdue" label={`${overdueDays} days overdue`} />
             )}
+            {/*
+              A plain anchor, not a form: a download is a GET, so the link works
+              from a right-click, can be copied, and does not need this page to
+              still be mounted when the file arrives.
+            */}
+            <a href={`/api/exports/document/${doc.id}`} className={btn.ghost}>
+              Export to Excel
+            </a>
           </>
         }
       />
@@ -72,6 +103,29 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
                   className="text-brand hover:underline">{doc.partner_name}</Link>],
               ['Date', fmtDate(doc.doc_date)],
               ['Due', fmtDate(doc.due_date)],
+              /*
+               * THE GST IDENTITY AND THE PLACE OF SUPPLY, shown always rather
+               * than only when set.
+               *
+               * A missing GSTIN on a B2B invoice and a missing place of supply
+               * are both defects — the first costs the customer their input
+               * credit, the second is the field that decides whether the tax
+               * charged was the right one. Hiding the row when it is empty
+               * hides the defect; an em dash in a labelled row is a question
+               * the person looking at the document can answer.
+               */
+              ['GSTIN', doc.partner_gstin ?? '—'],
+              ...(doc.partner_gst_name ? [['Registered name', doc.partner_gst_name] as [string, string]] : []),
+              ['Place of supply', stateName(doc.place_of_supply) ?? '—'],
+              ...(doc.order_ref ? [[
+                'Order reference',
+                `${doc.order_ref}${doc.order_date ? ` · ${fmtDate(doc.order_date)}` : ''}`,
+              ] as [string, string]] : []),
+              ...(doc.irn ? [['IRN',
+                <span key="irn" className="break-all text-[12px] num !text-left">
+                  {doc.irn}
+                  {doc.irn_ack_no && <span className="text-ink-faint"> · ack {doc.irn_ack_no}</span>}
+                </span>] as [string, React.ReactNode]] : []),
               ...(doc.supplier_ref ? [['Supplier reference', doc.supplier_ref] as [string, string]] : []),
               ...(doc.booking_id ? [['Booking',
                 <Link key="b" href={`/bookings/${doc.booking_id}`} className="text-brand hover:underline">
@@ -90,21 +144,43 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
             <Table>
               <thead>
                 <tr>
-                  <Th>Description</Th><Th>Account</Th><Th>Analytic</Th>
-                  <Th align="right">Qty</Th><Th align="right">Price</Th><Th align="right">Disc</Th>
+                  <Th>Description</Th><Th>HSN / SAC</Th><Th>Account</Th><Th>Analytic</Th>
+                  <Th align="right">Qty</Th><Th align="right">MRP</Th>
+                  <Th align="right">Price</Th><Th align="right">Disc</Th>
                   <Th>Tax</Th><Th align="right">Subtotal</Th><Th align="right">Tax</Th><Th align="right">Total</Th>
                 </tr>
               </thead>
               <tbody>
                 {lines.map((l) => (
                   <tr key={l.id}>
-                    <Td><span className="font-semibold">{l.name}</span></Td>
+                    <Td>
+                      <span className="font-semibold">{l.name}</span>
+                      {l.variant && <div className="text-[11.5px] text-ink-faint">{l.variant}</div>}
+                    </Td>
+                    <Td><span className="num !text-left text-ink-muted">{l.hsn_code ?? '—'}</span></Td>
                     <Td><span className="text-ink-muted">{l.account_code} {l.account_name}</span></Td>
                     <Td><span className="text-ink-muted">{l.analytic_name ?? '—'}</span></Td>
                     <Td align="right"><span className="num">{qtyFromMilli(l.qty_milli)}</span></Td>
+                    <Td align="right"><Money value={l.mrp} /></Td>
                     <Td align="right"><Money value={l.unit_price} dash={false} /></Td>
                     <Td align="right"><span className="num">{l.discount_bps ? bpsToPct(l.discount_bps) : '—'}</span></Td>
-                    <Td><span className="text-ink-muted">{l.tax_name ?? '—'}</span></Td>
+                    <Td>
+                      <span className="text-ink-muted">{l.tax_name ?? '—'}</span>
+                      {/*
+                        THE COMPONENTS, FROM THE STORED SPLIT.
+                        "GST 5%" is what the line was charged under; "CGST 2.5%
+                        10.69 · SGST 2.5% 10.69" is what the ledger did and what
+                        the return is filed on. These are read from the split
+                        written when the document was saved, NOT recomputed from
+                        the tax table — so a rate changed since does not quietly
+                        restate an invoice already issued.
+                      */}
+                      {(lineTaxes.get(l.id) ?? []).map((t) => (
+                        <div key={t.id} className="text-[11.5px] text-ink-faint">
+                          {t.tax_name} · {fmt(t.amount)}
+                        </div>
+                      ))}
+                    </Td>
                     <Td align="right"><Money value={l.subtotal} dash={false} /></Td>
                     <Td align="right"><Money value={l.tax_amount} /></Td>
                     <Td align="right"><Money value={l.total} bold dash={false} /></Td>
@@ -113,13 +189,13 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
               </tbody>
               <tfoot>
                 <tr>
-                  <Td colSpan={7} />
+                  <Td colSpan={9} />
                   <Td align="right"><span className="text-[11px] font-bold uppercase text-ink-faint">Subtotal</span></Td>
                   <Td align="right"><span className="text-[11px] font-bold uppercase text-ink-faint">Tax</span></Td>
                   <Td align="right"><span className="text-[11px] font-bold uppercase text-ink-faint">Total</span></Td>
                 </tr>
                 <tr>
-                  <Td colSpan={7} />
+                  <Td colSpan={9} />
                   <Td align="right"><Money value={doc.untaxed} dash={false} /></Td>
                   <Td align="right"><Money value={doc.tax_total} dash={false} /></Td>
                   <Td align="right"><Money value={doc.total} bold dash={false} /></Td>
@@ -182,13 +258,30 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
 
             <div className="mt-5 flex flex-col gap-2 no-print">
               {doc.state === 'draft' && (
-                <form action={postDocumentAction}>
-                  <input type="hidden" name="id" value={doc.id} />
-                  <input type="hidden" name="doc_type" value={doc.doc_type} />
-                  <button className={`${btn.primary} w-full`}>Post to the ledger</button>
-                </form>
+                <>
+                  <form action={postDocumentAction}>
+                    <input type="hidden" name="id" value={doc.id} />
+                    <input type="hidden" name="doc_type" value={doc.doc_type} />
+                    <button className={`${btn.primary} w-full`}>Post to the ledger</button>
+                  </form>
+                  {/* Only here, and only while it is a draft: once posted the
+                      document is immutable and the correction is a reversal. */}
+                  <Link href={`${basePath}/${doc.id}/edit`} className={`${btn.ghost} w-full text-center`}>
+                    Edit draft
+                  </Link>
+                </>
               )}
-              {doc.state === 'posted' && (
+              {/* Reversing is refused while anything is allocated (see
+                  `reverseDocument`), so say why here rather than offering a
+                  button whose only outcome is that error. */}
+              {doc.state === 'posted' && allocations.length > 0 && (
+                <p className="text-[12px] text-ink-faint">
+                  {fmt(allocations.reduce((t, a) => t + a.amount, 0))} is settled against this
+                  document, so it cannot be reversed. Remove it under Settlements first — or
+                  raise a credit note if the money is staying where it is.
+                </p>
+              )}
+              {doc.state === 'posted' && allocations.length === 0 && (
                 <form action={reverseDocumentAction} className="space-y-2">
                   <input type="hidden" name="id" value={doc.id} />
                   <input type="hidden" name="doc_type" value={doc.doc_type} />
@@ -200,6 +293,34 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
             </div>
           </Card>
 
+          {advances.length > 0 && (
+            <Card title="Advance on account"
+              subtitle={`${fmt(advanceTotal)} already paid to ${doc.partner_name} with nothing against it. Apply it before paying the rest.`}>
+              <div className="space-y-3">
+                {advances.map((p) => {
+                  const applicable = Math.min(p.unallocated, doc.residual);
+                  return (
+                    <form key={p.id} action={allocateAction}
+                      className="flex flex-wrap items-center gap-2 border-b border-line pb-3 last:border-0 last:pb-0">
+                      <input type="hidden" name="payment_id" value={p.id} />
+                      <input type="hidden" name="document_id" value={doc.id} />
+                      <input type="hidden" name="return_to" value={`${basePath}/${doc.id}`} />
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[13px] font-bold">{p.number}</div>
+                        <div className="text-[11.5px] text-ink-faint">
+                          {fmtDate(p.pay_date)} · {titleise(p.method)} · {fmt(p.unallocated)} unapplied
+                        </div>
+                      </div>
+                      <input name="amount" defaultValue={(applicable / 100).toFixed(2)}
+                        inputMode="decimal" className={`${inputClass} w-[110px] text-right`} />
+                      <button className={btn.ghost}>Apply</button>
+                    </form>
+                  );
+                })}
+              </div>
+            </Card>
+          )}
+
           {doc.state === 'posted' && doc.residual > 0 && (
             <Card title={settleVerb}>
               <form action={registerPaymentAction} className="space-y-3">
@@ -210,7 +331,9 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
                 <input type="hidden" name="booking_id" value={doc.booking_id ?? ''} />
                 <input type="hidden" name="return_to" value={`${basePath}/${doc.id}`} />
                 <Field label="Amount">
-                  <input name="amount" defaultValue={(doc.residual / 100).toFixed(2)}
+                  {/* Defaults to what is left AFTER the advances above are
+                      applied, so the obvious path does not pay twice. */}
+                  <input name="amount" defaultValue={(afterAdvances / 100).toFixed(2)}
                     inputMode="decimal" className={`${inputClass} text-right`} />
                 </Field>
                 <Field label="Date">
@@ -237,6 +360,7 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
               <p className="mt-3 text-[12px] text-ink-faint">
                 The bank account chosen decides which journal the entry lands in, and the amount
                 is allocated to this document straight away.
+                {advanceTotal > 0 && ` ${fmt(advanceTotal)} of advance is already with this partner — the amount above is what remains once it is applied.`}
               </p>
             </Card>
           )}

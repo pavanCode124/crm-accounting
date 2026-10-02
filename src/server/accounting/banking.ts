@@ -4,6 +4,7 @@ import { postEntry, PostingError, type Actor } from './engine';
 import { createPayment } from './payments';
 import { requireSetting } from './settings';
 import { audit } from './audit';
+import { upsertAccount, upsertJournal } from './masters';
 import { daysBetween } from '@/lib/accounting';
 
 /**
@@ -21,6 +22,8 @@ export interface BankAccountRow {
   id: string; name: string; bank_name: string | null; account_no: string | null;
   ifsc: string | null; currency: string; is_cash: number; account_id: string;
   journal_id: string | null; active: number; balance?: number; unreconciled?: number;
+  branch_name: string | null; swift: string | null; upi_id: string | null;
+  note: string | null; is_default: number;
 }
 
 export async function listBankAccounts(orgId: string): Promise<BankAccountRow[]> {
@@ -31,7 +34,7 @@ export async function listBankAccounts(orgId: string): Promise<BankAccountRow[]>
             COALESCE((SELECT COUNT(*) FROM bank_transactions bt
                        WHERE bt.bank_account_id = ba.id AND bt.state='unreconciled'),0) AS unreconciled
        FROM bank_accounts ba WHERE ba.org_id = ? AND ba.active = 1
-      ORDER BY ba.is_cash, ba.name`, orgId,
+      ORDER BY ba.is_cash, ba.is_default DESC, ba.name`, orgId,
   );
 }
 
@@ -425,5 +428,221 @@ export async function transfer(orgId: string, opts: {
         { accountId: from.account_id, credit: opts.amount, label },
       ],
     }, actor);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The bank & cash account MASTER
+// ---------------------------------------------------------------------------
+/**
+ * Creating a bank account is three records, not one, and that is the whole
+ * reason this lives in a service rather than in a form handler.
+ *
+ *   1. A GL ACCOUNT (`asset_cash`) — without it the account has no balance,
+ *      appears on no balance sheet, and no payment can post to it.
+ *   2. A JOURNAL of type bank or cash, with its own numbering sequence — this
+ *      is what makes receipts into that account land in ITS bank book with ITS
+ *      entry numbers instead of being folded into another account's.
+ *   3. The `bank_accounts` row itself, which is what the Banking screen lists
+ *      and what every money form offers in its dropdown.
+ *
+ * Done by hand through three separate screens, the usual outcome is a bank
+ * account with a GL account and no journal: it shows a balance, and every
+ * payment into it fails at posting time with "this bank account has no journal
+ * configured". Doing all three in one transaction is what makes "add a bank"
+ * an operation an agency's own admin can perform.
+ */
+
+export interface BankAccountInput {
+  id?: string;
+  name: string;
+  bankName?: string | null;
+  accountNo?: string | null;
+  ifsc?: string | null;
+  branchName?: string | null;
+  swift?: string | null;
+  upiId?: string | null;
+  note?: string | null;
+  currency?: string;
+  isCash?: boolean;
+  isDefault?: boolean;
+  /** An existing GL account to attach to, instead of minting a new one. */
+  accountId?: string | null;
+  /** An existing journal to post through, instead of minting a new one. */
+  journalId?: string | null;
+}
+
+/** The next free code in the bank/cash block, so the chart stays orderly. */
+async function nextCashAccountCode(orgId: string, isCash: boolean): Promise<string> {
+  // Cash sits at 100000+, banks at 101000+ — the same blocks the seeded chart
+  // uses, so an account added in year three files beside the ones from day one.
+  const base = isCash ? 100000 : 101000;
+  const taken = new Set((await all<{ code: string }>(
+    'SELECT code FROM accounts WHERE org_id = ?', orgId,
+  )).map((r) => r.code));
+  for (let n = base; n < base + 900; n += isCash ? 10 : 100) {
+    const code = String(n);
+    if (!taken.has(code)) return code;
+  }
+  throw new PostingError('No free account code is left in the bank and cash block.');
+}
+
+/** A journal code that is short, legible and not already in use. */
+async function nextJournalCode(orgId: string, name: string, isCash: boolean): Promise<string> {
+  const taken = new Set((await all<{ code: string }>(
+    'SELECT code FROM journals WHERE org_id = ?', orgId,
+  )).map((r) => r.code.toUpperCase()));
+  const letters = name.toUpperCase().replace(/[^A-Z]/g, '');
+  const stem = (letters.slice(0, 3) || (isCash ? 'CSH' : 'BNK')).padEnd(3, 'X');
+  if (!taken.has(stem)) return stem;
+  for (let n = 2; n < 100; n += 1) {
+    const code = `${stem.slice(0, 2)}${n}`;
+    if (!taken.has(code)) return code;
+  }
+  throw new PostingError('Could not derive an unused journal code for this account.');
+}
+
+export async function upsertBankAccount(
+  orgId: string, b: BankAccountInput, actor: Actor = {},
+): Promise<string> {
+  return await tx(async () => {
+    const name = b.name.trim();
+    if (!name) throw new PostingError('The account needs a name.');
+    const isCash = !!b.isCash;
+    const currency = (b.currency ?? 'INR').trim().toUpperCase() || 'INR';
+
+    // Names are what people pick from in a dropdown. Two accounts called
+    // "HDFC" is a receipt filed by coin-flip, so the collision is refused here
+    // rather than discovered during a reconciliation.
+    const clash = await one<{ id: string }>(
+      'SELECT id FROM bank_accounts WHERE org_id=? AND active=1 AND LOWER(name)=LOWER(?) AND id <> ?',
+      orgId, name, b.id ?? '',
+    );
+    if (clash) throw new PostingError(`Another account is already called "${name}".`);
+
+    if (b.id) {
+      const existing = await one<{ account_id: string; is_cash: number }>(
+        'SELECT account_id, is_cash FROM bank_accounts WHERE id=? AND org_id=?', b.id, orgId,
+      );
+      if (!existing) throw new PostingError('Unknown bank account.');
+      await run(
+        `UPDATE bank_accounts SET name=?, bank_name=?, account_no=?, ifsc=?, branch_name=?,
+                swift=?, upi_id=?, note=?, currency=?
+           WHERE id=? AND org_id=?`,
+        name, b.bankName ?? null, b.accountNo ?? null, (b.ifsc ?? '').toUpperCase() || null,
+        b.branchName ?? null, (b.swift ?? '').toUpperCase() || null, b.upiId ?? null,
+        b.note ?? null, currency, b.id, orgId,
+      );
+      // The GL account carries the same name, so the trial balance and the
+      // Banking screen never disagree about what an account is called.
+      await run('UPDATE accounts SET name=? WHERE id=? AND org_id=?', name, existing.account_id, orgId);
+      if (b.isDefault) await setDefaultBankAccount(orgId, b.id, actor);
+      await audit(orgId, actor, 'modified', 'bank_account', b.id, name);
+      return b.id;
+    }
+
+    const bankAccountId = id('bnk');
+
+    const accountId = b.accountId ?? await upsertAccount(orgId, {
+      code: await nextCashAccountCode(orgId, isCash),
+      name,
+      kind: 'asset_cash',
+      // NOT reconcilable. A bank account is reconciled against a STATEMENT, on
+      // the Reconciliation screen; the reconcilable flag is for control
+      // accounts whose lines match off against each other. See masters.ts.
+      reconcilable: false,
+      currency: currency === 'INR' ? null : currency,
+      description: `${isCash ? 'Cash' : 'Bank'} account — ${b.bankName ?? name}`,
+    }, actor);
+
+    const journalId = b.journalId ?? await upsertJournal(orgId, {
+      code: await nextJournalCode(orgId, name, isCash),
+      name,
+      type: isCash ? 'cash' : 'bank',
+      defaultAccountId: accountId,
+      currency: currency === 'INR' ? null : currency,
+    }, actor);
+
+    await run(
+      `INSERT INTO bank_accounts (id, org_id, name, bank_name, account_no, ifsc, branch_name,
+                                  swift, upi_id, note, currency, is_cash, account_id, journal_id,
+                                  is_default, active)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,1)`,
+      bankAccountId, orgId, name, b.bankName ?? null, b.accountNo ?? null,
+      (b.ifsc ?? '').toUpperCase() || null, b.branchName ?? null,
+      (b.swift ?? '').toUpperCase() || null, b.upiId ?? null, b.note ?? null,
+      currency, isCash ? 1 : 0, accountId, journalId,
+    );
+    // The journal points back, which is what `journals.bank_account_id` is for
+    // and what the Cash Book and Bank Book reports read.
+    await run('UPDATE journals SET bank_account_id=? WHERE id=?', bankAccountId, journalId);
+
+    // The first account an org ever creates becomes the default by definition —
+    // otherwise the forms would open on nothing at all.
+    const anyDefault = await one<{ id: string }>(
+      'SELECT id FROM bank_accounts WHERE org_id=? AND is_default=1 AND active=1', orgId,
+    );
+    if (b.isDefault || !anyDefault) await setDefaultBankAccount(orgId, bankAccountId, actor);
+
+    await audit(orgId, actor, 'created', 'bank_account', bankAccountId,
+      `${name}${b.bankName ? ` · ${b.bankName}` : ''}`);
+    return bankAccountId;
+  });
+}
+
+/** Exactly one default per org, enforced by clearing the rest in the same transaction. */
+export async function setDefaultBankAccount(orgId: string, bankAccountId: string, actor: Actor = {}) {
+  return await tx(async () => {
+    const row = await one<{ name: string }>(
+      'SELECT name FROM bank_accounts WHERE id=? AND org_id=? AND active=1', bankAccountId, orgId,
+    );
+    if (!row) throw new PostingError('Unknown bank account.');
+    await run('UPDATE bank_accounts SET is_default=0 WHERE org_id=?', orgId);
+    await run('UPDATE bank_accounts SET is_default=1 WHERE id=? AND org_id=?', bankAccountId, orgId);
+    await audit(orgId, actor, 'modified', 'bank_account', bankAccountId, `${row.name} is now the default`);
+  });
+}
+
+/**
+ * Retire an account. NEVER deleted.
+ *
+ * Its GL account keeps every posting that ever went through it — the balance
+ * sheet for last year has to keep adding up — so this hides it from the
+ * dropdowns and nothing more. It is refused while the account still holds
+ * money or has statement lines nobody has explained, because both of those are
+ * someone's unfinished work and hiding the account is how it gets forgotten.
+ */
+export async function archiveBankAccount(orgId: string, bankAccountId: string, actor: Actor = {}) {
+  return await tx(async () => {
+    const row = await getBankAccount(orgId, bankAccountId);
+    if (!row) throw new PostingError('Unknown bank account.');
+    if ((row.balance ?? 0) !== 0) {
+      throw new PostingError(
+        `${row.name} still holds a balance. Transfer it to another account first — an archived ` +
+        'account keeps its balance on the balance sheet with no screen left to explain it.',
+      );
+    }
+    const pending = await scalar(
+      `SELECT COUNT(*) FROM bank_transactions WHERE org_id=? AND bank_account_id=? AND state='unreconciled'`,
+      orgId, bankAccountId,
+    );
+    if (pending > 0) {
+      throw new PostingError(`${row.name} has ${pending} statement line(s) still to be reconciled.`);
+    }
+    await run('UPDATE bank_accounts SET active=0, is_default=0 WHERE id=? AND org_id=?', bankAccountId, orgId);
+    await run('UPDATE journals SET active=0 WHERE bank_account_id=? AND org_id=?', bankAccountId, orgId);
+    await audit(orgId, actor, 'modified', 'bank_account', bankAccountId, `${row.name} archived`);
+
+    // The org must never be left with no default, or every money form opens on
+    // whatever sorts first.
+    const stillDefault = await one<{ id: string }>(
+      'SELECT id FROM bank_accounts WHERE org_id=? AND is_default=1 AND active=1', orgId,
+    );
+    if (!stillDefault) {
+      const next = await one<{ id: string }>(
+        'SELECT id FROM bank_accounts WHERE org_id=? AND active=1 ORDER BY is_cash, name LIMIT 1', orgId,
+      );
+      if (next) await setDefaultBankAccount(orgId, next.id, actor);
+    }
   });
 }

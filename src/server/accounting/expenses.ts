@@ -4,6 +4,7 @@ import { postEntry, PostingError, type Actor } from './engine';
 import { requireSetting } from './settings';
 import { audit } from './audit';
 import { pct } from '@/lib/money';
+import { formatDocNumber } from '@/lib/accounting';
 
 /**
  * Employee expenses, employee advances and agent commissions
@@ -52,13 +53,16 @@ export async function createExpense(input: ExpenseInput, actor: Actor = {}): Pro
 }
 
 async function nextExpenseNumber(orgId: string): Promise<string> {
-  const seq = await one<{ next_no: number }>("SELECT next_no FROM sequences WHERE org_id=? AND code='expense' FOR UPDATE", orgId);
+  // Prefix and padding off the row, so Settings → Numbering reaches this series
+  // too. 'EXP' below only seeds one that does not exist yet.
+  const seq = await one<{ prefix: string; padding: number; next_no: number }>(
+    "SELECT prefix, padding, next_no FROM sequences WHERE org_id=? AND code='expense' FOR UPDATE", orgId);
   if (!seq) {
     await run("INSERT INTO sequences (org_id, code, prefix, padding, next_no) VALUES (?,'expense','EXP',4,2)", orgId);
-    return 'EXP-0001';
+    return formatDocNumber('EXP', 4, 1);
   }
   await run("UPDATE sequences SET next_no = next_no + 1 WHERE org_id=? AND code='expense'", orgId);
-  return `EXP-${String(seq.next_no).padStart(4, '0')}`;
+  return formatDocNumber(seq.prefix, seq.padding, seq.next_no);
 }
 
 export async function submitExpense(orgId: string, expenseId: string, actor: Actor = {}) {
@@ -206,18 +210,41 @@ export async function listExpenses(orgId: string, opts: { state?: string; limit?
 // ---------------------------------------------------------------------------
 
 /**
+ * What a commission is a percentage OF.
+ *
+ * `'margin'` is the old name for `'profit'` and is kept so that commissions
+ * calculated before the rename still read back as what they were.
+ */
+export type CommissionBasis = 'revenue' | 'profit' | 'margin';
+
+export function commissionBasisLabel(basis: string): string {
+  return basis === 'revenue' ? 'Revenue' : 'Profit';
+}
+
+/**
  * Compute and record a commission.
  *
  * `basis` matters and is not a detail. Commission on REVENUE rewards selling;
- * commission on MARGIN rewards selling profitably, and a travel agency that
+ * commission on PROFIT rewards selling profitably, and a travel agency that
  * pays on revenue will find its agents discounting the trip away. Both are
  * supported because both are used; the accounting is the same either way:
  *
  *   Commission expense Dr / Commission payable Cr
+ *
+ * PROFIT, not "gross margin", is the honest name for the second one. The base
+ * subtracts every P&L cost tagged to the trip — the direct hotel and flight
+ * cost, and equally the operating cost and the cab an employee paid for out of
+ * pocket. That is the same number Trip Profitability prints in its PROFIT
+ * column, and calling it a gross margin here while the report called it profit
+ * invited the reader to assume one of the two excluded overheads. It does not.
+ *
+ * `'margin'` is still accepted on the way in and still read back from rows
+ * written before the rename: it is the same basis under its old name, and a
+ * posted commission must never change the number it was calculated on.
  */
 export async function createCommission(orgId: string, input: {
   agentName: string; agentId?: string | null; bookingId: string;
-  basis: 'revenue' | 'margin'; rateBps?: number; fixedAmount?: number; dueDate?: string | null;
+  basis: CommissionBasis; rateBps?: number; fixedAmount?: number; dueDate?: string | null;
 }, actor: Actor = {}): Promise<string> {
   return await tx(async () => {
     const base = await commissionBase(orgId, input.bookingId, input.basis);
@@ -240,7 +267,7 @@ export async function createCommission(orgId: string, input: {
   });
 }
 
-async function commissionBase(orgId: string, bookingId: string, basis: 'revenue' | 'margin'): Promise<number> {
+async function commissionBase(orgId: string, bookingId: string, basis: CommissionBasis): Promise<number> {
   const analytic = await one<{ id: string }>(
     'SELECT id FROM analytic_accounts WHERE org_id=? AND booking_id=?', orgId, bookingId,
   );

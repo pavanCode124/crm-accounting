@@ -1,6 +1,7 @@
 import 'server-only';
 import { all, one, scalar } from '../db';
 import { isoDate } from '@/lib/accounting';
+import { searchTokens } from '@/lib/search';
 
 /**
  * Management accounting — trips, packages, agents, departments, branches.
@@ -353,9 +354,11 @@ export async function listBookings(orgId: string, opts: { status?: string; searc
   const params: Array<string | number> = [orgId];
   if (opts.status) { clauses.push('b.status = ?'); params.push(opts.status); }
   if (opts.search) {
-    clauses.push('(b.ref LIKE ? OR b.title LIKE ? OR b.destination LIKE ?)');
-    const like = `%${opts.search}%`;
-    params.push(like, like, like);
+    for (const token of searchTokens(opts.search)) {
+      clauses.push('(b.ref ILIKE ? OR b.title ILIKE ? OR b.destination ILIKE ? OR b.customer_name ILIKE ? OR b.agent_name ILIKE ?)');
+      const like = `%${token}%`;
+      params.push(like, like, like, like, like);
+    }
   }
   return await all<{
     id: string; ref: string; title: string; destination: string | null; status: string;

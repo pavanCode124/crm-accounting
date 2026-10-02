@@ -617,7 +617,8 @@ CREATE TABLE IF NOT EXISTS commissions (
   agent_id     TEXT,
   agent_name   TEXT NOT NULL,
   booking_id   TEXT REFERENCES bookings(id),
-  -- revenue | margin -- commission on the sale, or on what the trip actually made
+  -- revenue | profit -- commission on the sale, or on what the trip actually made.
+  -- 'margin' is the old name for 'profit'; rows written before the rename keep it.
   basis        TEXT NOT NULL DEFAULT 'revenue',
   rate_bps     BIGINT NOT NULL DEFAULT 0,
   fixed_amount BIGINT NOT NULL DEFAULT 0,
@@ -671,3 +672,270 @@ CREATE TABLE IF NOT EXISTS crm_links (
   PRIMARY KEY (org_id, kind, crm_id)
 );
 CREATE INDEX IF NOT EXISTS idx_crm_links_local ON crm_links(org_id, kind, local_id);
+
+-- ---------------------------------------------------------------------------
+-- Additive columns (scale-out release)
+-- ---------------------------------------------------------------------------
+-- `CREATE TABLE IF NOT EXISTS` above is a no-op once a table exists, so every
+-- column added after a schema has shipped has to be stated here explicitly.
+-- This file is re-executed on every cold start (see db.ts `ready()`), which
+-- makes these the migration: idempotent, ordered, and applied before the first
+-- query of the process.
+
+-- An agency is a legal entity, not just a display name. The invoice has to
+-- carry the registered name, the GSTIN and the place of supply, and the place
+-- of supply is what decides CGST+SGST against IGST — so `state_code` is a
+-- posting input, not decoration.
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS legal_name     TEXT;
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS email          TEXT;
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS phone          TEXT;
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS website        TEXT;
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS state_code     TEXT;
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS invoice_terms  TEXT;
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS invoice_footer TEXT;
+
+-- What a remittance advice has to print, and what an agency with eleven
+-- accounts needs in order to tell two HDFC currents apart in a dropdown.
+ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS branch_name TEXT;
+ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS swift       TEXT;
+ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS upi_id      TEXT;
+ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS note        TEXT;
+-- Exactly one account per org carries this, and it is what every money form
+-- opens on. Without it the first option alphabetically becomes the default by
+-- accident, which is how receipts end up in the wrong account.
+ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS is_default  BIGINT NOT NULL DEFAULT 0;
+
+-- Terms get retired, not deleted: an invoice posted on "30 days nett" must
+-- keep meaning that after the agency stops offering it.
+ALTER TABLE payment_terms ADD COLUMN IF NOT EXISTS active BIGINT NOT NULL DEFAULT 1;
+
+-- Which TDS rate was chosen on a vendor bill, not just the rupees it withheld.
+-- Without it, reopening a draft bill cannot show the deduction back to the
+-- user, and saving the edit would quietly drop it.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS withholding_tax_id TEXT;
+
+-- ---------------------------------------------------------------------------
+-- Statutory invoice detail (a GST tax invoice, and the statement that pays it)
+-- ---------------------------------------------------------------------------
+-- Everything below exists because a printed Indian tax invoice, and the payout
+-- statement a marketplace or OTA sends back against it, carry facts this schema
+-- could not hold. They were being lost at three separate points:
+--
+--   * the HSN/SAC code and the MRP are columns of the invoice itself, and Rule
+--     46 of the CGST Rules requires the HSN. There was nowhere to put either.
+--   * the PLACE OF SUPPLY is what decides CGST+SGST against IGST. The agency's
+--     own state was already stored; the customer's was not, so the comparison
+--     that chooses the tax had only one side of itself.
+--   * the per-component tax SPLIT was computed at posting and then discarded. A
+--     GSTR-1 return and every settlement statement want rate-wise IGST, CGST,
+--     SGST and cess per line, and recomputing them later reads today's tax rows
+--     rather than the ones the invoice was actually raised under.
+
+-- The buyer's own identity, as it has to be printed. `gst_name` is the
+-- registered trade name, which is routinely not the name the agency files them
+-- under; `city` and `state_code` are the place of supply.
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS gst_name         TEXT;
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS city             TEXT;
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS state_code       TEXT;
+ALTER TABLE partners ADD COLUMN IF NOT EXISTS shipping_address TEXT;
+
+-- What a product contributes to an invoice line when it is chosen. The HSN and
+-- the MRP are DEFAULTS copied onto the line, never read back at print time:
+-- editing a product must not retrospectively change what an invoice said.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS hsn_code TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS mrp      BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS variant  TEXT;
+
+-- The header fields a tax invoice and an e-invoice carry.
+--
+-- `place_of_supply` is a GST state code and a POSTING INPUT: compared against
+-- the agency's own state it is what makes a supply intra- or inter-state. It is
+-- snapshotted onto the document rather than read off the partner, because a
+-- customer who moves states must not change the tax on invoices already raised.
+--
+-- `irn` and its acknowledgement are what the Invoice Registration Portal
+-- returns when an invoice is registered. They are RECORDED, not generated: this
+-- product does not talk to the portal, and an invoice whose IRN cannot be
+-- stored cannot be reconciled against the portal's own report.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS place_of_supply TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS irn             TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS irn_ack_no      TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS irn_ack_date    TEXT;
+-- The customer's or the channel's own order reference, which is how a payout
+-- statement identifies the sale. `supplier_ref` is the other direction — the
+-- vendor's bill number on a purchase — and conflating the two left a sales
+-- invoice with nowhere to record the order it came from.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS order_ref       TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS order_date      TEXT;
+CREATE INDEX IF NOT EXISTS ix_doc_order ON documents(org_id, order_ref);
+
+ALTER TABLE document_lines ADD COLUMN IF NOT EXISTS hsn_code TEXT;
+-- The list price the discount is taken off, for the MRP column. Zero means not
+-- stated, which is a different fact from an MRP of nothing.
+ALTER TABLE document_lines ADD COLUMN IF NOT EXISTS mrp      BIGINT NOT NULL DEFAULT 0;
+
+-- The per-component tax split, STORED: one row per line per tax component.
+--
+-- This is the same `splits` the tax engine already computes in order to decide
+-- what to post; it is merely kept. Rebuilt whenever a draft's lines are saved
+-- and untouched afterwards, so a posted invoice's CGST at 2.5% stays 2.5% after
+-- the rate is changed for new business. `tax_group` is denormalised from the tax
+-- row because that is what a statement column is keyed on (IGST / CGST / SGST /
+-- CESS), and a tax later retired must not take the column heading of an invoice
+-- already raised under it.
+CREATE TABLE IF NOT EXISTS document_line_taxes (
+  id          TEXT PRIMARY KEY,
+  org_id      TEXT NOT NULL,
+  document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  line_id     TEXT NOT NULL REFERENCES document_lines(id) ON DELETE CASCADE,
+  tax_id      TEXT,
+  tax_name    TEXT NOT NULL,
+  tax_group   TEXT NOT NULL,          -- cgst | sgst | igst | cess | gst | other
+  rate_bps    BIGINT NOT NULL DEFAULT 0,
+  base        BIGINT NOT NULL DEFAULT 0,
+  amount      BIGINT NOT NULL DEFAULT 0,
+  account_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_dlt_doc  ON document_line_taxes(document_id);
+CREATE INDEX IF NOT EXISTS ix_dlt_line ON document_line_taxes(line_id);
+
+-- ---------------------------------------------------------------------------
+-- Settlements — the payout statement
+-- ---------------------------------------------------------------------------
+-- WHAT A SETTLEMENT IS. An agency that sells through an OTA or a marketplace is
+-- not paid per invoice. The channel collects from the traveller, keeps its
+-- commission, its shipping and storage charges and the GST on all of them,
+-- withholds TCS and TDS, and remits ONE net amount per cycle with a statement
+-- attached. Three figures in that statement matter to the books, and none of
+-- them is the invoice total:
+--
+--   customer payable   what the channel collected on the agency's behalf
+--   deductions         its charges, the GST on them, and the tax withheld
+--   net payout         what actually reaches the bank
+--
+-- WHY IT IS ITS OWN RECORD RATHER THAN A PAYMENT WITH A NOTE ON IT. Booking the
+-- net receipt against the invoices leaves the difference nowhere: receivables
+-- stay permanently short by the commission, the commission expense is never
+-- recognised, and the input GST on it is never claimed. Revenue and cost are
+-- both understated and the AR ageing fills with residuals nobody can clear. A
+-- settlement is the record that CARRIES the deductions, and posting it is what
+-- turns them into ledger entries.
+--
+-- POSTING reuses the machinery that already exists rather than adding a second
+-- copy of it: one journal entry for the charges (each charge debited, input GST
+-- debited, the receivable credited) and one ordinary inbound PAYMENT for the
+-- net, allocated across the documents in the cycle. See settlements.ts.
+CREATE TABLE IF NOT EXISTS settlements (
+  id             TEXT PRIMARY KEY,
+  org_id         TEXT NOT NULL,
+  number         TEXT,
+  -- The channel: a partner flagged as a customer, because it is who owes the
+  -- gross until the cycle settles.
+  partner_id     TEXT NOT NULL REFERENCES partners(id),
+  cycle_from     TEXT NOT NULL,
+  cycle_to       TEXT NOT NULL,
+  -- ORDER-LEVEL RATES, held on the header and applied per document, because
+  -- that is how the channel's own statement computes them: one commission
+  -- percentage for the cycle, one flat shipping charge per order. Storing the
+  -- resulting rupees per order (settlement_documents) AND the rate that
+  -- produced them is what lets the statement be reproduced exactly.
+  commission_bps  BIGINT NOT NULL DEFAULT 0,
+  charge_gst_bps  BIGINT NOT NULL DEFAULT 1800,  -- GST the channel charges on its own fees
+  shipping_charge BIGINT NOT NULL DEFAULT 0,     -- per delivered order
+  return_charge   BIGINT NOT NULL DEFAULT 0,     -- per cancelled or returned order
+  tcs_bps         BIGINT NOT NULL DEFAULT 0,
+  tds_bps         BIGINT NOT NULL DEFAULT 0,
+  -- Carried forward from the channel's previous statement. INFORMATIONAL: it is
+  -- already on the ledger as an unsettled receivable, so posting must not book
+  -- it a second time (plan section 49, Rule 2 — the ledger is the truth).
+  previous_unsettled BIGINT NOT NULL DEFAULT 0,
+  pay_date        TEXT,
+  utr             TEXT,                          -- the bank reference on the remittance
+  bank_account_id TEXT REFERENCES bank_accounts(id),
+  journal_id      TEXT REFERENCES journals(id),
+  state           TEXT NOT NULL DEFAULT 'draft', -- draft | posted | cancelled
+  -- Rolled up from the rows below on every change, never edited by hand.
+  customer_payable BIGINT NOT NULL DEFAULT 0,
+  deductions       BIGINT NOT NULL DEFAULT 0,
+  additions        BIGINT NOT NULL DEFAULT 0,
+  net_payout       BIGINT NOT NULL DEFAULT 0,
+  entry_id        TEXT REFERENCES journal_entries(id),
+  payment_id      TEXT REFERENCES payments(id),
+  note            TEXT,
+  created_by TEXT, created_at TEXT NOT NULL,
+  posted_by  TEXT, posted_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_settle_partner ON settlements(org_id, partner_id, cycle_to);
+CREATE INDEX IF NOT EXISTS ix_settle_state   ON settlements(org_id, state, cycle_to);
+
+-- One row per document in the cycle: the order-level half of the statement.
+-- Every figure is computed from the settlement's rates and the document's own
+-- gross, and recomputed whenever either changes.
+CREATE TABLE IF NOT EXISTS settlement_documents (
+  id             TEXT PRIMARY KEY,
+  org_id         TEXT NOT NULL,
+  settlement_id  TEXT NOT NULL REFERENCES settlements(id) ON DELETE CASCADE,
+  document_id    TEXT NOT NULL REFERENCES documents(id),
+  -- forward = a sale being paid for; return = a credit note being clawed back.
+  -- The channel splits its statement on exactly this line, and so does the
+  -- exported workbook.
+  kind           TEXT NOT NULL DEFAULT 'forward',
+  gross          BIGINT NOT NULL DEFAULT 0,
+  commission     BIGINT NOT NULL DEFAULT 0,
+  commission_gst BIGINT NOT NULL DEFAULT 0,
+  shipping       BIGINT NOT NULL DEFAULT 0,
+  shipping_gst   BIGINT NOT NULL DEFAULT 0,
+  return_fee     BIGINT NOT NULL DEFAULT 0,
+  return_gst     BIGINT NOT NULL DEFAULT 0,
+  tcs            BIGINT NOT NULL DEFAULT 0,
+  tds            BIGINT NOT NULL DEFAULT 0,
+  deductions     BIGINT NOT NULL DEFAULT 0,
+  additions      BIGINT NOT NULL DEFAULT 0,
+  payout         BIGINT NOT NULL DEFAULT 0,
+  -- What the statement reports back about this order, which is not the same
+  -- fact as what the ledger knows: a channel can mark an order SUCCESS in a
+  -- cycle it has not actually remitted yet.
+  status         TEXT NOT NULL DEFAULT 'PENDING',
+  UNIQUE (settlement_id, document_id)
+);
+CREATE INDEX IF NOT EXISTS ix_sd_settlement ON settlement_documents(settlement_id);
+CREATE INDEX IF NOT EXISTS ix_sd_document   ON settlement_documents(document_id);
+
+-- The cycle-level charges: storage, advertising, recall, a credit or debit note
+-- the channel raised, a reimbursement for inventory it lost. They belong to the
+-- CYCLE rather than to any one order, which is exactly why they cannot live on
+-- settlement_documents and why the statement prints them in their own block.
+--
+-- `section` decides the sign at posting: a deduction reduces the payout and is
+-- debited to its account; an addition increases it. `code` is the catalogue
+-- entry in settlements.ts, which owns the label and the default account.
+CREATE TABLE IF NOT EXISTS settlement_charges (
+  id            TEXT PRIMARY KEY,
+  org_id        TEXT NOT NULL,
+  settlement_id TEXT NOT NULL REFERENCES settlements(id) ON DELETE CASCADE,
+  seq           BIGINT NOT NULL DEFAULT 0,
+  code          TEXT NOT NULL,
+  label         TEXT NOT NULL,
+  section       TEXT NOT NULL DEFAULT 'deduction',  -- deduction | addition
+  amount        BIGINT NOT NULL DEFAULT 0,
+  gst_amount    BIGINT NOT NULL DEFAULT 0,
+  account_id    TEXT REFERENCES accounts(id),
+  note          TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_sc_settlement ON settlement_charges(settlement_id);
+
+-- A settlement clears the documents in its cycle without a payment row behind
+-- it: the cash that arrives is the NET, while the invoices are discharged for
+-- the GROSS, and the difference is the channel's charges rather than a receipt.
+-- Allocation stays the one mechanism that moves a residual (see
+-- `refreshResidual`), so the settlement writes allocation rows of its own and
+-- this column is what makes them traceable back to it.
+ALTER TABLE payment_allocations ADD COLUMN IF NOT EXISTS settlement_id TEXT;
+CREATE INDEX IF NOT EXISTS ix_alloc_settlement ON payment_allocations(settlement_id);
+
+-- The agency's own city, as a field rather than as the first line of its
+-- address. A payout statement has a "Supply City" column, and deriving it by
+-- splitting the free-text address on the first comma produced "Road No. 12" —
+-- confidently, and wrongly, on every row. An address is for printing; a city
+-- is a datum, and the two are not the same shape.
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS city TEXT;
