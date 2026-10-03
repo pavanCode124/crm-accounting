@@ -10,7 +10,7 @@ import {
   createDocument, updateDocument, postDocument, reverseDocument, createCreditNote, getDocument,
 } from '@/server/accounting/documents';
 import {
-  createPayment, postPayment, allocate, unallocate, applyCreditNote, reversePayment,
+  createPayment, postPayment, allocate, unallocate, applyCreditNote, applyCreditToSource, reversePayment,
 } from '@/server/accounting/payments';
 import { draftEntry, postDraft, postEntry, reverseEntry } from '@/server/accounting/engine';
 import {
@@ -24,7 +24,7 @@ import {
 } from '@/server/accounting/expenses';
 import { createAsset, confirmAsset, runDepreciation, createDeferral, runDeferrals } from '@/server/accounting/assets';
 import {
-  upsertAccount, setAccountReconcilable, upsertJournal, upsertPartner, createBooking,
+  upsertAccount, setAccountReconcilable, setAccountDefaultHsn, upsertJournal, upsertPartner, createBooking,
   upsertProduct, createBudget, resolvePartnerByName, findPartnerIdByName,
   upsertPaymentTerm, archivePaymentTerm, updateSequence,
   upsertAnalyticAccount, archiveAnalyticAccount,
@@ -169,8 +169,14 @@ export async function saveDocumentAction(formData: FormData) {
     // Typed, not chosen from a dropdown: a name with no match on this side
     // becomes a new partner here, so the customer/supplier never has to exist
     // beforehand for the first document against them to be raised.
+    // The GSTIN goes in with the name, not after it: a partner minted here by
+    // typing a name is created WITH its registration, and one that already
+    // exists without a registration has this one filled in. Either way it is
+    // typed once rather than once per invoice.
+    const partyGstin = opt(formData, 'party_gstin');
     const partnerId = await resolvePartnerByName(
       s.orgId, str(formData, 'partner_name'), isBill ? 'supplier' : 'customer', actorOf(s),
+      partyGstin,
     );
     const input = {
       orgId: s.orgId,
@@ -188,6 +194,7 @@ export async function saveDocumentAction(formData: FormData) {
       withholdingTaxId: opt(formData, 'withholding_tax_id'),
       note: opt(formData, 'note'),
       placeOfSupply: opt(formData, 'place_of_supply'),
+      partyGstin,
       irn: opt(formData, 'irn'),
       irnAckNo: opt(formData, 'irn_ack_no'),
       irnAckDate: opt(formData, 'irn_ack_date'),
@@ -227,7 +234,11 @@ export async function reverseDocumentAction(formData: FormData) {
 }
 
 export async function creditNoteAction(formData: FormData) {
-  const s = await requireCap('invoice.create');
+  // A note takes the capability of the side it is raised on: an agency that
+  // lets a purchase clerk cancel a hotel booking is not thereby letting them
+  // credit a customer.
+  const isBill = str(formData, 'doc_type') === 'in_invoice';
+  const s = await requireCap(isBill ? 'bill.create' : 'invoice.create');
   const sourceId = str(formData, 'id');
   const pctValue = parseFloat(str(formData, 'percent') || '100');
   const r = await guard(async () => {
@@ -236,13 +247,18 @@ export async function creditNoteAction(formData: FormData) {
       bps: Math.round(pctValue * 100),
       reason: str(formData, 'reason') || 'Cancellation',
     }, actorOf(s));
-    if (bool(formData, 'post_now')) await postDocument(s.orgId, noteId, actorOf(s));
+    if (bool(formData, 'post_now')) {
+      await postDocument(s.orgId, noteId, actorOf(s));
+      // Net it off the invoice it cancels straight away. A note left unmatched
+      // reads as a full refund owed to the customer — see `applyCreditToSource`.
+      await applyCreditToSource(s.orgId, noteId, actorOf(s));
+    }
     return noteId;
   });
-  if (r.error) back(`/sales/invoices/${sourceId}`, r);
+  if (r.error) back(`${isBill ? '/purchases/bills' : '/sales/invoices'}/${sourceId}`, r);
   const doc = await getDocument(s.orgId, r.value!);
   const path = doc?.doc_type === 'in_refund' ? '/purchases/debit-notes' : '/sales/credit-notes';
-  back(`${path}/${r.value}`, { ok: 'Credit note created.' });
+  back(`${path}/${r.value}`, { ok: isBill ? 'Debit note created.' : 'Credit note created.' });
 }
 
 // ---------------------------------------------------------------------------
@@ -661,6 +677,7 @@ export async function saveAccountAction(formData: FormData) {
     kind: str(formData, 'kind'),
     reconcilable: bool(formData, 'reconcilable'),
     description: opt(formData, 'description'),
+    defaultHsnCode: opt(formData, 'default_hsn_code'),
   }, actorOf(s)));
   // A failure bounces back to the FORM, not to the list. Sending it to the list
   // would show the reason the save failed on a page with no way to act on it,
@@ -683,6 +700,24 @@ export async function setReconcilableAction(formData: FormData) {
   const r = await guard(async () => await setAccountReconcilable(s.orgId, accountId, on, actorOf(s)));
   back(str(formData, 'return_to') || '/accounting/chart-of-accounts',
     r.error ? r : { ok: on ? 'Reconciliation allowed on this account.' : 'Reconciliation switched off.' });
+}
+
+/**
+ * The "Default HSN / SAC" box on the Chart of Accounts.
+ *
+ * Inline on the row rather than on a form of its own, because setting these is
+ * one pass down the chart — a dozen revenue and cost accounts, one code each,
+ * done once — and a page per account would make that a dozen round trips
+ * through a form with nine other fields on it.
+ */
+export async function setAccountHsnAction(formData: FormData) {
+  const s = await requireCap('coa.configure');
+  const accountId = str(formData, 'id');
+  const r = await guard(async () => await setAccountDefaultHsn(
+    s.orgId, accountId, opt(formData, 'default_hsn_code'), actorOf(s),
+  ));
+  back(str(formData, 'return_to') || '/accounting/chart-of-accounts',
+    r.error ? r : { ok: 'Default HSN / SAC saved.' });
 }
 
 export async function saveJournalAction(formData: FormData) {
@@ -920,6 +955,7 @@ export async function saveOrganisationAction(formData: FormData) {
     website: opt(formData, 'website'),
     invoiceTerms: opt(formData, 'invoice_terms'),
     invoiceFooter: opt(formData, 'invoice_footer'),
+    defaultHsnCode: opt(formData, 'default_hsn_code'),
   }, actorOf(s)));
   back('/settings/organisation', r.error ? r : { ok: 'Agency details saved.' });
 }

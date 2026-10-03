@@ -194,11 +194,21 @@ export async function listExpenses(orgId: string, opts: { state?: string; limit?
     id: string; number: string; employee_name: string; description: string;
     expense_date: string; amount: number; tax_amount: number; state: string;
     paid_by: string; account_name: string; analytic_name: string | null;
+    trip_booking_id: string | null; booking_ref: string | null;
   }>(
-    `SELECT e.*, a.name AS account_name, an.name AS analytic_name
+    // The trip is carried to the list as a BOOKING, not only as a name: the
+    // Trip column links the same way the Commissions screen links its Booking
+    // column, and a claim's trip is worth nothing to a reader who then has to
+    // go and find which booking it belongs to. `e.booking_id` wins over the
+    // analytic account's own booking because a claim filed against a booking
+    // directly is the more specific statement of the two.
+    `SELECT e.*, a.name AS account_name, an.name AS analytic_name,
+            COALESCE(e.booking_id, an.booking_id) AS trip_booking_id,
+            b.ref AS booking_ref
        FROM expenses e
        LEFT JOIN accounts a ON a.id = e.account_id
        LEFT JOIN analytic_accounts an ON an.id = e.analytic_id
+       LEFT JOIN bookings b ON b.id = COALESCE(e.booking_id, an.booking_id)
       WHERE ${clauses.join(' AND ')}
       ORDER BY e.expense_date DESC LIMIT ${opts.limit ?? 200}`,
     ...params,

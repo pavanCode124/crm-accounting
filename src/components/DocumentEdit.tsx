@@ -83,6 +83,10 @@ export async function DocumentEdit({ orgId, docId, basePath, role, message }: {
           withholdingTaxId: doc.withholding_tax_id ?? '',
           note: doc.note ?? '',
           placeOfSupply: doc.place_of_supply ?? '',
+          // `party_gstin` rather than the joined `partner_gstin`: reopening a
+          // draft has to show what the DOCUMENT says, blank included. Showing
+          // the partner's instead would silently adopt it on the next save.
+          partyGstin: doc.party_gstin ?? '',
           orderRef: doc.order_ref ?? '',
           orderDate: doc.order_date ?? '',
           irn: doc.irn ?? '',

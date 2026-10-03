@@ -63,10 +63,34 @@ export default async function NewAccountPage({ searchParams }: { searchParams: P
             </select>
           </Field>
 
-          <Field label="Description">
-            <input name="description" className={inputClass}
-              placeholder="What belongs on this account, for whoever posts to it next." />
-          </Field>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Description">
+              <input name="description" className={inputClass}
+                placeholder="What belongs on this account, for whoever posts to it next." />
+            </Field>
+            {/*
+              WHY AN HSN LIVES ON AN ACCOUNT.
+
+              Rule 46 requires an HSN (or a SAC, for a service) on every line of
+              a tax invoice, and nothing can work it out for you — it is a
+              classification the agency assigns and answers for. What it can do
+              is stop asking twice, and an account is the right place to answer
+              once: an account and a SAC classify the same thing from two
+              directions, so everything posted to Air Ticketing Revenue is
+              998551 and everything posted to Visa Charges is 998599.
+
+              A line takes its code from the product if it has one, from this if
+              it does not, and from the agency's default under Settings →
+              Organisation if neither is set. It is a DEFAULT, copied onto the
+              line and editable there — changing it here never restates an
+              invoice already raised.
+            */}
+            <Field label="Default HSN / SAC"
+              hint="Copied onto any invoice or bill line posted here. 4, 6 or 8 digits.">
+              <input name="default_hsn_code" inputMode="numeric" maxLength={8}
+                className={inputClass} placeholder="998599" />
+            </Field>
+          </div>
 
           <label className="flex items-start gap-2.5 rounded-[10px] border border-line px-3.5 py-3">
             <input type="checkbox" name="reconcilable" className="mt-0.5 h-4 w-4" />

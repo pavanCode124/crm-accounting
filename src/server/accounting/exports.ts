@@ -1,12 +1,18 @@
 import 'server-only';
 import { all, one } from '../db';
-import { fmtDate, titleise, DOC_TYPES, type DocType } from '@/lib/accounting';
+import { fmtDate, titleise, taxGroupLabel, DOC_TYPES, type DocType } from '@/lib/accounting';
 import { qtyFromMilli } from '@/lib/money';
 import {
   getDocument, documentLines, documentLineTaxes, taxByGroup, listDocuments,
   type DocRow, type DocLineRow, type LineTaxRow, type DocFilter,
 } from './documents';
 import { getOrganisation, stateName } from './organisation';
+import { taxReport, type TaxLine } from './reports';
+import {
+  tripDossier,
+  type TripDossier, type TripDocItemRow, type TripExpenseRow,
+  type TripCommissionRow, type TripPaymentRow, type TripLedgerRow,
+} from './analytics';
 import {
   getSettlement, settlementDocuments, settlementCharges, CHARGE_KINDS,
   type SettlementRow, type SettlementDocRow, type SettlementChargeRow,
@@ -685,6 +691,96 @@ export interface PayoutWorkbook {
 }
 
 /**
+ * The tax report, as the three things it is filed from.
+ *
+ * ONE SHEET PER RETURN, not one sheet of everything. GST goes to GSTR-3B by the
+ * 20th and TDS to a challan by the 7th, to two departments; a single blended
+ * sheet is how a figure ends up on the wrong form. The GST sheets carry the
+ * gross → notes → net breakdown the screen shows, because the number an officer
+ * queries is never the net — it is the credit note that produced it.
+ */
+export async function taxWorkbook(
+  orgId: string, p: { from: string; to: string },
+): Promise<Buffer> {
+  const t = await taxReport(orgId, p);
+  const s = await seller(orgId);
+
+  const head = (title: string): CellInput[][] => [
+    [text(s.name, 'title')],
+    [text(`GSTIN ${s.gstin ?? '—'}`, 'muted')],
+    [text(`${title} · ${fmtDate(p.from)} to ${fmtDate(p.to)}`, 'muted')],
+    [],
+  ];
+
+  const gstSheet = (
+    name: string, title: string, rows: TaxLine[],
+    total: number, base: number, notes: number, notesBase: number,
+    grossLabel: string, notesLabel: string,
+  ): Sheet => ({
+    name,
+    cols: [26, 14, 18, 18],
+    freezeRows: 5,
+    rows: [
+      ...head(title),
+      [text('Tax', 'header'), text('Group', 'header'),
+        text('Taxable value', 'header'), text('Tax', 'header')],
+      ...rows.map((r) => [
+        text(r.name), text(taxGroupLabel(r.tax_group)), money(r.base), money(r.amount),
+      ]),
+      [],
+      [text(grossLabel, 'bold'), null, money(base - notesBase), money(total - notes)],
+      [text(notesLabel, 'bold'), null, money(notesBase), money(notes)],
+      [text('Net', 'section'), { v: null, s: 'section' },
+        money(base, 'sectionMoney'), money(total, 'sectionMoney')],
+    ],
+  });
+
+  const summary: Sheet = {
+    name: 'Summary',
+    cols: [34, 20],
+    rows: [
+      ...head('Tax summary'),
+      [text('Output GST (collected)', 'bold'), money(t.outputTotal)],
+      [text('Input GST (credit)', 'bold'), money(t.inputTotal)],
+      [text('Net GST payable', 'section'), money(t.netPayable, 'sectionMoney')],
+      [],
+      [text('TDS withheld this period', 'bold'), money(t.withheldTotal)],
+      [text('TDS Payable outstanding', 'bold'), money(t.withheldUnpaid)],
+      [],
+      [text('GST is filed in GSTR-3B by the 20th; TDS is deposited by challan by the 7th.', 'muted')],
+      [text('The two are never set off against each other.', 'muted')],
+    ],
+  };
+
+  const withholding: Sheet = {
+    name: 'TDS',
+    cols: [30, 12, 10, 18, 18],
+    freezeRows: 5,
+    rows: [
+      ...head('Tax withheld from suppliers'),
+      [text('Section', 'header'), text('Type', 'header'), text('Rate', 'header'),
+        text('Amount paid', 'header'), text('Tax withheld', 'header')],
+      ...t.withheld.map((r) => [
+        text(r.name), text(taxGroupLabel(r.tax_group)), rate(r.rate_bps),
+        money(r.base), money(r.amount),
+      ]),
+      [],
+      [text('Total deducted', 'section'), { v: null, s: 'section' }, { v: null, s: 'section' },
+        { v: null, s: 'section' }, money(t.withheldTotal, 'sectionMoney')],
+    ],
+  };
+
+  return buildXlsx([
+    summary,
+    gstSheet('Output GST', 'Output GST', t.output, t.outputTotal, t.outputBase,
+      t.outputNotes, t.outputNotesBase, 'Invoices', 'Less credit notes'),
+    gstSheet('Input GST', 'Input GST', t.input, t.inputTotal, t.inputBase,
+      t.inputNotes, t.inputNotesBase, 'Bills', 'Less debit notes'),
+    withholding,
+  ]);
+}
+
+/**
  * THE statement: a channel payout cycle, in the three sheets the channels send.
  */
 export async function payoutWorkbook(orgId: string, settlementId: string): Promise<PayoutWorkbook | null> {
@@ -850,4 +946,462 @@ export async function documentWorkbook(orgId: string, docId: string): Promise<{ 
     cols: [5, 38, 12, 8, 12, 13, 8, 14, 9, 12, 9, 12, 9, 12, 12, 14],
   }]);
   return { buffer, doc };
+}
+
+// ---------------------------------------------------------------------------
+// The trip dossier workbook (plan sections 23 and 42)
+// ---------------------------------------------------------------------------
+
+/**
+ * ONE TRIP, DOWN TO THE RUPEE.
+ *
+ * The Trip Profitability report answers "what did this trip make". This
+ * workbook answers the question that always follows it — "where did it go" —
+ * and it is built in the same shape as the payout statement above, because
+ * that shape is what the agency's accountant already reads: a BREAKUP sheet
+ * that reconciles top to bottom, with the detail sheets behind it holding one
+ * row per line.
+ *
+ * THE LAST SHEET IS THE PROOF. `Ledger` is every posted analytic distribution
+ * on the trip, and its signed total is the trip's profit with the sign turned
+ * over — the engine writes cost positive and revenue negative. So a reader who
+ * distrusts the summary can add up the last column and arrive at the same
+ * figure, which is the only kind of management report worth handing to an
+ * auditor. Nothing on any sheet is computed twice from two sources.
+ *
+ * MIXED DOCUMENTS PRINT IN FULL. A supplier bill that covers two trips appears
+ * with all of its lines and an "On this trip" column saying which of them this
+ * trip carries. Printing only the tagged lines would make the document's own
+ * total unverifiable against the paper the supplier sent.
+ */
+
+const ITEM_HEADERS = [
+  'S.No.', 'Date', 'Document', 'Type', 'Party', 'GSTIN', 'Description', 'HSN / SAC',
+  'Account', 'Qty', 'Rate (Rs)', 'Disc %', 'Taxable (Rs)',
+  'IGST %', 'IGST (Rs)', 'CGST %', 'CGST (Rs)', 'SGST %', 'SGST (Rs)', 'Cess (Rs)',
+  'Total Tax (Rs)', 'Total (Rs)', 'On this trip',
+];
+
+const ITEM_COLS = [7, 12, 18, 14, 26, 18, 38, 12, 24, 8, 13, 8, 14, 8, 13, 8, 13, 8, 13, 11, 14, 14, 12];
+
+function itemSheet(
+  name: string, title: string, subtitle: string, rows: TripDocItemRow[],
+): Sheet {
+  const body: CellInput[][] = [
+    [text(title, 'title')],
+    [text(subtitle, 'muted')],
+    [],
+    ITEM_HEADERS.map((h) => text(h, 'header')),
+  ];
+
+  rows.forEach((r, i) => {
+    body.push([
+      { v: i + 1, s: 'int' },
+      text(fmtDate(r.doc_date)),
+      text(r.number),
+      text(DOC_TYPES[r.doc_type as DocType]?.short ?? r.doc_type),
+      text(r.partner_name),
+      text(r.partner_gstin),
+      text(r.name),
+      text(r.hsn_code),
+      text(r.account_code ? `${r.account_code} ${r.account_name}` : null),
+      { v: qtyFromMilli(r.qty_milli), s: 'int' },
+      money(r.unit_price),
+      rate(r.discount_bps),
+      money(r.taxable),
+      rate(r.igst_bps), moneyOrDash(r.igst),
+      rate(r.cgst_bps), moneyOrDash(r.cgst),
+      rate(r.sgst_bps), moneyOrDash(r.sgst),
+      moneyOrDash(r.cess),
+      money(r.tax_total),
+      money(r.total, 'moneyBold'),
+      text(r.on_trip ? 'Yes' : 'No'),
+    ]);
+  });
+
+  const sum = (f: (r: TripDocItemRow) => number) => rows.reduce((t, r) => t + f(r), 0);
+  const blank = (n: number) => Array.from({ length: n }, () => ({ v: null, s: 'section' as const }));
+  body.push([]);
+  body.push([
+    text('Total', 'section'), ...blank(11),
+    money(sum((r) => r.taxable), 'sectionMoney'),
+    { v: null, s: 'section' }, money(sum((r) => r.igst), 'sectionMoney'),
+    { v: null, s: 'section' }, money(sum((r) => r.cgst), 'sectionMoney'),
+    { v: null, s: 'section' }, money(sum((r) => r.sgst), 'sectionMoney'),
+    money(sum((r) => r.cess), 'sectionMoney'),
+    money(sum((r) => r.tax_total), 'sectionMoney'),
+    money(sum((r) => r.total), 'sectionMoney'),
+    { v: null, s: 'section' },
+  ]);
+
+  return { name, rows: body, cols: ITEM_COLS, freezeRows: 4, freezeCols: 3 };
+}
+
+function tripExpenseSheet(rows: TripExpenseRow[]): Sheet {
+  const headers = [
+    'S.No.', 'Claim', 'Date', 'Who', 'What', 'Account', 'Paid by',
+    'Amount (Rs)', 'Tax', 'Tax rate %', 'GST (Rs)', 'Claim total (Rs)',
+    'State', 'Still owed (Rs)', 'Journal entry', 'Approved by', 'Approved on', 'Receipt',
+  ];
+  const body: CellInput[][] = [
+    [text('Staff Expenses on this trip', 'title')],
+    [text('What people paid for themselves, and what the agency still owes them back.', 'muted')],
+    [],
+    headers.map((h) => text(h, 'header')),
+  ];
+
+  rows.forEach((e, i) => {
+    // Owed means POSTED and paid for by the employee: a draft claim is not a
+    // liability, and one the agency's own card paid was never owed to anyone.
+    const owed = e.state === 'posted' && e.paid_by === 'employee' ? e.amount + e.tax_amount : 0;
+    body.push([
+      { v: i + 1, s: 'int' },
+      text(e.number),
+      text(fmtDate(e.expense_date)),
+      text(e.employee_name),
+      text(e.description),
+      text(e.account_code ? `${e.account_code} ${e.account_name}` : null),
+      text(e.paid_by === 'employee' ? 'Employee (reimbursable)' : 'Company'),
+      money(e.amount),
+      text(e.tax_name),
+      rate(e.tax_rate_bps),
+      moneyOrDash(e.tax_amount),
+      money(e.amount + e.tax_amount, 'moneyBold'),
+      text(titleise(e.state)),
+      moneyOrDash(owed),
+      text(e.entry_no),
+      text(e.approved_by),
+      text(e.approved_at ? fmtDate(e.approved_at.slice(0, 10)) : null),
+      text(e.receipt),
+    ]);
+  });
+
+  const sum = (f: (e: TripExpenseRow) => number) => rows.reduce((t, e) => t + f(e), 0);
+  const live = rows.filter((e) => e.state !== 'refused' && e.state !== 'draft');
+  const blank = (n: number) => Array.from({ length: n }, () => ({ v: null, s: 'section' as const }));
+  body.push([]);
+  body.push([
+    text('Total claimed (excluding draft and refused)', 'section'), ...blank(6),
+    money(live.reduce((t, e) => t + e.amount, 0), 'sectionMoney'),
+    { v: null, s: 'section' }, { v: null, s: 'section' },
+    money(live.reduce((t, e) => t + e.tax_amount, 0), 'sectionMoney'),
+    money(live.reduce((t, e) => t + e.amount + e.tax_amount, 0), 'sectionMoney'),
+    { v: null, s: 'section' },
+    money(sum((e) => (e.state === 'posted' && e.paid_by === 'employee' ? e.amount + e.tax_amount : 0)), 'sectionMoney'),
+    ...blank(4),
+  ]);
+
+  return {
+    name: 'Staff Expenses',
+    rows: body,
+    cols: [7, 12, 12, 20, 40, 26, 22, 14, 18, 11, 13, 16, 12, 15, 15, 16, 14, 24],
+    freezeRows: 4,
+  };
+}
+
+function tripCommissionSheet(rows: TripCommissionRow[]): Sheet {
+  const headers = [
+    'S.No.', 'Agent', 'Calculated on', 'Rate %', 'Fixed (Rs)', 'Base (Rs)',
+    'Commission (Rs)', 'Payable on', 'State', 'Journal entry', 'Calculated on (date)',
+  ];
+  const body: CellInput[][] = [
+    [text('Agent Commission on this trip', 'title')],
+    [text('A commission on PROFIT is a share of the figure the Summary sheet arrives at — '
+      + 'so a cost booked after it was calculated does not change what was already posted.', 'muted')],
+    [],
+    headers.map((h) => text(h, 'header')),
+  ];
+
+  rows.forEach((c, i) => {
+    body.push([
+      { v: i + 1, s: 'int' },
+      text(c.agent_name),
+      text(c.basis === 'revenue' ? 'Revenue from the trip' : 'Profit from the trip'),
+      c.rate_bps ? rate(c.rate_bps) : text('fixed'),
+      moneyOrDash(c.fixed_amount),
+      money(c.base_amount),
+      money(c.amount, 'moneyBold'),
+      text(c.due_date ? fmtDate(c.due_date) : null),
+      text(titleise(c.state)),
+      text(c.entry_no),
+      text(fmtDate(c.created_at.slice(0, 10))),
+    ]);
+  });
+
+  const blank = (n: number) => Array.from({ length: n }, () => ({ v: null, s: 'section' as const }));
+  const posted = rows.filter((c) => c.state === 'posted' || c.state === 'paid')
+    .reduce((t, c) => t + c.amount, 0);
+  const draft = rows.filter((c) => c.state === 'draft').reduce((t, c) => t + c.amount, 0);
+  body.push([]);
+  body.push([text('On the books (posted and paid)', 'section'), ...blank(5),
+    money(posted, 'sectionMoney'), ...blank(4)]);
+  body.push([text('Calculated, not yet posted', 'section'), ...blank(5),
+    money(draft, 'sectionMoney'), ...blank(4)]);
+
+  return {
+    name: 'Commissions',
+    rows: body,
+    cols: [7, 26, 24, 10, 14, 16, 18, 14, 12, 15, 18],
+    freezeRows: 4,
+  };
+}
+
+function tripPaymentSheet(rows: TripPaymentRow[]): Sheet {
+  const headers = [
+    'S.No.', 'Payment', 'Date', 'In / Out', 'Against', 'Party', 'Account used',
+    'Method', 'Reference', 'Amount (Rs)', 'Unallocated (Rs)', 'Advance', 'State', 'Note',
+  ];
+  const body: CellInput[][] = [
+    [text('Money Movement', 'title')],
+    [text('Cash actually in and out against this trip, which is not the same as what was '
+      + 'invoiced or billed — a trip can be profitable and still unpaid.', 'muted')],
+    [],
+    headers.map((h) => text(h, 'header')),
+  ];
+
+  rows.forEach((p, i) => {
+    body.push([
+      { v: i + 1, s: 'int' },
+      text(p.number),
+      text(fmtDate(p.pay_date)),
+      text(p.direction === 'inbound' ? 'In' : 'Out'),
+      text(p.side === 'customer' ? 'Customer' : 'Supplier'),
+      text(p.partner_name),
+      text(p.journal_name),
+      text(titleise(p.method)),
+      text(p.reference),
+      money(p.amount, 'moneyBold'),
+      moneyOrDash(p.unallocated),
+      text(p.is_advance ? 'Yes' : 'No'),
+      text(titleise(p.state)),
+      text(p.note, 'wrap'),
+    ]);
+  });
+
+  const blank = (n: number) => Array.from({ length: n }, () => ({ v: null, s: 'section' as const }));
+  const inbound = rows.filter((p) => p.direction === 'inbound').reduce((t, p) => t + p.amount, 0);
+  const outbound = rows.filter((p) => p.direction === 'outbound').reduce((t, p) => t + p.amount, 0);
+  body.push([]);
+  body.push([text('Money in', 'section'), ...blank(8), money(inbound, 'sectionMoney'), ...blank(4)]);
+  body.push([text('Money out', 'section'), ...blank(8), money(outbound, 'sectionMoney'), ...blank(4)]);
+  body.push([text('Net cash on this trip', 'section'), ...blank(8),
+    money(inbound - outbound, 'sectionMoney'), ...blank(4)]);
+
+  return {
+    name: 'Money Movement',
+    rows: body,
+    cols: [7, 14, 12, 10, 12, 26, 22, 12, 20, 15, 16, 10, 12, 36],
+    freezeRows: 4,
+  };
+}
+
+function tripLedgerSheet(rows: TripLedgerRow[]): Sheet {
+  const headers = [
+    'S.No.', 'Date', 'Entry No.', 'Journal', 'Account code', 'Account', 'Type',
+    'Narration', 'Line label', 'Party', 'Raised from', 'Document',
+    'Line debit (Rs)', 'Line credit (Rs)', 'Share %', 'Charged to this trip (Rs)',
+  ];
+  const body: CellInput[][] = [
+    [text('Ledger — every posted line tagged to this trip', 'title')],
+    [text('Cost is positive and revenue negative, as the engine writes it. The last column '
+      + 'adds up to the trip’s profit with the sign reversed: that is the check.', 'muted')],
+    [],
+    headers.map((h) => text(h, 'header')),
+  ];
+
+  rows.forEach((l, i) => {
+    body.push([
+      { v: i + 1, s: 'int' },
+      text(fmtDate(l.entry_date)),
+      text(l.entry_no),
+      text(l.journal_code ? `${l.journal_code} ${l.journal_name}` : l.journal_name),
+      text(l.account_code),
+      text(l.account_name),
+      text(titleise(l.account_kind)),
+      text(l.narration),
+      text(l.label),
+      text(l.partner_name),
+      text(l.source_model ? titleise(l.source_model) : 'Manual'),
+      text(l.doc_number ?? l.reference),
+      moneyOrDash(l.debit),
+      moneyOrDash(l.credit),
+      rate(l.bps),
+      money(l.amount, 'moneyBold'),
+    ]);
+  });
+
+  const net = rows.reduce((t, l) => t + l.amount, 0);
+  const blank = (n: number) => Array.from({ length: n }, () => ({ v: null, s: 'section' as const }));
+  body.push([]);
+  body.push([text('Net charged to the trip', 'section'), ...blank(14), money(net, 'sectionMoney')]);
+  body.push([text('Trip profit (the same figure, sign reversed)', 'section'), ...blank(14),
+    money(-net, 'sectionMoney')]);
+
+  return {
+    name: 'Ledger',
+    rows: body,
+    cols: [7, 12, 14, 22, 13, 28, 14, 34, 34, 24, 14, 18, 16, 16, 9, 20],
+    freezeRows: 4,
+    freezeCols: 3,
+  };
+}
+
+/** A label/value pair on the summary sheet's header block. */
+function tripKv(k: string, v: string | number | null | undefined): CellInput[] {
+  return [null, null, text(k, 'bold'), typeof v === 'number' ? { v, s: 'int' as const } : text(v)];
+}
+
+function tripLine(
+  sNo: number | null, label: string, amount: number, note?: string,
+): CellInput[] {
+  return [
+    null,
+    sNo === null ? null : { v: sNo, s: 'int' as const },
+    label,
+    moneyOrDash(amount),
+    note ? text(note, 'muted') : null,
+  ];
+}
+
+function tripSection(label: string): CellInput[] {
+  return [null, null, text(label, 'section'), text('', 'section'), text('', 'section')];
+}
+
+function tripTotal(label: string, amount: number, note?: string): CellInput[] {
+  return [
+    null, null, text(label, 'section'), moneyOrDash(amount, 'sectionMoney'),
+    note ? text(note, 'section') : text('', 'section'),
+  ];
+}
+
+function tripSummarySheet(d: TripDossier, orgName: string): Sheet {
+  const b = d.booking;
+  const t = d.totals;
+  const pax = b?.pax ?? 0;
+
+  const rows: CellInput[][] = [
+    [],
+    [null, text(`${d.analytic.name} — Trip Profitability`, 'title')],
+    [null, null, text(orgName, 'muted')],
+    [],
+    tripSection('The trip'),
+    tripKv('Trip account', `${d.analytic.code} · ${d.analytic.name}`),
+    tripKv('Analytic plan', `${d.analytic.plan_code} · ${d.analytic.plan_name}`),
+    ...(b ? [
+      tripKv('Booking', `${b.ref} — ${b.title}`),
+      tripKv('Customer', b.customer_name ?? b.partner_name),
+      tripKv('Destination', b.destination),
+      tripKv('Package', b.package_name),
+      tripKv('Agent who closed it', b.agent_name),
+      tripKv('Travellers (pax)', pax),
+      tripKv('Travel dates', b.start_date
+        ? `${fmtDate(b.start_date)} to ${fmtDate(b.end_date ?? b.start_date)}`
+        : null),
+      tripKv('Quoted sell value', `Rs ${(b.sell_value / 100).toFixed(2)}`),
+      tripKv('Booking status', titleise(b.status)),
+    ] : [
+      // A trip analytic with no booking is legitimate — a cost centre someone
+      // tagged bills to before the CRM record existed. Saying so is better
+      // than printing an empty customer block.
+      tripKv('Booking', 'Not linked to a CRM booking'),
+    ]),
+    tripKv('Ledger activity', t.firstEntry
+      ? `${fmtDate(t.firstEntry)} to ${fmtDate(t.lastEntry)}` : 'Nothing posted yet'),
+    tripKv('Posted ledger lines', d.ledger.length),
+    [],
+    [null, text('S. No.', 'header'), text('Particular', 'header'),
+      text('Amount (Rs)', 'header'), text('Where it comes from', 'header')],
+    [],
+
+    tripSection('What the trip earned'),
+    tripLine(1, '  Customer invoices (incl. GST)', t.invoiced, 'Sheet: Revenue'),
+    tripLine(null, '  Less credit notes (incl. GST)', -t.creditNotes, 'Sheet: Revenue'),
+    tripLine(null, '  Output GST on the above', -t.outputTax, 'Not income — collected for the department'),
+    ...d.revenueLines.map((r) => tripLine(null, `  ${r.code} ${r.name}`, r.amount, 'Ledger')),
+    tripTotal('Revenue recognised (net of GST)', t.revenue, 'Ledger'),
+    [],
+
+    tripSection('What the trip cost'),
+    tripLine(2, '  Supplier bills (incl. GST)', t.billed, 'Sheet: Costs'),
+    tripLine(null, '  Less debit notes (incl. GST)', -t.debitNotes, 'Sheet: Costs'),
+    tripLine(3, '  Staff expense claims (excl. GST)', t.expenseClaims, 'Sheet: Staff Expenses'),
+    tripLine(null, '  GST on staff expense claims', t.expenseTax, 'Input credit, not a cost'),
+    tripLine(4, '  Agent commission posted', t.commissionPosted, 'Sheet: Commissions'),
+    tripLine(null, '  Agent commission calculated, not posted', t.commissionDraft,
+      'Not in the cost below until it is posted'),
+    [],
+    tripSection('Cost by account, as the ledger carries it'),
+    ...d.costLines.map((r) => tripLine(null, `  ${r.code} ${r.name}`, r.amount, 'Ledger')),
+    tripTotal('Total cost', t.cost, 'Ledger'),
+    [],
+
+    tripTotal('Gross profit', t.profit, 'Revenue less every cost tagged to the trip'),
+    [
+      null, null, text('Margin', 'section'),
+      { v: Number(t.margin.toFixed(2)), s: 'rate' }, text('% of revenue', 'section'),
+    ],
+    ...(pax > 0 ? [
+      tripTotal('Revenue per traveller', Math.round(t.revenue / pax)),
+      tripTotal('Cost per traveller', Math.round(t.cost / pax)),
+      tripTotal('Profit per traveller', Math.round(t.profit / pax)),
+    ] : []),
+    [],
+
+    tripSection('Tax on this trip'),
+    tripLine(null, '  Output GST charged to the customer', t.outputTax, 'Payable to the department'),
+    tripLine(null, '  Input GST on bills and staff claims', t.inputTax, 'Claimable as credit'),
+    tripLine(null, '  TDS withheld from suppliers', t.withheldTax, 'Deposited by challan'),
+    tripTotal('Net GST effect of this trip', t.outputTax - t.inputTax),
+    [],
+
+    tripSection('Money, as against profit'),
+    tripLine(null, '  Received from the customer', t.received, 'Sheet: Money Movement'),
+    tripLine(null, '  Still to collect', t.outstanding, 'Unpaid on posted invoices'),
+    tripLine(null, '  Customer advance still unapplied', t.advances),
+    tripLine(null, '  Paid out against this trip', t.paidOut, 'Sheet: Money Movement'),
+    tripTotal('Still owed back to staff', t.expenseOwed,
+      'Approved claims the employee paid for and has not been reimbursed'),
+  ];
+
+  return {
+    name: 'Trip Summary',
+    rows,
+    cols: [3, 9, 46, 20, 52],
+    merges: ['B2:E2'],
+  };
+}
+
+export interface TripWorkbook {
+  buffer: Buffer;
+  dossier: TripDossier;
+}
+
+export async function tripWorkbook(orgId: string, analyticId: string): Promise<TripWorkbook | null> {
+  const dossier = await tripDossier(orgId, analyticId);
+  if (!dossier) return null;
+  const org = await seller(orgId);
+
+  const sales = new Set(['out_invoice', 'out_refund']);
+  const revenueItems = dossier.items.filter((i) => sales.has(i.doc_type));
+  const costItems = dossier.items.filter((i) => !sales.has(i.doc_type));
+
+  // Every sheet is written even when it is empty, unlike the payout workbook.
+  // There the third sheet is a question; here it is an ANSWER — "no commission
+  // was paid on this trip" is exactly what a reader checking where the money
+  // went needs to be told, and an absent sheet reads as an export that failed.
+  const sheets: Sheet[] = [
+    tripSummarySheet(dossier, org.name),
+    itemSheet('Revenue', 'Revenue — what was invoiced to the customer',
+      'Customer invoices and credit notes tagged to this trip, line by line, with the GST on each.',
+      revenueItems),
+    itemSheet('Costs', 'Costs — what suppliers billed',
+      'Vendor bills and debit notes tagged to this trip, line by line, with the input GST on each.',
+      costItems),
+    tripExpenseSheet(dossier.expenses),
+    tripCommissionSheet(dossier.commissions),
+    tripPaymentSheet(dossier.payments),
+    tripLedgerSheet(dossier.ledger),
+  ];
+
+  return { buffer: buildXlsx(sheets), dossier };
 }

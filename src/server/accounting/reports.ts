@@ -419,12 +419,48 @@ export async function partnerBalance(orgId: string, partnerId: string, asOf = is
  * it HAS to be split off by `tax_group` BEFORE the scope filter runs, or it
  * lands in input credit and silently reduces the GST cheque.
  */
+export interface TaxLine {
+  tax_id: string; name: string; tax_group: string; scope: string; rate_bps: number;
+  /** Taxable value, signed the same way `amount` is. */
+  base: number;
+  amount: number;
+  /** The part of the two figures above that came from a credit or debit note. */
+  note_base: number;
+  note_amount: number;
+}
+
 export async function taxReport(orgId: string, p: Period) {
-  const rows = await all<{ tax_id: string; name: string; tax_group: string; scope: string; rate_bps: number; base: number; amount: number }>(
+  /*
+   * THE TAXABLE VALUE IS SIGNED, BECAUSE THE TAX IS.
+   *
+   * `tax_base` is stored positive on every line; the direction lives in the
+   * debit and credit columns, exactly as it does for the tax itself. Summing
+   * the column raw therefore ADDED a credit note's taxable value to outward
+   * turnover while its tax was correctly subtracted, and the two columns of
+   * this report stopped supporting each other: a cancelled ₹1,36,500 trip read
+   * as ₹3,56,000 of supplies carrying ₹4,350 of CGST, which is 1.2%, a rate
+   * that does not exist. Nothing reconciles GSTR-1 against GSTR-3B from that.
+   *
+   * The CASE mirrors `credit - debit` so base and amount always move together.
+   *
+   * The note columns are the same two figures restricted to credit and debit
+   * notes, so the report can show outward supplies gross, the notes that
+   * reduced them, and the net — which is how GSTR-1 reports them (Table 9B)
+   * and the only form in which a cancellation is VISIBLE rather than merely
+   * netted away.
+   */
+  const signedBase = `CASE WHEN l.credit > 0 THEN l.tax_base ELSE -l.tax_base END`;
+  const isNote = `d.doc_type IN ('out_refund','in_refund')`;
+  const rows = await all<TaxLine>(
     `SELECT l.tax_id, t.name, t.tax_group, t.scope, t.rate_bps,
-            COALESCE(SUM(l.tax_base),0) AS base,
-            COALESCE(SUM(l.credit - l.debit),0) AS amount
-       FROM journal_entry_lines l JOIN taxes t ON t.id = l.tax_id
+            COALESCE(SUM(${signedBase}),0) AS base,
+            COALESCE(SUM(l.credit - l.debit),0) AS amount,
+            COALESCE(SUM(CASE WHEN ${isNote} THEN ${signedBase} ELSE 0 END),0) AS note_base,
+            COALESCE(SUM(CASE WHEN ${isNote} THEN l.credit - l.debit ELSE 0 END),0) AS note_amount
+       FROM journal_entry_lines l
+       JOIN taxes t ON t.id = l.tax_id
+       LEFT JOIN journal_entries e ON e.id = l.entry_id AND e.source_model = 'document'
+       LEFT JOIN documents d ON d.id = e.source_id
       WHERE l.org_id = ? AND l.state='posted' AND l.entry_date BETWEEN ? AND ? AND l.tax_id IS NOT NULL
       GROUP BY l.tax_id, t.name, t.tax_group, t.scope, t.rate_bps ORDER BY t.scope, t.name`,
     orgId, p.from, p.to,
@@ -435,13 +471,49 @@ export async function taxReport(orgId: string, p: Period) {
 
   // Output tax is a credit (positive above); input tax is a debit (negative).
   const output = gst.filter((r) => r.scope === 'sale');
-  const input = gst.filter((r) => r.scope === 'purchase').map((r) => ({ ...r, amount: -r.amount }));
+  // Flipping the whole row, not just the amount: base, tax and the note split
+  // have to stay in the same frame or the purchase table contradicts itself.
+  const input = gst.filter((r) => r.scope === 'purchase').map((r) => ({
+    ...r,
+    base: -r.base, amount: -r.amount, note_base: -r.note_base, note_amount: -r.note_amount,
+  }));
   // Withheld tax is credited to TDS Payable, so it is already positive.
   const withheld = rows.filter(isWithholding);
 
-  const outputTotal = output.reduce((s, r) => s + r.amount, 0);
-  const inputTotal = input.reduce((s, r) => s + r.amount, 0);
-  const withheldTotal = withheld.reduce((s, r) => s + r.amount, 0);
+  const sum = (rs: TaxLine[], f: (r: TaxLine) => number) => rs.reduce((s, r) => s + f(r), 0);
+  const outputTotal = sum(output, (r) => r.amount);
+  const inputTotal = sum(input, (r) => r.amount);
+  const withheldTotal = sum(withheld, (r) => r.amount);
+
+  /*
+   * ONE TAXABLE VALUE PER SUPPLY, NOT ONE PER TAX COMPONENT.
+   *
+   * CGST and SGST are two postings of ONE supply and each line carries the
+   * whole taxable value, so adding the two rows reports a ₹1,74,000 trip as
+   * ₹3,48,000 of turnover — the figure GSTR-3B Table 3.1 asks for once, beside
+   * separate CGST and SGST columns. Tax totals DO add across the pair (both are
+   * payable); taxable value does not.
+   *
+   * `tax_children` is what says the two are halves of the same thing, so the
+   * base is taken once per family. An IGST row is its own family and is
+   * unaffected. The larger magnitude wins rather than the first seen, so a
+   * family whose components somehow disagree reports the supply rather than
+   * half of it — and credit notes, whose bases are negative, compare correctly.
+   */
+  const pairs = await all<{ parent_id: string; child_id: string }>(
+    'SELECT parent_id, child_id FROM tax_children',
+  );
+  const parentOf = new Map(pairs.map((p) => [p.child_id, p.parent_id]));
+  const familyTotal = (rs: TaxLine[], f: (r: TaxLine) => number) => {
+    const byFamily = new Map<string, number>();
+    for (const r of rs) {
+      const family = parentOf.get(r.tax_id) ?? r.tax_id;
+      const v = f(r);
+      const prev = byFamily.get(family);
+      if (prev === undefined || Math.abs(v) > Math.abs(prev)) byFamily.set(family, v);
+    }
+    return [...byFamily.values()].reduce((s, v) => s + v, 0);
+  };
 
   // What is deducted in a period and what is still sitting undeposited are two
   // different numbers: a challan paid in April clears March's deduction. The
@@ -458,6 +530,14 @@ export async function taxReport(orgId: string, p: Period) {
   return {
     output, input, withheld,
     outputTotal, inputTotal, withheldTotal, withheldUnpaid,
+    // Taxable value alongside the tax, and the credit/debit note split out of
+    // each, so the screen can show gross → notes → net on both sides.
+    outputBase: familyTotal(output, (r) => r.base),
+    inputBase: familyTotal(input, (r) => r.base),
+    outputNotes: sum(output, (r) => r.note_amount),
+    outputNotesBase: familyTotal(output, (r) => r.note_base),
+    inputNotes: sum(input, (r) => r.note_amount),
+    inputNotesBase: familyTotal(input, (r) => r.note_base),
     // GST only. TDS is deposited separately and never nets against it.
     netPayable: outputTotal - inputTotal,
   };
@@ -562,9 +642,9 @@ export async function expenseBreakdown(orgId: string, p: Period) {
 export async function accountsWithBalances(orgId: string, asOf = isoDate()) {
   return (await all<{
     id: string; code: string; name: string; kind: string; reconcilable: number;
-    active: number; balance: number;
+    active: number; default_hsn_code: string | null; balance: number;
   }>(
-    `SELECT a.id, a.code, a.name, a.kind, a.reconcilable, a.active,
+    `SELECT a.id, a.code, a.name, a.kind, a.reconcilable, a.active, a.default_hsn_code,
             COALESCE((SELECT SUM(l.debit - l.credit) FROM journal_entry_lines l
                        WHERE l.account_id = a.id AND l.state='posted' AND l.entry_date <= ?), 0) AS balance
        FROM accounts a WHERE a.org_id = ? ORDER BY a.code`,

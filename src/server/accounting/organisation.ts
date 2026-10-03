@@ -20,7 +20,8 @@ export interface OrganisationRow {
   gstin: string | null; pan: string | null; fy_start_month: number; address: string | null;
   city: string | null;
   email: string | null; phone: string | null; website: string | null; state_code: string | null;
-  invoice_terms: string | null; invoice_footer: string | null; created_at: string;
+  invoice_terms: string | null; invoice_footer: string | null;
+  default_hsn_code: string | null; created_at: string;
 }
 
 export async function getOrganisation(orgId: string): Promise<OrganisationRow | null> {
@@ -58,6 +59,49 @@ export function stateName(code: string | null): string | null {
 const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]$/;
 const PAN_RE = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
 
+/**
+ * A typed GSTIN, upper-cased and checked, or null if nothing was typed.
+ *
+ * SHARED RATHER THAN REPEATED. The agency's own registration was validated here
+ * and the counterparty's was not validated anywhere, so a customer GSTIN with a
+ * digit missing reached a printed tax invoice unchallenged — which is the one
+ * field on it a buyer's accountant checks before any other, and the field that
+ * decides whether they can claim the credit at all.
+ *
+ * `where` names the field in the message, because "is not a valid GSTIN" on a
+ * form carrying two of them does not say which one to fix.
+ */
+export function parseGstin(raw: string | null | undefined, where = 'GSTIN'): string | null {
+  const gstin = (raw ?? '').trim().toUpperCase().replace(/\s+/g, '') || null;
+  if (gstin && !GSTIN_RE.test(gstin)) {
+    throw new Error(
+      `"${gstin}" is not a valid ${where}. It is 15 characters: 2-digit state code, PAN, ` +
+      'entity number, Z, check digit.',
+    );
+  }
+  return gstin;
+}
+
+/**
+ * An HSN or SAC code as it is allowed to be stored: digits only, and 4, 6 or 8
+ * of them.
+ *
+ * The CGST notification fixes the length by turnover — 4 digits below ₹5 crore
+ * on a B2B supply, 6 above it, 8 on an export — and every length in between is
+ * a typo rather than a choice. Checked at every entry point because an HSN of
+ * "99855" is rejected by the GSTR-1 upload, months later, with no indication of
+ * which invoice carried it.
+ */
+export function parseHsn(raw: string | null | undefined, where = 'HSN / SAC code'): string | null {
+  const hsn = (raw ?? '').trim().replace(/\s+/g, '') || null;
+  if (hsn && !/^([0-9]{4}|[0-9]{6}|[0-9]{8})$/.test(hsn)) {
+    throw new Error(
+      `"${hsn}" is not a valid ${where}. It is 4, 6 or 8 digits — 998555, not 99855.`,
+    );
+  }
+  return hsn;
+}
+
 export interface OrganisationInput {
   name: string;
   legalName?: string | null;
@@ -74,6 +118,8 @@ export interface OrganisationInput {
   website?: string | null;
   invoiceTerms?: string | null;
   invoiceFooter?: string | null;
+  /** The agency's principal SAC, the last fallback for a line's HSN. */
+  defaultHsnCode?: string | null;
 }
 
 /**
@@ -102,10 +148,7 @@ export async function updateOrganisation(orgId: string, o: OrganisationInput, ac
   const name = o.name.trim();
   if (!name) throw new Error('The agency needs a name.');
 
-  const gstin = (o.gstin ?? '').trim().toUpperCase() || null;
-  if (gstin && !GSTIN_RE.test(gstin)) {
-    throw new Error(`"${gstin}" is not a valid GSTIN. It is 15 characters: 2-digit state code, PAN, entity number, Z, check digit.`);
-  }
+  const gstin = parseGstin(o.gstin);
   const pan = (o.pan ?? '').trim().toUpperCase() || null;
   if (pan && !PAN_RE.test(pan)) {
     throw new Error(`"${pan}" is not a valid PAN. It is 10 characters: AAAAA9999A.`);
@@ -159,13 +202,14 @@ export async function updateOrganisation(orgId: string, o: OrganisationInput, ac
   await run(
     `UPDATE organizations SET name=?, legal_name=?, gstin=?, pan=?, state_code=?, country=?,
             currency=?, fy_start_month=?, address=?, city=?, email=?, phone=?, website=?,
-            invoice_terms=?, invoice_footer=?
+            invoice_terms=?, invoice_footer=?, default_hsn_code=?
        WHERE id=?`,
     name, (o.legalName ?? '').trim() || null, gstin, pan, stateCode,
     (o.country ?? current.country ?? 'IN').trim().toUpperCase() || 'IN',
     currency, fyStartMonth, (o.address ?? '').trim() || null, (o.city ?? '').trim() || null,
     (o.email ?? '').trim() || null, (o.phone ?? '').trim() || null, (o.website ?? '').trim() || null,
     (o.invoiceTerms ?? '').trim() || null, (o.invoiceFooter ?? '').trim() || null,
+    parseHsn(o.defaultHsnCode, 'default HSN / SAC code'),
     orgId,
   );
   await audit(orgId, actor, 'modified', 'organisation', orgId, name);

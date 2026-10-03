@@ -3,9 +3,9 @@ import { all } from './db';
 import { listAccounts, listJournals, listPartners, listPaymentTerms, listProducts } from './accounting/masters';
 import { listTaxes, listWithholdingTaxes } from './accounting/tax';
 import { listAnalyticAccounts, listBookings } from './accounting/analytics';
-import { GST_STATES } from './accounting/organisation';
+import { GST_STATES, getOrganisation } from './accounting/organisation';
 import type { DocFormProps } from '@/components/DocumentForm';
-import type { DocType } from '@/lib/accounting';
+import { isDocumentLineKind, type DocType } from '@/lib/accounting';
 
 /**
  * The dropdown contents every form needs, assembled in one place.
@@ -29,16 +29,35 @@ export async function documentFormOptions(orgId: string, docType: DocType, canPo
   const secondaryKinds = isBill
     ? ['asset_current', 'asset_fixed', 'asset_prepaid']
     : ['liability_current'];
+  // The two lists together are `DOCUMENT_LINE_KINDS`, which the Chart of
+  // Accounts reads to decide which rows get a default-HSN box. Asserted rather
+  // than derived, because the ORDER here is the point — see the comment above —
+  // and a kind added to one place and not the other is an account the form
+  // offers with no way to classify it, or a box that can never be used.
+  if (process.env.NODE_ENV !== 'production') {
+    const offered = new Set([...primaryKinds, ...secondaryKinds]);
+    for (const k of offered) {
+      if (!isDocumentLineKind(k)) {
+        throw new Error(`Account kind "${k}" is offered on a document line but missing from DOCUMENT_LINE_KINDS.`);
+      }
+    }
+  }
 
   return {
     docType,
     canPost,
+    // `hint` carries the partner's GSTIN, so typing a name that already exists
+    // fills the registration beside it instead of asking for fifteen characters
+    // the system is already holding. Same idiom as the bookings list below.
     partners: (await listPartners(orgId, { side: isBill ? 'supplier' : 'customer' }))
-      .map((p) => ({ id: p.id, label: p.name })),
+      .map((p) => ({ id: p.id, label: p.name, hint: p.gstin ?? '' })),
     journals: (await listJournals(orgId, isBill ? 'purchase' : 'sale'))
       .map((j) => ({ id: j.id, label: `${j.code} — ${j.name}` })),
+    // `hint` is the account's default HSN/SAC — the middle step of the chain the
+    // form applies to a blank HSN cell (line → account → agency). Carried with
+    // the option so changing the account fills the code with no round trip.
     accounts: [...await listAccounts(orgId, { kinds: primaryKinds }), ...await listAccounts(orgId, { kinds: secondaryKinds })]
-      .map((a) => ({ id: a.id, label: `${a.code} ${a.name}` })),
+      .map((a) => ({ id: a.id, label: `${a.code} ${a.name}`, hint: a.default_hsn_code ?? '' })),
     taxes: (await listTaxes(orgId, isBill ? 'purchase' : 'sale'))
       .map((t) => ({ id: t.id, label: t.name, rateBps: t.rate_bps, priceIncluded: !!t.price_included })),
     withholdingTaxes: (await listWithholdingTaxes(orgId))
@@ -61,6 +80,9 @@ export async function documentFormOptions(orgId: string, docType: DocType, canPo
     })),
     // The closed list of GST state codes, from the one place that holds it.
     states: GST_STATES,
+    // The last step of the HSN chain: the agency's own principal service code,
+    // for a line on an account nobody has classified yet.
+    defaultHsn: (await getOrganisation(orgId))?.default_hsn_code ?? '',
   };
 }
 

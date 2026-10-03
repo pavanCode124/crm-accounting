@@ -45,6 +45,28 @@ export type AccountKind = keyof typeof ACCOUNT_KINDS;
 export const ACCOUNT_GROUPS = ['asset', 'liability', 'equity', 'income', 'expense'] as const;
 export type AccountGroup = (typeof ACCOUNT_GROUPS)[number];
 
+/**
+ * The account kinds an invoice or vendor-bill LINE can be posted to, which is
+ * also the set of accounts that can usefully carry a default HSN/SAC.
+ *
+ * Stated once because two screens need the same answer and would drift: the
+ * document form offers these accounts (`documentFormOptions` orders them, which
+ * is a separate question from which they are), and the Chart of Accounts shows
+ * an HSN box on exactly these rows. A code against Bank Charges or Retained
+ * Earnings could never reach an invoice line, so offering one invites a setting
+ * that does nothing.
+ */
+export const DOCUMENT_LINE_KINDS = [
+  'income', 'income_other',
+  'expense_direct', 'expense_operating',
+  'asset_current', 'asset_fixed', 'asset_prepaid',
+  'liability_current',
+] as const;
+
+export function isDocumentLineKind(kind: string): boolean {
+  return (DOCUMENT_LINE_KINDS as readonly string[]).includes(kind);
+}
+
 export function kindLabel(kind: string): string {
   return ACCOUNT_KINDS[kind as AccountKind]?.label ?? kind;
 }
@@ -132,6 +154,9 @@ export const STATE_CHIP: Record<string, { bg: string; fg: string }> = {
   not_paid: { bg: '#fef2f2', fg: '#b91c1c' },
   partial: { bg: '#fffbeb', fg: '#92400e' },
   paid: { bg: '#f0fdf4', fg: '#15803d' },
+  // Deliberately NOT the green of "paid": settled by a credit note, with
+  // whatever money arrived shown separately on the document.
+  credited: { bg: '#f3f0f7', fg: '#6b6480' },
   overdue: { bg: '#fef2f2', fg: '#b91c1c' },
   reconciled: { bg: '#f0fdf4', fg: '#15803d' },
   unreconciled: { bg: '#fffbeb', fg: '#92400e' },
@@ -153,6 +178,22 @@ export function stateChip(state: string) {
 
 export function titleise(s: string): string {
   return s.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/**
+ * A tax group as a statutory column spells it.
+ *
+ * `titleise` turns "tds" into "Tds" and "igst" into "Igst", which reads as a
+ * typo on a return. Shared by the tax screen and the tax workbook so the
+ * spelling cannot drift between what is read and what is filed.
+ */
+export function taxGroupLabel(group: string): string {
+  const known: Record<string, string> = {
+    cgst: 'CGST', sgst: 'SGST', igst: 'IGST', utgst: 'UTGST',
+    cess: 'Cess', gst: 'GST', cgst_sgst: 'CGST + SGST',
+    tds: 'TDS', tcs: 'TCS', vat: 'VAT',
+  };
+  return known[group] ?? titleise(group);
 }
 
 // ---------------------------------------------------------------------------

@@ -32,7 +32,19 @@ export async function DocumentList({ orgId, docType, basePath, filter, emptyHint
         <EmptyState
           title="Nothing here yet."
           hint={emptyHint}
-          action={<Link href={`${basePath}/new`} className={btn.primary}>Create one</Link>}
+          /*
+           * ONLY WHERE THERE IS SOMETHING TO CREATE.
+           *
+           * `editable` already says a note is raised from the document it
+           * corrects and has no screen of its own. This offered "Create one" to
+           * `/sales/credit-notes/new` and `/purchases/debit-notes/new` all the
+           * same — routes that do not exist, so the segment fell through to
+           * `[id]` and the note list's only call to action answered with "That
+           * document no longer exists."
+           */
+          action={editable
+            ? <Link href={`${basePath}/new`} className={btn.primary}>Create one</Link>
+            : undefined}
         />
       ) : (
         <Table>
@@ -155,6 +167,7 @@ export function DocumentFilters({ action, filter, docType }: {
           <option value="not_paid">Not paid</option>
           <option value="partial">Partially paid</option>
           <option value="paid">Paid</option>
+          <option value="credited">Credited</option>
         </select>
       </label>
       <label className="block">

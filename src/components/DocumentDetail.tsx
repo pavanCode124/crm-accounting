@@ -3,13 +3,13 @@ import { DOC_TYPES, fmtDate, titleise, isoDate, daysBetween } from '@/lib/accoun
 import { stateName } from '@/server/accounting/organisation';
 import { fmt, qtyFromMilli, bpsToPct } from '@/lib/money';
 import { getDocument, documentLines, documentLineTaxes } from '@/server/accounting/documents';
-import { allocationsFor, listPayments } from '@/server/accounting/payments';
+import { allocationsFor, listPayments, openInvoicesFor } from '@/server/accounting/payments';
 import { auditFor } from '@/server/accounting/audit';
 import { journalEntry } from '@/server/accounting/reports';
 import { bankAccountOptions, journalOptions } from '@/server/options';
 import {
   postDocumentAction, reverseDocumentAction, creditNoteAction, registerPaymentAction, unallocateAction,
-  allocateAction,
+  allocateAction, applyCreditAction,
 } from '@/app/actions';
 import {
   PageHeader, Card, Table, Th, Td, Money, Chip, DefList, btn, inputClass, Field, Banner, RefLink,
@@ -62,6 +62,23 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
     })
     : [];
   const advanceTotal = advances.reduce((t, p) => t + p.unallocated, 0);
+  /*
+   * A CREDIT NOTE IS A REDUCTION OF A BILL BEFORE IT IS EVER A REFUND.
+   *
+   * Cash is only owed back once the customer has paid more than the charge
+   * being retained, so the open invoices come first and Pay out is what is left
+   * after them. Offering only Pay out — which is what this screen used to do —
+   * invited a ₹95,550 payout against a ₹20,000 advance.
+   */
+  const isCreditNote = meta.sign === -1;
+  // The split the Balance card reports. `allocationsFor` already carries
+  // `credit_doc_id`, so this needs no further query.
+  const settledTotal = doc.total - doc.withheld_tax - doc.residual;
+  const creditedTotal = allocations.reduce((t, a) => t + (a.credit_doc_id ? a.amount : 0), 0);
+  const receivedTotal = settledTotal - creditedTotal;
+  const openInvoices = isCreditNote && doc.state === 'posted' && doc.residual > 0 && doc.partner_id
+    ? await openInvoicesFor(orgId, doc.partner_id, isBill ? 'in_invoice' : 'out_invoice')
+    : [];
   // Applying the advances covers this much of the bill; the rest is the
   // payment that still has to leave the bank.
   const afterAdvances = Math.max(0, doc.residual - advanceTotal);
@@ -252,9 +269,27 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
             <dl className="space-y-2 text-[14px]">
               <SummaryRow label="Total" value={doc.total} bold />
               {doc.withheld_tax > 0 && <SummaryRow label="TDS withheld" value={-doc.withheld_tax} />}
-              <SummaryRow label="Settled" value={doc.total - doc.withheld_tax - doc.residual} />
+              {/*
+                * Money and credit are never added into one "Settled" figure.
+                * A cancelled trip is settled in both, and the agency's first
+                * question is always how much of it actually arrived.
+                */}
+              {creditedTotal > 0 ? (
+                <>
+                  <SummaryRow label={isBill ? 'Paid in cash' : 'Received in cash'} value={receivedTotal} />
+                  <SummaryRow label={isBill ? 'Debit notes applied' : 'Credit notes applied'} value={creditedTotal} />
+                </>
+              ) : (
+                <SummaryRow label="Settled" value={settledTotal} />
+              )}
               <SummaryRow label={doc.residual > 0 ? 'Still owed' : 'Cleared'} value={doc.residual} bold />
             </dl>
+            {creditedTotal > 0 && !isCreditNote && (
+              <p className="mt-3 text-[12px] text-ink-faint">
+                {fmt(creditedTotal)} of this was cancelled by a credit note, not collected.
+                {receivedTotal > 0 && ` ${fmt(receivedTotal)} was actually received from ${doc.partner_name}.`}
+              </p>
+            )}
 
             <div className="mt-5 flex flex-col gap-2 no-print">
               {doc.state === 'draft' && (
@@ -321,6 +356,34 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
             </Card>
           )}
 
+          {openInvoices.length > 0 && (
+            <Card title="Apply to an invoice"
+              subtitle="Reduces what is owed. No money moves — use this before paying anything out.">
+              <div className="space-y-3">
+                {openInvoices.map((inv) => {
+                  const applicable = Math.min(inv.residual, doc.residual);
+                  return (
+                    <form key={inv.id} action={applyCreditAction}
+                      className="flex flex-wrap items-center gap-2 border-b border-line pb-3 last:border-0 last:pb-0">
+                      <input type="hidden" name="credit_id" value={doc.id} />
+                      <input type="hidden" name="invoice_id" value={inv.id} />
+                      <input type="hidden" name="return_to" value={`${basePath}/${doc.id}`} />
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[13px] font-bold">{inv.number}</div>
+                        <div className="text-[11.5px] text-ink-faint">
+                          {fmtDate(inv.doc_date)} · {fmt(inv.residual)} still owed
+                        </div>
+                      </div>
+                      <input name="amount" defaultValue={(applicable / 100).toFixed(2)}
+                        inputMode="decimal" className={`${inputClass} w-[110px] text-right`} />
+                      <button className={btn.ghost}>Apply</button>
+                    </form>
+                  );
+                })}
+              </div>
+            </Card>
+          )}
+
           {doc.state === 'posted' && doc.residual > 0 && (
             <Card title={settleVerb}>
               <form action={registerPaymentAction} className="space-y-3">
@@ -362,6 +425,13 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
                 is allocated to this document straight away.
                 {advanceTotal > 0 && ` ${fmt(advanceTotal)} of advance is already with this partner — the amount above is what remains once it is applied.`}
               </p>
+              {openInvoices.length > 0 && (
+                <p className="mt-2 text-[12px] font-semibold text-negative">
+                  {doc.partner_name} still owes {fmt(openInvoices.reduce((t, i) => t + i.residual, 0))} on
+                  open invoices. Apply this note to them first — paying cash out now refunds money
+                  that was never received.
+                </p>
+              )}
             </Card>
           )}
 
@@ -395,24 +465,46 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
             )}
           </Card>
 
-          {doc.state === 'posted' && doc.doc_type === 'out_invoice' && (
-            <Card title="Cancellation / credit note"
-              subtitle="A percentage of the invoice, so a cancellation charge stays tied to the original.">
+          {/*
+            * BOTH SIDES RAISE A NOTE, AND THE BILL SIDE IS NOT THE RARE ONE.
+            *
+            * This read `doc_type === 'out_invoice'`, so a vendor bill had no way
+            * to raise anything — yet a cancelled trip is exactly when the agency
+            * needs one, because the hotel and the airline have already been paid
+            * in full. `createCreditNote` has always handled both (it picks
+            * `in_refund` off the source type); only this gate was one-sided, so
+            * the debit note list could never be anything but empty.
+            */}
+          {doc.state === 'posted' && (doc.doc_type === 'out_invoice' || doc.doc_type === 'in_invoice') && (
+            <Card title={isBill ? 'Cancellation / debit note' : 'Cancellation / credit note'}
+              subtitle={isBill
+                ? 'A percentage of the bill, for what the supplier has agreed to refund.'
+                : 'A percentage of the invoice, so a cancellation charge stays tied to the original.'}>
               <form action={creditNoteAction} className="space-y-3">
                 <input type="hidden" name="id" value={doc.id} />
-                <Field label="Credit percentage" hint="30% credited means 70% retained as a cancellation charge.">
+                <input type="hidden" name="doc_type" value={doc.doc_type} />
+                <Field label={isBill ? 'Refund percentage' : 'Credit percentage'}
+                  hint={isBill
+                    ? `How much of ${fmt(doc.total)} the supplier is giving back. 100 cancels the bill in full; 70 recovers ${fmt(Math.round(doc.total * 0.7))} and leaves ${fmt(doc.total - Math.round(doc.total * 0.7))} as their retained charge.`
+                    : `How much of ${fmt(doc.total)} is cancelled. 100 cancels it in full; 70 credits ${fmt(Math.round(doc.total * 0.7))} and keeps ${fmt(doc.total - Math.round(doc.total * 0.7))} as the cancellation charge.`}>
                   <input name="percent" defaultValue="100" inputMode="decimal" className={`${inputClass} text-right`} />
                 </Field>
                 <Field label="Date">
                   <input type="date" name="date" defaultValue={today} className={inputClass} />
                 </Field>
                 <Field label="Reason">
-                  <input name="reason" placeholder="Customer cancellation" className={inputClass} />
+                  <input name="reason" placeholder={isBill ? 'Supplier cancellation' : 'Customer cancellation'} className={inputClass} />
                 </Field>
                 <button name="post_now" value="true" className={`${btn.ghost} w-full`}>
-                  Create and post credit note
+                  {isBill ? 'Create and post debit note' : 'Create and post credit note'}
                 </button>
               </form>
+              {isBill && (
+                <p className="mt-3 text-[12px] text-ink-faint">
+                  The input GST on the refunded portion is reversed with it, which is what the
+                  supplier&apos;s own credit note will report against your GSTIN.
+                </p>
+              )}
             </Card>
           )}
         </div>

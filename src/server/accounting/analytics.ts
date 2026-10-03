@@ -375,3 +375,333 @@ export async function listBookings(orgId: string, opts: { status?: string; searc
 }
 
 export const today = isoDate;
+
+// ---------------------------------------------------------------------------
+// The trip dossier — everything tagged to one trip, for the drill-down export
+// ---------------------------------------------------------------------------
+
+/**
+ * WHY THE DOSSIER IS ASSEMBLED HERE AND NOT IN THE WORKBOOK.
+ *
+ * `tripProfitability` answers "what did this trip make"; the reader's next
+ * question is always "where did it go", and that question is answered by rows,
+ * not by a total. This function gathers every row the ledger holds against one
+ * trip — the invoices that earned it, the bills and employee claims that cost
+ * it, the commission paid on it, the money that actually moved, and underneath
+ * all of them the GL lines themselves — so that the spreadsheet in exports.ts
+ * is layout and nothing else.
+ *
+ * THE LEDGER SHEET IS THE SPINE, and the others are readings of it. Every
+ * figure on the summary comes from `ledger`, which is the posted analytic
+ * distributions and therefore the same lines the P&L is built from. The
+ * document, expense and commission sheets exist because a GL line reading
+ * "Transport Cost 500.00" does not tell a reader it was a cab to the airport
+ * that an agent paid for out of his own pocket and is still owed back.
+ *
+ * A TRIP IS AN ANALYTIC ACCOUNT, not a booking. Most trips have a booking and
+ * the dossier carries it, but a trip analytic with no CRM booking behind it
+ * still has costs and still exports — it simply has no customer block.
+ */
+
+export interface TripLedgerRow {
+  entry_date: string; entry_no: string | null; entry_id: string;
+  journal_code: string | null; journal_name: string | null;
+  account_code: string; account_name: string; account_kind: string;
+  label: string | null; narration: string | null; reference: string | null;
+  partner_name: string | null;
+  source_model: string | null; source_id: string | null;
+  doc_number: string | null; doc_type: string | null;
+  /** The GL line's own figures, before the analytic share is applied. */
+  debit: number; credit: number;
+  /** The share of that line this trip carries: 10000 = all of it. */
+  bps: number;
+  /** Signed as the engine writes it: +cost, -revenue. */
+  amount: number;
+}
+
+export interface TripDocRow {
+  id: string; doc_type: string; number: string | null; doc_date: string;
+  due_date: string | null; supplier_ref: string | null; state: string; payment_state: string;
+  partner_name: string | null; partner_gstin: string | null; place_of_supply: string | null;
+  untaxed: number; tax_total: number; total: number; residual: number; withheld_tax: number;
+  note: string | null;
+}
+
+export interface TripDocItemRow {
+  document_id: string; doc_type: string; number: string | null; doc_date: string;
+  partner_name: string | null; partner_gstin: string | null;
+  seq: number; name: string; hsn_code: string | null; tax_name: string | null;
+  account_code: string | null; account_name: string | null;
+  qty_milli: number; unit_price: number; discount_bps: number;
+  taxable: number; igst_bps: number; igst: number; cgst_bps: number; cgst: number;
+  sgst_bps: number; sgst: number; cess: number; tax_total: number; total: number;
+  /** Whether this particular line is the one tagged to the trip. */
+  on_trip: number;
+}
+
+export interface TripExpenseRow {
+  id: string; number: string | null; employee_name: string | null; description: string;
+  expense_date: string; amount: number; tax_amount: number; tax_name: string | null;
+  tax_rate_bps: number | null; account_code: string | null; account_name: string | null;
+  paid_by: string; state: string; receipt: string | null;
+  approved_by: string | null; approved_at: string | null;
+  entry_no: string | null;
+}
+
+export interface TripCommissionRow {
+  id: string; agent_name: string; basis: string; rate_bps: number; fixed_amount: number;
+  base_amount: number; amount: number; due_date: string | null; state: string;
+  created_at: string; entry_no: string | null;
+}
+
+export interface TripPaymentRow {
+  id: string; number: string | null; direction: string; side: string; pay_date: string;
+  partner_name: string | null; journal_name: string | null; method: string;
+  reference: string | null; amount: number; unallocated: number; is_advance: number;
+  state: string; note: string | null;
+}
+
+export interface TripDossier {
+  analytic: {
+    id: string; code: string; name: string; plan_code: string; plan_name: string;
+    booking_id: string | null;
+  };
+  booking: BookingFinancials['booking'] | null;
+  ledger: TripLedgerRow[];
+  documents: TripDocRow[];
+  items: TripDocItemRow[];
+  expenses: TripExpenseRow[];
+  commissions: TripCommissionRow[];
+  payments: TripPaymentRow[];
+  /** Revenue and cost by account — the split behind the margin. */
+  revenueLines: Array<{ code: string; name: string; amount: number }>;
+  costLines: Array<{ code: string; name: string; amount: number }>;
+  totals: {
+    revenue: number; cost: number; profit: number; margin: number;
+    invoiced: number; creditNotes: number; billed: number; debitNotes: number;
+    outputTax: number; inputTax: number; withheldTax: number;
+    expenseClaims: number; expenseTax: number; expenseOwed: number;
+    commissionPosted: number; commissionDraft: number;
+    received: number; paidOut: number; advances: number; outstanding: number;
+    firstEntry: string | null; lastEntry: string | null;
+  };
+}
+
+/** `?,?,?` for an IN list, so a set of ids stays parameterised. */
+function placeholders(n: number): string {
+  return Array.from({ length: n }, () => '?').join(',');
+}
+
+export async function tripDossier(orgId: string, analyticId: string): Promise<TripDossier | null> {
+  const analytic = await one<TripDossier['analytic']>(
+    `SELECT an.id, an.code, an.name, pl.code AS plan_code, pl.name AS plan_name, an.booking_id
+       FROM analytic_accounts an JOIN analytic_plans pl ON pl.id = an.plan_id
+      WHERE an.id = ? AND an.org_id = ?`, analyticId, orgId,
+  );
+  if (!analytic) return null;
+
+  const financials = analytic.booking_id
+    ? await bookingFinancials(orgId, analytic.booking_id) : null;
+  const booking = financials?.booking ?? null;
+  const bookingId = booking?.id ?? null;
+
+  // -------------------------------------------------------------- the spine
+  const ledger = await all<TripLedgerRow>(
+    `SELECT ad.entry_date, je.entry_no, je.id AS entry_id,
+            j.code AS journal_code, j.name AS journal_name,
+            a.code AS account_code, a.name AS account_name, a.kind AS account_kind,
+            jel.label, je.narration, je.reference,
+            p.name AS partner_name, je.source_model, je.source_id,
+            d.number AS doc_number, d.doc_type,
+            jel.debit, jel.credit, ad.bps, ad.amount
+       FROM analytic_distributions ad
+       JOIN journal_entry_lines jel ON jel.id = ad.line_id
+       JOIN journal_entries je ON je.id = jel.entry_id
+       JOIN journals j ON j.id = je.journal_id
+       JOIN accounts a ON a.id = ad.account_id
+       LEFT JOIN partners p ON p.id = jel.partner_id
+       LEFT JOIN documents d ON d.id = je.source_id AND je.source_model = 'document'
+      WHERE ad.org_id = ? AND ad.analytic_id = ? AND ad.state = 'posted'
+      ORDER BY ad.entry_date, je.entry_no, a.code`,
+    orgId, analyticId,
+  );
+
+  // ---------------------------------------------------------- the documents
+  /*
+   * A document belongs to the trip three ways, and all three are honoured.
+   * The header may carry the analytic account or the booking, and a mixed
+   * invoice may tag only SOME of its lines to it — a supplier bill covering
+   * two trips is the ordinary case, not the exotic one. Matching on the header
+   * alone would drop exactly the documents whose allocation a reader most
+   * wants to see.
+   */
+  const documents = await all<TripDocRow>(
+    `SELECT DISTINCT d.id, d.doc_type, d.number, d.doc_date, d.due_date, d.supplier_ref,
+            d.state, d.payment_state, p.name AS partner_name, COALESCE(d.party_gstin, p.gstin) AS partner_gstin,
+            d.place_of_supply, d.untaxed, d.tax_total, d.total, d.residual,
+            d.withheld_tax, d.note
+       FROM documents d
+       LEFT JOIN partners p ON p.id = d.partner_id
+      WHERE d.org_id = ? AND d.state = 'posted'
+        AND (d.analytic_id = ?
+             OR (?::text IS NOT NULL AND d.booking_id = ?)
+             OR EXISTS (SELECT 1 FROM document_lines dl
+                         WHERE dl.document_id = d.id AND dl.analytic_id = ?))
+      ORDER BY d.doc_date, d.number`,
+    orgId, analyticId, bookingId, bookingId, analyticId,
+  );
+
+  /*
+   * ONE ROW PER LINE, WITH ITS OWN TAX SPLIT, because "with GSTs" is the
+   * question and a document total cannot answer it: a bill carrying a hotel at
+   * 12% and a transfer at 5% has no single rate. The split is aggregated in
+   * SQL by component group rather than line by line in JavaScript, since a
+   * trip with forty bills would otherwise be forty round trips.
+   *
+   * `on_trip` marks the lines actually tagged to this analytic account, so a
+   * bill shared with another trip prints in full — the reader can see what the
+   * whole bill was — while the column says which part of it this trip carries.
+   */
+  const items = documents.length
+    ? await all<TripDocItemRow>(
+      `SELECT dl.document_id, d.doc_type, d.number, d.doc_date,
+              p.name AS partner_name, COALESCE(d.party_gstin, p.gstin) AS partner_gstin,
+              dl.seq, dl.name, dl.hsn_code, t.name AS tax_name,
+              a.code AS account_code, a.name AS account_name,
+              dl.qty_milli, dl.unit_price, dl.discount_bps,
+              dl.subtotal AS taxable,
+              COALESCE(SUM(CASE WHEN lt.tax_group='igst' THEN lt.rate_bps END),0) AS igst_bps,
+              COALESCE(SUM(CASE WHEN lt.tax_group='igst' THEN lt.amount END),0) AS igst,
+              COALESCE(SUM(CASE WHEN lt.tax_group='cgst' THEN lt.rate_bps END),0) AS cgst_bps,
+              COALESCE(SUM(CASE WHEN lt.tax_group='cgst' THEN lt.amount END),0) AS cgst,
+              COALESCE(SUM(CASE WHEN lt.tax_group='sgst' THEN lt.rate_bps END),0) AS sgst_bps,
+              COALESCE(SUM(CASE WHEN lt.tax_group='sgst' THEN lt.amount END),0) AS sgst,
+              COALESCE(SUM(CASE WHEN lt.tax_group='cess' THEN lt.amount END),0) AS cess,
+              dl.tax_amount AS tax_total, dl.total,
+              CASE WHEN dl.analytic_id = ? OR d.analytic_id = ? THEN 1 ELSE 0 END AS on_trip
+         FROM document_lines dl
+         JOIN documents d ON d.id = dl.document_id
+         LEFT JOIN partners p ON p.id = d.partner_id
+         LEFT JOIN accounts a ON a.id = dl.account_id
+         LEFT JOIN taxes t ON t.id = dl.tax_id
+         LEFT JOIN document_line_taxes lt ON lt.line_id = dl.id
+        WHERE dl.document_id IN (${placeholders(documents.length)})
+        GROUP BY dl.id, d.id, p.name, p.gstin, a.code, a.name, t.name
+        ORDER BY d.doc_date, d.number, dl.seq`,
+      analyticId, analyticId, ...documents.map((d) => d.id),
+    )
+    : [];
+
+  // -------------------------------------------------------- what staff spent
+  const expenses = await all<TripExpenseRow>(
+    `SELECT e.id, e.number, e.employee_name, e.description, e.expense_date,
+            e.amount, e.tax_amount, t.name AS tax_name, t.rate_bps AS tax_rate_bps,
+            a.code AS account_code, a.name AS account_name,
+            e.paid_by, e.state, e.receipt, e.approved_by, e.approved_at,
+            je.entry_no
+       FROM expenses e
+       LEFT JOIN accounts a ON a.id = e.account_id
+       LEFT JOIN taxes t ON t.id = e.tax_id
+       LEFT JOIN journal_entries je ON je.id = e.entry_id
+      WHERE e.org_id = ?
+        AND (e.analytic_id = ? OR (?::text IS NOT NULL AND e.booking_id = ?))
+      ORDER BY e.expense_date, e.number`,
+    orgId, analyticId, bookingId, bookingId,
+  );
+
+  // ------------------------------------------------------ what agents earned
+  const commissions = bookingId
+    ? await all<TripCommissionRow>(
+      `SELECT c.id, c.agent_name, c.basis, c.rate_bps, c.fixed_amount, c.base_amount,
+              c.amount, c.due_date, c.state, c.created_at, je.entry_no
+         FROM commissions c
+         LEFT JOIN journal_entries je ON je.id = c.entry_id
+        WHERE c.org_id = ? AND c.booking_id = ?
+        ORDER BY c.created_at`, orgId, bookingId,
+    )
+    : [];
+
+  // ----------------------------------------------------- what actually moved
+  const payments = bookingId
+    ? await all<TripPaymentRow>(
+      `SELECT pay.id, pay.number, pay.direction, pay.side, pay.pay_date,
+              p.name AS partner_name, j.name AS journal_name, pay.method, pay.reference,
+              pay.amount, pay.unallocated, pay.is_advance, pay.state, pay.note
+         FROM payments pay
+         LEFT JOIN partners p ON p.id = pay.partner_id
+         LEFT JOIN journals j ON j.id = pay.journal_id
+        WHERE pay.org_id = ? AND pay.booking_id = ? AND pay.state <> 'cancelled'
+        ORDER BY pay.pay_date, pay.number`, orgId, bookingId,
+    )
+    : [];
+
+  // ----------------------------------------------------------------- the sums
+  /*
+   * Revenue and cost are summed from the LEDGER rows above rather than from
+   * the documents, and that is the whole discipline of this file: an employee
+   * claim and a manual journal are costs of the trip with no document behind
+   * them, and a total built from documents would quietly leave the agent's cab
+   * out of the margin it actually reduced.
+   */
+  const byAccount = (keep: (kind: string) => boolean, sign: 1 | -1) => {
+    const map = new Map<string, { code: string; name: string; amount: number }>();
+    for (const l of ledger) {
+      if (!keep(l.account_kind)) continue;
+      const row = map.get(l.account_code)
+        ?? { code: l.account_code, name: l.account_name, amount: 0 };
+      row.amount += sign * l.amount;
+      map.set(l.account_code, row);
+    }
+    return [...map.values()].filter((r) => r.amount !== 0)
+      .sort((a, b) => b.amount - a.amount);
+  };
+
+  const revenueLines = byAccount((k) => k.startsWith('income'), -1);
+  const costLines = byAccount((k) => k.startsWith('expense'), 1);
+  const revenue = revenueLines.reduce((t, r) => t + r.amount, 0);
+  const cost = costLines.reduce((t, r) => t + r.amount, 0);
+  const profit = revenue - cost;
+
+  const docSum = (type: string, f: (d: TripDocRow) => number) =>
+    documents.filter((d) => d.doc_type === type).reduce((t, d) => t + f(d), 0);
+
+  const live = expenses.filter((e) => e.state !== 'refused' && e.state !== 'draft');
+  const expenseClaims = live.reduce((t, e) => t + e.amount, 0);
+  const expenseTax = live.reduce((t, e) => t + e.tax_amount, 0);
+  // Posted, paid for by the employee, not yet reimbursed: what the agency
+  // still owes its own staff out of this trip.
+  const expenseOwed = expenses
+    .filter((e) => e.state === 'posted' && e.paid_by === 'employee')
+    .reduce((t, e) => t + e.amount + e.tax_amount, 0);
+
+  const paySum = (f: (p: TripPaymentRow) => boolean) =>
+    payments.filter(f).reduce((t, p) => t + p.amount, 0);
+
+  return {
+    analytic, booking, ledger, documents, items, expenses, commissions, payments,
+    revenueLines, costLines,
+    totals: {
+      revenue, cost, profit, margin: marginOf(revenue, profit),
+      invoiced: docSum('out_invoice', (d) => d.total),
+      creditNotes: docSum('out_refund', (d) => d.total),
+      billed: docSum('in_invoice', (d) => d.total),
+      debitNotes: docSum('in_refund', (d) => d.total),
+      outputTax: docSum('out_invoice', (d) => d.tax_total) - docSum('out_refund', (d) => d.tax_total),
+      inputTax: docSum('in_invoice', (d) => d.tax_total) - docSum('in_refund', (d) => d.tax_total)
+        + expenseTax,
+      withheldTax: documents.reduce((t, d) => t + d.withheld_tax, 0),
+      expenseClaims, expenseTax, expenseOwed,
+      commissionPosted: commissions.filter((c) => c.state === 'posted' || c.state === 'paid')
+        .reduce((t, c) => t + c.amount, 0),
+      commissionDraft: commissions.filter((c) => c.state === 'draft')
+        .reduce((t, c) => t + c.amount, 0),
+      received: paySum((p) => p.direction === 'inbound' && p.side === 'customer'),
+      paidOut: paySum((p) => p.direction === 'outbound'),
+      advances: payments.filter((p) => p.is_advance && p.direction === 'inbound')
+        .reduce((t, p) => t + p.unallocated, 0),
+      outstanding: financials?.outstanding ?? 0,
+      firstEntry: ledger[0]?.entry_date ?? null,
+      lastEntry: ledger.length ? ledger[ledger.length - 1].entry_date : null,
+    },
+  };
+}

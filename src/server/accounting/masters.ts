@@ -3,6 +3,7 @@ import { all, one, run, scalar, tx, id, nowIso } from '../db';
 import { audit } from './audit';
 import type { Actor } from './engine';
 import { searchTokens } from '@/lib/search';
+import { parseGstin, parseHsn } from './organisation';
 
 /**
  * Configuration records: accounts, journals, partners, taxes, products,
@@ -17,6 +18,14 @@ import { searchTokens } from '@/lib/search';
 export interface AccountRow {
   id: string; code: string; name: string; kind: string; currency: string | null;
   reconcilable: number; active: number; description: string | null;
+  /**
+   * The HSN/SAC a line posted to this account carries unless something more
+   * specific says otherwise. An account and a SAC classify the same thing from
+   * two directions — everything on Air Ticketing Revenue is 998551 — so the
+   * account is where the default belongs for a line that is not a catalogued
+   * product, which on a travel invoice is most of them.
+   */
+  default_hsn_code: string | null;
 }
 
 export async function listAccounts(orgId: string, opts: { kinds?: string[]; activeOnly?: boolean } = {}): Promise<AccountRow[]> {
@@ -39,24 +48,28 @@ export async function getAccount(orgId: string, accountId: string): Promise<Acco
 export async function upsertAccount(orgId: string, a: {
   id?: string; code: string; name: string; kind: string; reconcilable?: boolean;
   currency?: string | null; description?: string | null; active?: boolean;
+  defaultHsnCode?: string | null;
 }, actor: Actor = {}) {
+  const defaultHsn = parseHsn(a.defaultHsnCode, 'default HSN / SAC code');
   return await tx(async () => {
     if (a.id) {
       await run(
-        `UPDATE accounts SET code=?, name=?, kind=?, reconcilable=?, currency=?, description=?, active=?
+        `UPDATE accounts SET code=?, name=?, kind=?, reconcilable=?, currency=?, description=?, active=?,
+                default_hsn_code=?
            WHERE id=? AND org_id=?`,
         a.code, a.name, a.kind, a.reconcilable ? 1 : 0, a.currency ?? null,
-        a.description ?? null, a.active === false ? 0 : 1, a.id, orgId,
+        a.description ?? null, a.active === false ? 0 : 1, defaultHsn, a.id, orgId,
       );
       await audit(orgId, actor, 'modified', 'account', a.id, `${a.code} ${a.name}`);
       return a.id;
     }
     const accountId = id('acc');
     await run(
-      `INSERT INTO accounts (id, org_id, code, name, kind, currency, reconcilable, active, description)
-       VALUES (?,?,?,?,?,?,?,1,?)`,
+      `INSERT INTO accounts (id, org_id, code, name, kind, currency, reconcilable, active,
+                             description, default_hsn_code)
+       VALUES (?,?,?,?,?,?,?,1,?,?)`,
       accountId, orgId, a.code, a.name, a.kind, a.currency ?? null,
-      a.reconcilable ? 1 : 0, a.description ?? null,
+      a.reconcilable ? 1 : 0, a.description ?? null, defaultHsn,
     );
     await audit(orgId, actor, 'created', 'account', accountId, `${a.code} ${a.name}`);
     return accountId;
@@ -133,6 +146,32 @@ export async function setAccountReconcilable(
   await run('UPDATE accounts SET reconcilable=? WHERE id=? AND org_id=?', on ? 1 : 0, accountId, orgId);
   await audit(orgId, actor, 'modified', 'account', accountId,
     `${account.code} ${account.name} — reconciliation ${on ? 'allowed' : 'not allowed'}`);
+}
+
+/**
+ * Set the HSN/SAC an invoice line posted to this account defaults to.
+ *
+ * ITS OWN SETTER, like the reconciliation switch beside it, for the same reason:
+ * the only other way to set it is to have filled a box in when the account was
+ * created, which for every account in the seeded chart was never. A field whose
+ * only entry point is a form nobody will reopen is a field that stays empty, and
+ * an empty default is the HSN column staying empty on every invoice.
+ *
+ * It is a classification, not a posting input — nothing already on the ledger
+ * depends on it, and a line that already carries a code keeps it — so unlike
+ * reconciliation this has nothing to refuse. The blank clears it.
+ */
+export async function setAccountDefaultHsn(
+  orgId: string, accountId: string, rawHsn: string | null, actor: Actor = {},
+): Promise<void> {
+  const account = await one<{ code: string; name: string }>(
+    'SELECT code, name FROM accounts WHERE id=? AND org_id=?', accountId, orgId,
+  );
+  if (!account) throw new Error('Unknown account.');
+  const hsn = parseHsn(rawHsn, `default HSN / SAC code for ${account.code} ${account.name}`);
+  await run('UPDATE accounts SET default_hsn_code=? WHERE id=? AND org_id=?', hsn, accountId, orgId);
+  await audit(orgId, actor, 'modified', 'account', accountId,
+    `${account.code} ${account.name} — default HSN/SAC ${hsn ? `set to ${hsn}` : 'cleared'}`);
 }
 
 /*
@@ -274,7 +313,7 @@ export async function upsertPartner(orgId: string, p: {
      * left alone and shown back on screen: one of the two is a typo, and this
      * is not the layer that should decide which.
      */
-    const gstin = (p.gstin ?? '').trim().toUpperCase() || null;
+    const gstin = parseGstin(p.gstin, `GSTIN for ${p.name}`);
     const stateCode = (p.stateCode ?? '').trim() || (gstin ? gstin.slice(0, 2) : null);
 
     if (p.id) {
@@ -323,16 +362,51 @@ export async function upsertPartner(orgId: string, p: {
  */
 export async function resolvePartnerByName(
   orgId: string, rawName: string, side: 'customer' | 'supplier', actor: Actor = {},
+  gstin?: string | null,
 ): Promise<string> {
   const name = rawName.trim();
   if (!name) throw new Error(`${side === 'customer' ? 'Customer' : 'Supplier'} is required.`);
+  // Validated here rather than on the way into the UPDATE below, so an invalid
+  // one is refused even when the partner already exists and nothing is written.
+  const parsed = parseGstin(gstin, `GSTIN for ${name}`);
   const flagCol = side === 'customer' ? 'is_customer' : 'is_supplier';
-  const existing = await one<{ id: string }>(
-    `SELECT id FROM partners WHERE org_id=? AND ${flagCol}=1 AND LOWER(name)=LOWER(?)`,
+  const existing = await one<{ id: string; gstin: string | null; state_code: string | null }>(
+    `SELECT id, gstin, state_code FROM partners WHERE org_id=? AND ${flagCol}=1 AND LOWER(name)=LOWER(?)`,
     orgId, name,
   );
-  if (existing) return existing.id;
-  return await upsertPartner(orgId, { name, isCustomer: side === 'customer', isSupplier: side === 'supplier' }, actor);
+  if (existing) {
+    /*
+     * A GSTIN TYPED ON A DOCUMENT BACK-FILLS A PARTNER THAT HAS NONE, AND ONLY
+     * THEN.
+     *
+     * Filling it in is the point of asking for it on the invoice at all: the
+     * usual case is a partner minted by typing a name into an earlier document,
+     * which has no registration against it, and leaving the master blank would
+     * mean re-typing the same fifteen characters on every invoice afterwards.
+     *
+     * A GSTIN that is already recorded is NOT overwritten. It would turn a typo
+     * on one invoice into a change to master data behind the user's back, and
+     * the next invoice would then inherit the typo as its default. A document
+     * whose GSTIN genuinely differs from the master keeps its own — the
+     * document's copy is what it prints — and the master is corrected under
+     * Customers or Suppliers, where the change is visible as a change.
+     */
+    if (parsed && !existing.gstin) {
+      await run(
+        'UPDATE partners SET gstin=?, state_code=COALESCE(state_code, ?) WHERE id=? AND org_id=?',
+        parsed, parsed.slice(0, 2), existing.id, orgId,
+      );
+      await audit(orgId, actor, 'modified', 'partner', existing.id, `GSTIN set to ${parsed}`);
+    }
+    return existing.id;
+  }
+  return await upsertPartner(orgId, {
+    name, isCustomer: side === 'customer', isSupplier: side === 'supplier',
+    gstin: parsed,
+    // B2B the moment a registration is given: it is what distinguishes a
+    // traveller from an agency, and the partner type drives the GST reports.
+    partnerType: parsed ? 'b2b' : undefined,
+  }, actor);
 }
 
 /**
@@ -377,6 +451,11 @@ export async function upsertProduct(orgId: string, p: {
   expenseAccountId?: string | null; saleTaxId?: string | null; purchaseTaxId?: string | null;
   hsnCode?: string | null; mrp?: number; variant?: string | null;
 }, actor: Actor = {}) {
+  // Checked here, not only on the invoice. A product's code is copied onto every
+  // line that chooses it, so a malformed one set once propagates silently into
+  // every invoice afterwards — and surfaces as a rejected GSTR-1 upload months
+  // later, with nothing pointing back at the product that caused it.
+  const hsnCode = parseHsn(p.hsnCode, `HSN / SAC code for ${p.name}`);
   return await tx(async () => {
     if (p.id) {
       await run(
@@ -387,7 +466,7 @@ export async function upsertProduct(orgId: string, p: {
         p.name, p.code ?? null, p.category, p.salePrice ?? 0, p.costPrice ?? 0,
         p.incomeAccountId ?? null, p.expenseAccountId ?? null,
         p.saleTaxId ?? null, p.purchaseTaxId ?? null,
-        p.hsnCode ?? null, p.mrp ?? 0, p.variant ?? null, p.id, orgId,
+        hsnCode, p.mrp ?? 0, p.variant ?? null, p.id, orgId,
       );
       return p.id;
     }
@@ -399,7 +478,7 @@ export async function upsertProduct(orgId: string, p: {
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)`,
       productId, orgId, p.name, p.code ?? null, p.category, p.salePrice ?? 0, p.costPrice ?? 0,
       p.incomeAccountId ?? null, p.expenseAccountId ?? null, p.saleTaxId ?? null, p.purchaseTaxId ?? null,
-      p.hsnCode ?? null, p.mrp ?? 0, p.variant ?? null,
+      hsnCode, p.mrp ?? 0, p.variant ?? null,
     );
     await audit(orgId, actor, 'created', 'product', productId, p.name);
     return productId;

@@ -108,8 +108,8 @@ export async function seed() {
     await run(
       `INSERT INTO organizations (id, name, legal_name, currency, country, gstin, pan, state_code,
                                   fy_start_month, address, city, email, phone, website,
-                                  invoice_terms, invoice_footer, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+                                  invoice_terms, invoice_footer, default_hsn_code, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       orgId, 'Wander Travels', 'Wander Travels Private Limited', 'INR', 'IN',
       // 36 is Telangana, and it is the GSTIN's own first two digits — the pair
       // has to agree or `updateOrganisation` refuses the save. It is also what
@@ -119,7 +119,13 @@ export async function seed() {
       'accounts@wandertravels.in', '+91 40 4000 1234', 'https://wandertravels.in',
       'Cancellation within 15 days of departure attracts 50% of the package value. '
       + 'Visa fees and airline penalties are non-refundable.',
-      'Subject to Hyderabad jurisdiction', nowIso(),
+      'Subject to Hyderabad jurisdiction',
+      // 998555 is "tour operator services", which is what most of this agency's
+      // book is. The last resort in the HSN chain, so a line that is neither a
+      // catalogued product nor on a classified account still reaches the invoice
+      // with a code on it rather than with a blank Rule 46 column.
+      '998555',
+      nowIso(),
     );
 
     const users: Array<[string, string, string, string]> = [
@@ -243,8 +249,32 @@ export async function seed() {
       ['612200', 'Channel Charges — Storage, Ads & Other', 'expense_operating'],
       ['609000', 'Depreciation', 'expense_depreciation'],
     ];
+    /*
+     * THE SAC EACH REVENUE AND COST ACCOUNT IMPLIES.
+     *
+     * The middle step of the chain that fills an invoice line's HSN — product,
+     * then account, then the agency's own. Separate from `chart` above rather
+     * than a fifth column on seventy rows, because only these dozen carry one:
+     * an account like Rent or Retained Earnings never appears on a tax invoice
+     * line and a code against it would be noise.
+     *
+     * These are the Chapter 99 service codes a travel agency actually invoices
+     * under: 998551 air ticketing, 996311 accommodation, 996412/996423 passenger
+     * transport, 998555 tour operator, 998599 other support services. They are
+     * DEFAULTS and the agency is answerable for them, which is why each is
+     * editable on the account — it is a starting chart, not advice.
+     */
+    const sacOfAccount: Record<string, string> = {
+      '400000': '998555', '401000': '996311', '402000': '998551', '403000': '998599',
+      '404000': '996412', '405000': '998555', '406000': '998599', '407000': '998599',
+      '408000': '998551', '409000': '998555',
+      '500000': '996311', '501000': '998551', '502000': '996412', '503000': '998599',
+      '504000': '998555', '505000': '998599', '506000': '998555', '507000': '998555',
+    };
     for (const [code, name, kind, reconcilable] of chart) {
-      acc[code] = await upsertAccount(orgId, { code, name, kind, reconcilable });
+      acc[code] = await upsertAccount(orgId, {
+        code, name, kind, reconcilable, defaultHsnCode: sacOfAccount[code] ?? null,
+      });
     }
 
     // ---------------------------------------------------------- journals

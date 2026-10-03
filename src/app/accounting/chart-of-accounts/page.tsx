@@ -3,11 +3,11 @@ import { ctx } from '@/server/bootstrap';
 import { msg, one, type SearchParams } from '@/lib/range';
 import { accountsWithBalances } from '@/server/accounting/reports';
 import {
-  ACCOUNT_GROUPS, kindLabel, kindGroup, kindSign, drCr, isoDate,
+  ACCOUNT_GROUPS, kindLabel, kindGroup, kindSign, drCr, isoDate, isDocumentLineKind,
 } from '@/lib/accounting';
-import { setReconcilableAction } from '@/app/actions';
+import { setReconcilableAction, setAccountHsnAction } from '@/app/actions';
 import {
-  PageHeader, Card, Banner, Table, Th, Td, Money, StatTile, LinkButton, ToggleSwitch,
+  PageHeader, Card, Banner, Table, Th, Td, Money, StatTile, LinkButton, ToggleSwitch, inputClass,
 } from '@/components/ui';
 
 export const dynamic = 'force-dynamic';
@@ -80,7 +80,8 @@ export default async function ChartOfAccountsPage({ searchParams }: { searchPara
           <Table>
             <thead>
               <tr><Th width="90px">Code</Th><Th>Name</Th><Th>Type</Th>
-                <Th align="center" width="150px">Allow Reconciliation</Th>
+                <Th align="center" width="120px">Default HSN / SAC</Th>
+                <Th align="center" width="150px">Allow Reconcile</Th>
                 <Th align="center" width="60px">Nature</Th>
                 <Th align="right" width="150px">Debit</Th>
                 <Th align="right" width="150px">Credit</Th></tr>
@@ -97,6 +98,54 @@ export default async function ChartOfAccountsPage({ searchParams }: { searchPara
                       </Link>
                     </Td>
                     <Td><span className="text-ink-muted">{kindLabel(a.kind)}</span></Td>
+                    {/*
+                      THE DEFAULT HSN / SAC, editable on the row.
+
+                      Rule 46 requires an HSN (a SAC, for a service) on every
+                      line of a tax invoice, and nothing can work one out for
+                      you: it is a classification the agency assigns and is
+                      answerable for. What a system can do is stop asking twice,
+                      and this is the column that does it — an account and a SAC
+                      classify the same thing from two directions, so everything
+                      posted to Flight Revenue is 998551 and saying so once here
+                      fills it on every invoice afterwards.
+
+                      ONLY ON THE ACCOUNTS THAT CAN CARRY ONE. A bank account or
+                      Retained Earnings never appears on an invoice line, and a
+                      box against it would invite a code that could never be
+                      used while making the column impossible to read down.
+                    */}
+                    <Td align="center">
+                      {isDocumentLineKind(a.kind) ? (
+                        <form action={setAccountHsnAction} className="inline-flex">
+                          <input type="hidden" name="id" value={a.id} />
+                          <input type="hidden" name="return_to"
+                            value={group ? `/accounting/chart-of-accounts?group=${group}` : '/accounting/chart-of-accounts'} />
+                          <input
+                            name="default_hsn_code"
+                            defaultValue={a.default_hsn_code ?? ''}
+                            inputMode="numeric"
+                            maxLength={8}
+                            placeholder="—"
+                            title={`Press Enter to save. The HSN / SAC an invoice or bill line posted to ${a.code} ${a.name} fills itself with — 4, 6 or 8 digits. Blank clears it.`}
+                            className={`${inputClass} num !text-center !w-[96px] !px-1.5 !py-1`}
+                          />
+                          {/*
+                            ENTER SAVES, and this button is what guarantees it.
+                            Implicit submission on a form whose only control is a
+                            text box is the sort of thing browsers disagree
+                            about; a submit button settles it, and it is hidden
+                            because a save button per row on a sixty-row table is
+                            noise in a column meant to be read down. No
+                            JavaScript is involved, which is the rest of this
+                            screen's bargain too.
+                          */}
+                          <button type="submit" className="sr-only" tabIndex={-1}>Save HSN</button>
+                        </form>
+                      ) : (
+                        <span className="text-[11px] text-ink-faint">—</span>
+                      )}
+                    </Td>
                     {/*
                       ALLOW RECONCILIATION — a switch, not a badge.
                       It used to be a "Reconcilable" chip tucked beside the
@@ -143,7 +192,7 @@ export default async function ChartOfAccountsPage({ searchParams }: { searchPara
             */}
             <tfoot>
               <tr className="bg-brand-soft">
-                <Td colSpan={5}>
+                <Td colSpan={6}>
                   <span className="font-extrabold">
                     {group ? `Total — ${group} accounts` : 'Total — all accounts'}
                   </span>
@@ -153,7 +202,7 @@ export default async function ChartOfAccountsPage({ searchParams }: { searchPara
               </tr>
               {!group && (
                 <tr>
-                  <Td colSpan={7}>
+                  <Td colSpan={8}>
                     <span className={`text-[12px] font-bold ${
                       totalDebit === totalCredit ? 'text-positive' : 'text-negative'}`}>
                       {totalDebit === totalCredit

@@ -6,6 +6,7 @@ import { postEntry, reverseEntry, PostingError, type Actor, type PostingLine } f
 import { receivableAccount, payableAccount, requireSetting } from './settings';
 import { audit } from './audit';
 import { searchTokens } from '@/lib/search';
+import { parseGstin, parseHsn, getOrganisation } from './organisation';
 
 /**
  * Customer invoices, vendor bills and both kinds of credit note.
@@ -83,6 +84,17 @@ export interface DocInput {
    * states does not retrospectively change the tax on invoices already raised.
    */
   placeOfSupply?: string | null;
+  /**
+   * The counterparty's GSTIN as this document states it.
+   *
+   * SNAPSHOTTED, for the same reason the place of supply is. A customer typed
+   * straight into the form has no partner record carrying a registration yet,
+   * and a partner who re-registers must not change what an invoice already
+   * issued says. Left unset it falls back to the partner's own — see
+   * `derivePartyGstin` — and a registration given here back-fills a partner that
+   * has none, so it is typed once rather than once per invoice.
+   */
+  partyGstin?: string | null;
   /** Recorded from the Invoice Registration Portal, never generated here. */
   irn?: string | null;
   irnAckNo?: string | null;
@@ -103,7 +115,7 @@ export interface DocRow {
   withheld_tax: number; withholding_tax_id: string | null;
   payment_terms_id: string | null; entry_id: string | null; reversal_of: string | null;
   reversed_by: string | null; note: string | null;
-  place_of_supply: string | null; irn: string | null;
+  place_of_supply: string | null; party_gstin: string | null; irn: string | null;
   irn_ack_no: string | null; irn_ack_date: string | null;
   order_ref: string | null; order_date: string | null;
   created_by: string | null; created_at: string; posted_by: string | null; posted_at: string | null;
@@ -126,15 +138,16 @@ export async function createDocument(input: DocInput, actor: Actor = {}): Promis
          (id, org_id, doc_type, partner_id, journal_id, booking_id, analytic_id,
           doc_date, due_date, payment_terms_id, supplier_ref, currency, rate_e6,
           state, payment_state, withholding_tax_id, note,
-          place_of_supply, irn, irn_ack_no, irn_ack_date, order_ref, order_date,
+          place_of_supply, party_gstin, irn, irn_ack_no, irn_ack_date, order_ref, order_date,
           created_by, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'draft','not_paid',?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'draft','not_paid',?,?,?,?,?,?,?,?,?,?,?)`,
       docId, input.orgId, input.docType, input.partnerId, input.journalId,
       input.bookingId ?? null, input.analyticId ?? null, input.docDate, due,
       input.paymentTermsId ?? null, input.supplierRef ?? null,
       input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
       input.withholdingTaxId ?? null, input.note ?? null,
-      await derivePlaceOfSupply(input), input.irn ?? null, input.irnAckNo ?? null,
+      await derivePlaceOfSupply(input), await derivePartyGstin(input),
+      input.irn ?? null, input.irnAckNo ?? null,
       input.irnAckDate ?? null, input.orderRef ?? null, input.orderDate ?? null,
       actor.id ?? null, nowIso(),
     );
@@ -157,14 +170,15 @@ export async function updateDocument(docId: string, input: DocInput, actor: Acto
     await run(
       `UPDATE documents SET partner_id=?, journal_id=?, booking_id=?, analytic_id=?,
               doc_date=?, due_date=?, payment_terms_id=?, supplier_ref=?, currency=?, rate_e6=?,
-              withholding_tax_id=?, note=?, place_of_supply=?, irn=?, irn_ack_no=?,
+              withholding_tax_id=?, note=?, place_of_supply=?, party_gstin=?, irn=?, irn_ack_no=?,
               irn_ack_date=?, order_ref=?, order_date=?
          WHERE id=? AND org_id=?`,
       input.partnerId, input.journalId, input.bookingId ?? null, input.analyticId ?? null,
       input.docDate, input.dueDate ?? await deriveDueDate(input), input.paymentTermsId ?? null,
       input.supplierRef ?? null, input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
       input.withholdingTaxId ?? null, input.note ?? null,
-      await derivePlaceOfSupply(input), input.irn ?? null, input.irnAckNo ?? null,
+      await derivePlaceOfSupply(input), await derivePartyGstin(input),
+      input.irn ?? null, input.irnAckNo ?? null,
       input.irnAckDate ?? null, input.orderRef ?? null, input.orderDate ?? null,
       docId, input.orgId,
     );
@@ -191,11 +205,46 @@ export async function updateDocument(docId: string, input: DocInput, actor: Acto
 async function derivePlaceOfSupply(input: DocInput): Promise<string | null> {
   const given = (input.placeOfSupply ?? '').trim();
   if (given) return given;
+  /*
+   * A GSTIN TYPED ON THIS DOCUMENT IS CONSULTED BEFORE THE PARTNER RECORD.
+   *
+   * Its first two digits ARE the state, and they are the freshest statement of
+   * it on the page: someone who typed a Maharashtra registration into the form
+   * said Maharashtra, whatever a partner record created months ago still says.
+   * Without this the two new fields disagreed in the one case they most matter
+   * — a first invoice against a customer who exists only as a name — leaving an
+   * invoice printing a 27 GSTIN and taxed as if it were intra-state Delhi.
+   */
+  const typed = (input.partyGstin ?? '').trim().toUpperCase();
+  if (typed.length >= 2 && /^[0-9]{2}/.test(typed)) return typed.slice(0, 2);
   const p = await one<{ state_code: string | null; gstin: string | null }>(
     'SELECT state_code, gstin FROM partners WHERE id = ? AND org_id = ?',
     input.partnerId, input.orgId,
   );
   return p?.state_code ?? (p?.gstin ? p.gstin.slice(0, 2) : null);
+}
+
+/**
+ * The counterparty's GSTIN, from the form if it was given and from the partner
+ * if it was not.
+ *
+ * The same shape as `derivePlaceOfSupply`, and for the same reason: the field is
+ * new, the form cannot require it — an unregistered traveller has none, and B2C
+ * is most of a travel agency's book — and what is stored has to be the
+ * registration this document was raised against rather than whatever the
+ * partner's record happens to say the day it is printed.
+ *
+ * Validated, not merely trimmed. A malformed GSTIN on a tax invoice is the
+ * failure the buyer discovers when their credit does not appear, which is a
+ * quarter later and no longer correctable by editing a draft.
+ */
+async function derivePartyGstin(input: DocInput): Promise<string | null> {
+  const given = parseGstin(input.partyGstin);
+  if (given) return given;
+  const p = await one<{ gstin: string | null }>(
+    'SELECT gstin FROM partners WHERE id = ? AND org_id = ?', input.partnerId, input.orgId,
+  );
+  return p?.gstin ?? null;
 }
 
 async function deriveDueDate(input: DocInput): Promise<string> {
@@ -207,6 +256,57 @@ async function deriveDueDate(input: DocInput): Promise<string> {
   return input.docDate;
 }
 
+/**
+ * The HSN/SAC a line ends up carrying, and where it comes from when the line
+ * does not state one.
+ *
+ * NO SYSTEM CAN DERIVE AN HSN. It is a classification the taxpayer assigns and
+ * answers for under Rule 46, and nothing in "Bali 5D/4N — 2 pax" determines it;
+ * a product that guessed would be putting a number the agency is liable for
+ * onto a statutory document. What a system can do is stop asking for the same
+ * code twice, which is the whole of what this does:
+ *
+ *   the line's own  →  the account it is posted to  →  the agency's default
+ *
+ * Most specific first, and every step is something a person set deliberately.
+ * The form applies the same chain as you type so the column is visibly filled
+ * before anything is saved; this is the server's copy of it, which is what makes
+ * it true for the no-JavaScript path, for a credit note generated from an
+ * invoice, and for anything else that reaches `createDocument` directly.
+ *
+ * ONE QUERY FOR THE WHOLE DOCUMENT, not one per line: a twelve-line invoice on
+ * three accounts is two round trips, not twenty-four.
+ */
+async function resolveLineHsns(orgId: string, lines: DocLineInput[]): Promise<Map<number, string | null>> {
+  const out = new Map<number, string | null>();
+  const needy = lines.map((l, i) => [i, l] as const)
+    .filter(([, l]) => !(l.hsnCode ?? '').trim());
+  for (const [i, l] of lines.entries()) {
+    // Named by line, because a bounced form shows one message and a ten-line
+    // invoice gives no clue which row carried the bad code.
+    const own = parseHsn(l.hsnCode, `HSN / SAC code on line ${i + 1} (${l.name})`);
+    if (own) out.set(i, own);
+  }
+  if (!needy.length) return out;
+
+  const accountIds = [...new Set(needy.map(([, l]) => l.accountId).filter(Boolean))];
+  const byAccount = new Map<string, string | null>();
+  if (accountIds.length) {
+    const rows = await all<{ id: string; default_hsn_code: string | null }>(
+      `SELECT id, default_hsn_code FROM accounts
+        WHERE org_id = ? AND id IN (${accountIds.map(() => '?').join(',')})`,
+      orgId, ...accountIds,
+    );
+    for (const r of rows) byAccount.set(r.id, r.default_hsn_code);
+  }
+  const orgDefault = (await getOrganisation(orgId))?.default_hsn_code ?? null;
+
+  for (const [i, l] of needy) {
+    out.set(i, byAccount.get(l.accountId) || orgDefault || null);
+  }
+  return out;
+}
+
 async function replaceLines(orgId: string, docId: string, lines: DocLineInput[], docAnalytic: string | null) {
   // The split table hangs off the lines, so it goes first: deleting the lines
   // cascades it away anyway, but the order makes that independent of the
@@ -214,6 +314,7 @@ async function replaceLines(orgId: string, docId: string, lines: DocLineInput[],
   // silently.
   await run('DELETE FROM document_line_taxes WHERE document_id = ?', docId);
   await run('DELETE FROM document_lines WHERE document_id = ?', docId);
+  const hsns = await resolveLineHsns(orgId, lines);
   // Sequential, not Promise.all: these inserts share the posting transaction's
   // one connection, and `seq` must land in the order the accountant typed.
   for (const [i, l] of lines.entries()) {
@@ -228,7 +329,7 @@ async function replaceLines(orgId: string, docId: string, lines: DocLineInput[],
       lineId, orgId, docId, i, l.productId ?? null, l.name,
       l.qtyMilli, l.unitPrice, l.discountBps ?? 0, l.taxId ?? null, l.accountId,
       l.analyticId ?? docAnalytic, amounts.subtotal, amounts.taxAmount, amounts.total,
-      (l.hsnCode ?? '').trim() || null, l.mrp ?? 0,
+      hsns.get(i) ?? null, l.mrp ?? 0,
     );
 
     /*
@@ -575,6 +676,10 @@ export async function createCreditNote(
        * any customer whose details have changed since.
        */
       placeOfSupply: doc.place_of_supply,
+      // And its GSTIN, for the same reason: the credit note has to report
+      // against the registration the invoice was raised against, which is not
+      // necessarily the one on the partner's record today.
+      partyGstin: doc.party_gstin,
       orderRef: doc.order_ref,
       orderDate: doc.order_date,
       note: `${opts.reason ?? 'Credit note'} — against ${doc.number}`,
@@ -616,15 +721,33 @@ export async function refreshResidual(orgId: string, docId: string) {
     'SELECT total, withheld_tax, state, doc_type FROM documents WHERE id = ? AND org_id = ?', docId, orgId,
   );
   if (!doc) return;
-  const allocated = await scalar(
-    'SELECT COALESCE(SUM(amount),0) FROM payment_allocations WHERE document_id = ?', docId,
+  /*
+   * SETTLED IS NOT THE SAME AS PAID, AND AN AGENCY CANNOT AFFORD THE CONFUSION.
+   *
+   * An allocation carrying `credit_doc_id` is a credit note applied, not money
+   * received. Counting the two together and calling the result "Paid" told the
+   * reader that a cancelled ₹1,36,500 trip had been collected in full when
+   * ₹60,000 had actually arrived and ₹76,500 had been cancelled — the invoice
+   * that is most important to read correctly, reading exactly backwards.
+   *
+   * The residual is unaffected (a credit note genuinely discharges the debt);
+   * only what the state is CALLED changes. Notes themselves keep "Paid",
+   * where it means the note has been used up rather than money collected.
+   */
+  const sums = await one<{ allocated: number; credited: number }>(
+    `SELECT COALESCE(SUM(amount),0) AS allocated,
+            COALESCE(SUM(CASE WHEN credit_doc_id IS NOT NULL THEN amount ELSE 0 END),0) AS credited
+       FROM payment_allocations WHERE document_id = ?`, docId,
   );
+  const allocated = sums?.allocated ?? 0;
+  const credited = sums?.credited ?? 0;
   const payable = doc.total - (doc.doc_type.startsWith('in_') ? doc.withheld_tax : 0);
   const residual = Math.max(payable - allocated, 0);
+  const isNote = doc.doc_type === 'out_refund' || doc.doc_type === 'in_refund';
 
   let state = 'not_paid';
   if (doc.state === 'cancelled') state = 'reversed';
-  else if (residual === 0 && payable !== 0) state = 'paid';
+  else if (residual === 0 && payable !== 0) state = credited > 0 && !isNote ? 'credited' : 'paid';
   else if (allocated > 0) state = 'partial';
 
   await run('UPDATE documents SET residual=?, payment_state=? WHERE id=?', residual, state, docId);
@@ -637,7 +760,7 @@ export async function refreshResidual(orgId: string, docId: string) {
 export async function getDocument(orgId: string, docId: string): Promise<DocRow | null> {
   return await one<DocRow>(
     `SELECT d.*, p.name AS partner_name, b.ref AS booking_ref,
-            p.gstin AS partner_gstin, p.gst_name AS partner_gst_name,
+            COALESCE(d.party_gstin, p.gstin) AS partner_gstin, p.gst_name AS partner_gst_name,
             p.city AS partner_city, p.state_code AS partner_state_code,
             p.address AS partner_address
        FROM documents d
@@ -760,17 +883,27 @@ export async function listDocuments(orgId: string, f: DocFilter = {}): Promise<D
     // The ORDER REFERENCE is searchable too, and it is the field people
     // actually have in hand: a traveller or a channel quotes the order number
     // they placed, not the invoice number this system assigned afterwards.
+    //
+    // So is the GSTIN, and for the same reason: a GST notice, a GSTR-2B
+    // mismatch and a supplier's own query all arrive quoting a registration
+    // number, and finding every document raised under one is the whole of what
+    // answering them takes. Matched against the DOCUMENT's copy and the
+    // partner's both, so a document saved before the column existed is still
+    // found by it.
     for (const token of searchTokens(f.search)) {
-      clauses.push('(d.number ILIKE ? OR p.name ILIKE ? OR d.supplier_ref ILIKE ? OR d.order_ref ILIKE ? OR d.irn ILIKE ?)');
+      clauses.push(
+        '(d.number ILIKE ? OR p.name ILIKE ? OR d.supplier_ref ILIKE ? OR d.order_ref ILIKE ?'
+        + ' OR d.irn ILIKE ? OR d.party_gstin ILIKE ? OR p.gstin ILIKE ?)',
+      );
       const like = `%${token}%`;
-      params.push(like, like, like, like, like);
+      params.push(like, like, like, like, like, like, like);
     }
   }
 
   const limit = f.limit ?? 200;
   return await all<DocRow>(
     `SELECT d.*, p.name AS partner_name, b.ref AS booking_ref,
-            p.gstin AS partner_gstin, p.gst_name AS partner_gst_name,
+            COALESCE(d.party_gstin, p.gstin) AS partner_gstin, p.gst_name AS partner_gst_name,
             p.city AS partner_city, p.state_code AS partner_state_code,
             p.address AS partner_address
        FROM documents d

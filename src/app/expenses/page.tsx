@@ -6,6 +6,7 @@ import { fmtDate, isoDate, titleise, can } from '@/lib/accounting';
 import { expenseWorkflowAction } from '@/app/actions';
 import {
   PageHeader, Card, Banner, Table, Th, Td, Money, Chip, StatTile, EmptyState, btn, LinkButton,
+  RefLink,
 } from '@/components/ui';
 
 export const dynamic = 'force-dynamic';
@@ -72,7 +73,15 @@ export default async function ExpensesPage({ searchParams }: { searchParams: Pro
                     <Td>{e.employee_name}</Td>
                     <Td><span className="font-semibold">{e.description}</span></Td>
                     <Td><span className="text-ink-muted">{e.account_name}</span></Td>
-                    <Td><span className="text-ink-muted">{e.analytic_name ?? '—'}</span></Td>
+                    <Td>
+                      {e.trip_booking_id
+                        ? (
+                          <RefLink href={`/bookings/${e.trip_booking_id}`}>
+                            {e.analytic_name ?? e.booking_ref ?? 'Trip'}
+                          </RefLink>
+                        )
+                        : <span className="text-ink-muted">{e.analytic_name ?? '—'}</span>}
+                    </Td>
                     <Td>{fmtDate(e.expense_date)}</Td>
                     <Td align="right"><Money value={e.amount + e.tax_amount} bold dash={false} /></Td>
                     <Td>

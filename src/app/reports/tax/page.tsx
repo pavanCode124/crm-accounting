@@ -1,9 +1,9 @@
 import { ctx } from '@/server/bootstrap';
 import { one, resolveRange, type SearchParams } from '@/lib/range';
 import { taxReport } from '@/server/accounting/reports';
-import { fmtDate, titleise } from '@/lib/accounting';
+import { fmtDate, taxGroupLabel } from '@/lib/accounting';
 import { RangeBar } from '@/components/RangeBar';
-import { PageHeader, Card, Table, Th, Td, Money, StatTile, EmptyState, Banner } from '@/components/ui';
+import { PageHeader, Card, Table, Th, Td, Money, StatTile, EmptyState, Banner, btn } from '@/components/ui';
 
 export const dynamic = 'force-dynamic';
 
@@ -37,6 +37,11 @@ export default async function TaxReportPage({ searchParams }: { searchParams: Pr
         title="Tax Report"
         subtitle={`${fmtDate(range.from)} to ${fmtDate(range.to)} · GST collected against GST paid, and tax withheld from suppliers`}
         accent="var(--color-sec-taxes)"
+        actions={
+          <a href={`/api/exports/tax?from=${range.from}&to=${range.to}`} className={btn.ghost}>
+            Export to Excel
+          </a>
+        }
       />
       <RangeBar action="/reports/tax" range={range} />
 
@@ -59,11 +64,23 @@ export default async function TaxReportPage({ searchParams }: { searchParams: Pr
       )}
 
       <div className="mb-5 grid gap-5 lg:grid-cols-2">
-        <Card title="Output GST" subtitle="Charged to customers on posted invoices." padded={false}>
-          <TaxTable rows={tax.output} total={tax.outputTotal} />
+        <Card title="Output GST"
+          subtitle="Charged to customers, net of credit notes raised against them."
+          padded={false}>
+          <TaxTable
+            rows={tax.output} total={tax.outputTotal} base={tax.outputBase}
+            notes={tax.outputNotes} notesBase={tax.outputNotesBase}
+            grossLabel="Invoices" notesLabel="Less credit notes"
+          />
         </Card>
-        <Card title="Input GST" subtitle="Paid to suppliers and claimable as credit." padded={false}>
-          <TaxTable rows={tax.input} total={tax.inputTotal} />
+        <Card title="Input GST"
+          subtitle="Paid to suppliers and claimable as credit, net of debit notes."
+          padded={false}>
+          <TaxTable
+            rows={tax.input} total={tax.inputTotal} base={tax.inputBase}
+            notes={tax.inputNotes} notesBase={tax.inputNotesBase}
+            grossLabel="Bills" notesLabel="Less debit notes"
+          />
         </Card>
       </div>
 
@@ -91,9 +108,19 @@ function rupees(v: number) {
   return `₹${(v / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
 }
 
-function TaxTable({ rows, total }: {
+/**
+ * Each rate, then the gross → notes → net reconciliation under it.
+ *
+ * The per-rate rows are NET of the notes, because that is the liability. But a
+ * net-only table is what made a cancelled trip invisible here: the figure moved
+ * and nothing on the page said why. The three footer rows are the GSTR-1 shape
+ * — outward supplies, the credit notes of Table 9B, and what is actually
+ * payable — so the cancellation is a line someone can point at.
+ */
+function TaxTable({ rows, total, base, notes, notesBase, grossLabel, notesLabel }: {
   rows: Array<{ tax_id: string; name: string; tax_group: string; base: number; amount: number }>;
-  total: number;
+  total: number; base: number; notes: number; notesBase: number;
+  grossLabel: string; notesLabel: string;
 }) {
   if (rows.length === 0) return <EmptyState title="Nothing in this period." />;
   return (
@@ -112,8 +139,23 @@ function TaxTable({ rows, total }: {
         ))}
       </tbody>
       <tfoot>
+        {notes !== 0 && (
+          <>
+            <tr>
+              <Td colSpan={2}><span className="text-ink-muted">{grossLabel}</span></Td>
+              <Td align="right"><Money value={base - notesBase} /></Td>
+              <Td align="right"><Money value={total - notes} /></Td>
+            </tr>
+            <tr>
+              <Td colSpan={2}><span className="text-ink-muted">{notesLabel}</span></Td>
+              <Td align="right"><Money value={notesBase} /></Td>
+              <Td align="right"><Money value={notes} /></Td>
+            </tr>
+          </>
+        )}
         <tr className="bg-brand-soft">
-          <Td colSpan={3}><span className="font-extrabold">Total</span></Td>
+          <Td colSpan={2}><span className="font-extrabold">{notes !== 0 ? 'Net' : 'Total'}</span></Td>
+          <Td align="right"><Money value={base} bold dash={false} /></Td>
           <Td align="right"><Money value={total} bold dash={false} /></Td>
         </tr>
       </tfoot>
@@ -167,16 +209,3 @@ function WithholdingTable({ rows, total }: {
   );
 }
 
-/**
- * `titleise` turns "tds" into "Tds" and "igst" into "Igst", which reads as a
- * typo in a statutory column. The acronyms are spelled the way the return
- * spells them.
- */
-function taxGroupLabel(group: string) {
-  const known: Record<string, string> = {
-    cgst: 'CGST', sgst: 'SGST', igst: 'IGST', utgst: 'UTGST',
-    cess: 'Cess', gst: 'GST', cgst_sgst: 'CGST + SGST',
-    tds: 'TDS', tcs: 'TCS', vat: 'VAT',
-  };
-  return known[group] ?? titleise(group);
-}

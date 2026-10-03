@@ -128,9 +128,29 @@ export default async function OrganisationPage({ searchParams }: { searchParams:
             </div>
           </Card>
 
-          <Card title="Invoice wording"
-            subtitle="Appears under every document. Cancellation policy, bank details, the usual small print.">
+          <Card title="Invoice defaults"
+            subtitle="What every document carries unless it says otherwise — the small print, and the code the taxman wants.">
             <div className="space-y-3">
+              {/*
+                THE LAST RESORT IN THE HSN CHAIN.
+
+                Rule 46 requires an HSN (a SAC, for a service) on every invoice
+                line, and no system can derive one — it is a classification the
+                agency assigns and answers for. So it is asked once, here, and a
+                line that is not a catalogued product, on an account with no code
+                of its own, takes this.
+
+                For a travel agency that is 998555, tour operator services, which
+                is most of the book. A DEFAULT: copied onto the line and editable
+                there, never read back at print time, so changing it cannot
+                restate an invoice already issued.
+              */}
+              <Field label="Default HSN / SAC"
+                hint="The agency's principal service code, for a line nothing more specific classifies. A product's own code wins, then the account's. 998555 is tour operator services.">
+                <input name="default_hsn_code" defaultValue={org.default_hsn_code ?? ''}
+                  disabled={!mayConfigure} inputMode="numeric" maxLength={8}
+                  className={`${inputClass} sm:max-w-[200px]`} placeholder="998555" />
+              </Field>
               <Field label="Terms & conditions">
                 <textarea name="invoice_terms" rows={3} defaultValue={org.invoice_terms ?? ''}
                   disabled={!mayConfigure} className={inputClass}

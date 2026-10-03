@@ -40,6 +40,11 @@ export interface DocFormProps {
   /** GST state codes, for the place-of-supply field. Closed list, by design. */
   states?: Array<[string, string]>;
   /**
+   * The agency's own default HSN/SAC — the last step of the chain that fills a
+   * blank HSN cell (the line's own, then the account's, then this).
+   */
+  defaultHsn?: string;
+  /**
    * The draft being edited, if this is an edit rather than a new document.
    * Only a draft ever reaches here — a posted document is immutable, and the
    * server refuses the update even if the form were reached by hand.
@@ -49,7 +54,7 @@ export interface DocFormProps {
     partnerName?: string; journalId?: string; bookingId?: string; analyticId?: string; date?: string;
     dueDate?: string; paymentTermsId?: string; supplierRef?: string;
     currency?: string; rate?: string; withholdingTaxId?: string; note?: string;
-    placeOfSupply?: string; orderRef?: string; orderDate?: string;
+    placeOfSupply?: string; partyGstin?: string; orderRef?: string; orderDate?: string;
     irn?: string; irnAckNo?: string; irnAckDate?: string;
     lines?: LineDefault[];
   };
@@ -71,29 +76,90 @@ interface Line {
 }
 
 let nextKey = 1;
-const blankLine = (accountId = ''): Line => ({
+const blankLine = (accountId = '', hsn = ''): Line => ({
   key: nextKey++, name: '', qty: '1', price: '', discount: '0',
-  taxId: '', accountId, analyticId: '', hsn: '', mrp: '',
+  taxId: '', accountId, analyticId: '', hsn, mrp: '',
 });
+
+/**
+ * The HSN/SAC an account implies, falling back to the agency's own.
+ *
+ * Module level rather than a closure because a new line needs it before the
+ * component's own state exists — the first row arrives with an account already
+ * selected, and arriving with the matching HSN already in the box is the whole
+ * difference between a column that is filled and a column that is not.
+ */
+function hsnOfAccount(accounts: Option[], orgDefault: string | undefined, accountId: string): string {
+  return accounts.find((a) => a.id === accountId)?.hint || orgDefault || '';
+}
 
 export function DocumentForm(props: DocFormProps) {
   const { docType, partners, journals, accounts, taxes, analytics, bookings, paymentTerms } = props;
   const isBill = docType.startsWith('in_');
   const today = props.defaults?.date ?? new Date().toISOString().slice(0, 10);
 
-  const [lines, setLines] = useState<Line[]>(() =>
-    props.defaults?.lines?.length
-      ? props.defaults.lines.map((l) => ({ key: nextKey++, ...l }))
-      : [blankLine(accounts[0]?.id ?? '')]);
+  const [lines, setLines] = useState<Line[]>(() => {
+    if (props.defaults?.lines?.length) return props.defaults.lines.map((l) => ({ key: nextKey++, ...l }));
+    const first = accounts[0]?.id ?? '';
+    return [blankLine(first, hsnOfAccount(accounts, props.defaultHsn, first))];
+  });
   const [analyticId, setAnalyticId] = useState(props.defaults?.analyticId ?? '');
   // A line with no description or no account is dropped on the server, and the
   // whole form would bounce back empty — everything typed, lost. Catch it here
   // instead, before anything is submitted.
   const [lineError, setLineError] = useState<string | null>(null);
   const [withholdingId, setWithholdingId] = useState(props.defaults?.withholdingTaxId ?? '');
+  const [partnerName, setPartnerName] = useState(props.defaults?.partnerName ?? '');
+  const [gstin, setGstin] = useState(props.defaults?.partyGstin ?? '');
 
   const update = (key: number, patch: Partial<Line>) =>
     setLines((ls) => ls.map((l) => (l.key === key ? { ...l, ...patch } : l)));
+
+  /**
+   * The HSN/SAC a blank cell falls back to: the account's default, then the
+   * agency's.
+   *
+   * THE SAME CHAIN THE SERVER APPLIES, deliberately duplicated — like the
+   * totals above, and for the same reason. The server's copy in `replaceLines`
+   * is the one that decides what is stored; this one exists so the column is
+   * visibly filled while the invoice is being typed, because an HSN that only
+   * appears after saving is an HSN nobody trusts and everyone re-types.
+   *
+   * NO SYSTEM CAN DERIVE AN HSN from a description — it is a classification the
+   * agency assigns and answers for under Rule 46. Every link in this chain is a
+   * code somebody set deliberately, on a product, on an account, or on the
+   * agency; nothing here guesses one.
+   */
+  const hsnFor = (accountId: string) => hsnOfAccount(accounts, props.defaultHsn, accountId);
+
+  /**
+   * Changing a line's account fills a BLANK HSN from it, and leaves a filled one
+   * alone.
+   *
+   * The opposite of how a product behaves, and the asymmetry is the point. A
+   * product IS the authority on what is being sold, so choosing one overrides
+   * the classification. An account is a weaker signal — a single revenue account
+   * carries several SACs in practice — so it may complete the column but must
+   * never overwrite a code someone typed or a product supplied.
+   */
+  const setAccount = (l: Line, accountId: string) =>
+    update(l.key, { accountId, hsn: l.hsn || hsnFor(accountId) });
+
+  /**
+   * Typing a customer or supplier name fills the GSTIN beside it.
+   *
+   * Typed, not chosen — the same idiom as every other partner field here — so a
+   * name with no match leaves the GSTIN for the user to type, and that typed
+   * registration is what back-fills the partner record on save. A name that DOES
+   * match brings its registration with it, and only into an empty box: a GSTIN
+   * already typed is the fresher statement of the two and survives someone
+   * correcting a spelling in the name.
+   */
+  const applyPartner = (name: string) => {
+    setPartnerName(name);
+    const p = partners.find((x) => x.label.toLowerCase() === name.trim().toLowerCase());
+    if (p?.hint && !gstin.trim()) setGstin(p.hint);
+  };
 
   /**
    * Typing a product's name fills the rest of the line from it.
@@ -126,12 +192,16 @@ export function DocumentForm(props: DocFormProps) {
   const applyProduct = (l: Line, name: string) => {
     const p = props.products?.find((x) => x.name.toLowerCase() === name.trim().toLowerCase());
     if (!p) { update(l.key, { name }); return; }
+    const accountId = p.accountId || l.accountId;
     update(l.key, {
       name,
       price: l.price || (p.price ? fmtPlain(p.price) : ''),
-      accountId: p.accountId || l.accountId,
+      accountId,
       taxId: p.taxId ?? l.taxId,
-      hsn: p.hsnCode || l.hsn,
+      // The product's own code wins; a product with none still leaves the line
+      // classified by the account it moved to, rather than blanking a cell that
+      // the previous account had filled.
+      hsn: p.hsnCode || l.hsn || hsnFor(accountId),
       mrp: p.mrp ? fmtPlain(p.mrp) : l.mrp,
     });
   };
@@ -183,9 +253,39 @@ export function DocumentForm(props: DocFormProps) {
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <Field label={isBill ? 'Supplier' : 'Customer'}>
             <input name="partner_name" list="partner-options" required autoComplete="off"
-              defaultValue={props.defaults?.partnerName ?? ''}
+              value={partnerName} onChange={(e) => applyPartner(e.target.value)}
               placeholder={isBill ? 'Who billed it' : 'Who it is billed to'} className={inputClass} />
             <PartnerDatalist id="partner-options" options={partners} />
+          </Field>
+          {/*
+            THE GSTIN BELONGS ON THE DOCUMENT, NOT ONLY ON THE PARTNER.
+
+            A tax invoice that does not carry the buyer's registration is not a
+            tax invoice, and it is the first field their accountant checks —
+            without it they cannot claim the input credit at all. On a vendor
+            bill it is the other direction: the supplier's GSTIN is what the
+            agency's own purchase is matched on in GSTR-2B, and a bill recorded
+            without one is a credit that quietly never arrives.
+
+            It sits beside the name because that is where it is read from — the
+            same certificate, the same glance — and because the name field is
+            TYPED. A customer who does not exist as a master record yet is the
+            path this form is built around, and such a customer has no partner
+            row to inherit a registration from. Typing it here records it on the
+            document AND fills it onto the partner, so it is typed once.
+
+            NOT REQUIRED. Most of a travel agency's book is B2C: an unregistered
+            traveller has no GSTIN, and a blank here is the correct and common
+            answer rather than an omission.
+          */}
+          <Field label="GSTIN"
+            hint={isBill
+              ? "The supplier's registration — what this bill is matched on in GSTR-2B."
+              : "The customer's registration. Blank for an unregistered traveller (B2C)."}>
+            <input name="party_gstin" value={gstin} autoComplete="off"
+              maxLength={15} spellCheck={false}
+              onChange={(e) => setGstin(e.target.value.toUpperCase())}
+              placeholder="27AAACT1234A1Z5" className={`${inputClass} num !text-left`} />
           </Field>
           <Field label="Journal">
             <select name="journal_id" required defaultValue={props.defaults?.journalId ?? journals[0]?.id} className={inputClass}>
@@ -237,7 +337,14 @@ export function DocumentForm(props: DocFormProps) {
             hint="Decides CGST+SGST against IGST. Blank takes the customer's own state.">
             <select name="place_of_supply" className={inputClass}
               defaultValue={props.defaults?.placeOfSupply ?? ''}>
-              <option value="">From the {isBill ? 'supplier' : 'customer'} record</option>
+              {/* Says which fallback will actually apply. A GSTIN typed above
+                  carries the state in its first two digits and is used before
+                  the partner record, so naming the record would be wrong. */}
+              <option value="">
+                {/^[0-9]{2}/.test(gstin.trim())
+                  ? `From the GSTIN (${gstin.trim().slice(0, 2)})`
+                  : `From the ${isBill ? 'supplier' : 'customer'} record`}
+              </option>
               {(props.states ?? []).map(([code, name]) =>
                 <option key={code} value={code}>{code} — {name}</option>)}
             </select>
@@ -328,7 +435,8 @@ export function DocumentForm(props: DocFormProps) {
                     so it sits next to the description rather than behind a
                     disclosure: a column people have to go looking for is a
                     column that stays empty. */}
-                <th className="border-b border-line px-3 py-2 text-left w-[100px]" title="HSN for goods, SAC for a service. Required on a GST tax invoice.">HSN / SAC</th>
+                <th className="border-b border-line px-3 py-2 text-left w-[100px]"
+                    title="HSN for goods, SAC for a service. Required on a GST tax invoice. Filled from the product, or from the account's default, or from the agency's — and always editable.">HSN / SAC</th>
                 <th className="border-b border-line px-3 py-2 text-left w-[120px]">Account</th>
                 <th className="border-b border-line px-3 py-2 text-right w-[80px]">Qty</th>
                 <th className="border-b border-line px-3 py-2 text-right w-[120px]" title="The list price. Shown on the invoice beside what was actually charged; it does not affect the tax or the total.">MRP</th>
@@ -359,7 +467,7 @@ export function DocumentForm(props: DocFormProps) {
                     </td>
                     <td className="border-b border-line px-2 py-1.5">
                       <select name="line_account" value={l.accountId}
-                        onChange={(e) => update(l.key, { accountId: e.target.value })} className={inputClass}>
+                        onChange={(e) => setAccount(l, e.target.value)} className={inputClass}>
                         <option value="">—</option>
                         {accounts.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
                       </select>
@@ -411,7 +519,13 @@ export function DocumentForm(props: DocFormProps) {
         )}
         <div className="flex flex-wrap items-start justify-between gap-4 px-4 py-3">
           <button type="button" className={btn.ghost}
-            onClick={() => setLines((ls) => [...ls, blankLine(accounts[0]?.id ?? '')])}>
+            onClick={() => setLines((ls) => {
+              // A new row inherits the LAST row's account, not the first in the
+              // list: an invoice is nearly always several lines on one account,
+              // and it brings that account's HSN with it.
+              const prev = ls[ls.length - 1]?.accountId || accounts[0]?.id || '';
+              return [...ls, blankLine(prev, hsnFor(prev))];
+            })}>
             + Add line
           </button>
           <dl className="min-w-[280px] space-y-1.5 text-[13.5px]">

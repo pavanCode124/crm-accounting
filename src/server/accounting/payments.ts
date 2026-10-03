@@ -334,11 +334,57 @@ export async function applyCreditNote(orgId: string, creditDocId: string, invoic
   });
 }
 
+/**
+ * Net a posted credit note off the invoice it was raised against.
+ *
+ * A credit note REDUCES A BILL. It is not a refund, and the two are not
+ * interchangeable: the customer is only owed cash to the extent he has already
+ * paid more than the charge being retained. Leaving the note unmatched made the
+ * system say otherwise — the note sat at its full value marked "Not Paid" with
+ * a Pay out box beside it defaulted to that figure, so cancelling a ₹1,36,500
+ * invoice at 70% offered to send ₹95,550 to a customer who had paid a ₹20,000
+ * advance. The ledger was right throughout; the document residuals were the
+ * thing that had never been told the two halves belong together.
+ *
+ * `min(note, invoice)` is the whole rule, and it falls out correctly in every
+ * case because the invoice's residual already carries whatever has been paid:
+ *
+ *   nothing paid    invoice 1,36,500 · note 95,550 → owes 40,950, no refund
+ *   advance 20,000  invoice 1,16,500 · note 95,550 → owes 20,950, no refund
+ *   paid in full    invoice        0 · note 95,550 → refund 95,550
+ *   advance 1,20,000 invoice  16,500 · note 95,550 → refund 79,050
+ *
+ * Whatever is left on the note afterwards is exactly the cash due back, so the
+ * Pay out default becomes correct rather than dangerous.
+ */
+export async function applyCreditToSource(orgId: string, creditDocId: string, actor: Actor = {}): Promise<number> {
+  const credit = await getDocument(orgId, creditDocId);
+  if (!credit || credit.state !== 'posted' || !credit.reversal_of) return 0;
+  const invoice = await getDocument(orgId, credit.reversal_of);
+  if (!invoice || invoice.state !== 'posted') return 0;
+  const amount = Math.min(credit.residual, invoice.residual);
+  if (amount <= 0) return 0;
+  await applyCreditNote(orgId, creditDocId, invoice.id, amount, actor);
+  return amount;
+}
+
+/** Posted customer invoices this partner still owes on, newest first. */
+export async function openInvoicesFor(orgId: string, partnerId: string, docType: string) {
+  return await all<{ id: string; number: string | null; doc_date: string; total: number; residual: number }>(
+    `SELECT id, number, doc_date, total, residual
+       FROM documents
+      WHERE org_id = ? AND partner_id = ? AND doc_type = ?
+        AND state = 'posted' AND residual > 0
+      ORDER BY doc_date DESC, number DESC`,
+    orgId, partnerId, docType,
+  );
+}
+
 /** Undo one allocation — the payment was matched to the wrong invoice. */
 export async function unallocate(orgId: string, allocationId: number, actor: Actor = {}) {
   return await tx(async () => {
-    const a = await one<{ payment_id: string | null; document_id: string; amount: number }>(
-      'SELECT payment_id, document_id, amount FROM payment_allocations WHERE id = ? AND org_id = ?',
+    const a = await one<{ payment_id: string | null; document_id: string; credit_doc_id: string | null; amount: number }>(
+      'SELECT payment_id, document_id, credit_doc_id, amount FROM payment_allocations WHERE id = ? AND org_id = ?',
       allocationId, orgId,
     );
     if (!a) throw new PostingError('Unknown allocation.');
@@ -346,6 +392,28 @@ export async function unallocate(orgId: string, allocationId: number, actor: Act
     if (a.payment_id) {
       await run(`UPDATE payments SET unallocated = ?, state = 'posted' WHERE id = ?`,
         await paymentUnallocated(orgId, a.payment_id), a.payment_id);
+    }
+    /*
+     * A CREDIT NOTE'S ALLOCATION IS A PAIR, AND IT IS UNDONE AS A PAIR.
+     *
+     * `applyCreditNote` writes the match in both directions so each document's
+     * residual falls. Deleting one half left the other still counting itself
+     * consumed: Undo from the invoice freed the invoice while the note stayed
+     * "Paid" with nothing behind it, and the two documents then disagreed about
+     * the same ₹76,500 with no screen showing why.
+     *
+     * Matched on the pair's own shape and deleted by id, so a partner with two
+     * identical allocations loses exactly the one being undone.
+     */
+    if (a.credit_doc_id) {
+      await run(
+        `DELETE FROM payment_allocations WHERE id = (
+           SELECT id FROM payment_allocations
+            WHERE org_id = ? AND document_id = ? AND credit_doc_id = ? AND amount = ?
+            LIMIT 1)`,
+        orgId, a.credit_doc_id, a.document_id, a.amount,
+      );
+      await refreshResidual(orgId, a.credit_doc_id);
     }
     await refreshResidual(orgId, a.document_id);
     await audit(orgId, actor, 'unallocated', 'document', a.document_id, 'Allocation removed');

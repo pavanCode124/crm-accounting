@@ -939,3 +939,46 @@ CREATE INDEX IF NOT EXISTS ix_alloc_settlement ON payment_allocations(settlement
 -- confidently, and wrongly, on every row. An address is for printing; a city
 -- is a datum, and the two are not the same shape.
 ALTER TABLE organizations ADD COLUMN IF NOT EXISTS city TEXT;
+
+-- ---------------------------------------------------------------------------
+-- The GSTIN on the document, and a default HSN/SAC that fills itself in
+-- ---------------------------------------------------------------------------
+-- Two gaps left by the statutory block above, both of the same shape: the field
+-- existed on a master record and had no way of reaching the document.
+
+-- THE COUNTERPARTY'S GSTIN, SNAPSHOTTED ONTO THE DOCUMENT.
+--
+-- It was only ever held on the partner and joined in at print time, which fails
+-- in both directions. A customer or supplier typed straight into the invoice
+-- form — the path this product is built around — has no partner record carrying
+-- a GSTIN yet, so the registration number of the very invoice being raised had
+-- nowhere to go. And joining it at read time means a partner who re-registers,
+-- or whose GSTIN is corrected, retrospectively changes what every invoice
+-- already issued says it was. A GSTIN is part of the document, exactly as the
+-- place of supply is, so it is stored on the document.
+--
+-- Reads COALESCE this over the partner's own, so a document saved before this
+-- column existed still prints the registration it was raised against.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS party_gstin TEXT;
+
+-- A DEFAULT HSN/SAC, SO THE COLUMN FILLS ITSELF.
+--
+-- Rule 46 requires the HSN (or the SAC, for a service) on every line of a tax
+-- invoice, and no system can derive it: it is a classification the taxpayer
+-- assigns and answers for, and nothing in a free-text description determines it.
+-- What a system CAN do is stop asking for the same six digits again.
+--
+-- `products.hsn_code` already covers a catalogued item. These two cover the rest
+-- — and the rest is most of it for a travel agency, where a line is typed as
+-- "Bali 5D/4N — 2 pax" and is not a catalogue row at all. The ACCOUNT is the
+-- right place for the fallback because an account and a SAC classify the same
+-- thing from two directions: everything posted to Air Ticketing Revenue is
+-- 998551, everything posted to Visa Charges is 998599. The ORGANISATION's is the
+-- last resort, the agency's principal service code, for a line on an account
+-- nobody has classified yet.
+--
+-- DEFAULTS, copied onto the line and read back off it afterwards — never
+-- consulted at print time. Reclassifying an account must not restate an invoice
+-- issued last year, which is the same rule the price and the tax already follow.
+ALTER TABLE accounts      ADD COLUMN IF NOT EXISTS default_hsn_code TEXT;
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS default_hsn_code TEXT;

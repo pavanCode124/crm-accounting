@@ -48,7 +48,7 @@ export default async function TripsPage({ searchParams }: { searchParams: Promis
       </div>
 
       <Card title="Thinnest margin first" padded={false}
-        subtitle="The order that matters: a trip losing money is worth more attention than one making it.">
+        subtitle="The order that matters: a trip losing money is worth more attention than one making it. Click a trip to download it in full — every invoice, bill, staff claim, commission and GL line behind the margin.">
         {trips.length === 0 ? (
           <EmptyState title="No trips with posted activity in this window."
             hint="Tag an invoice or a vendor bill to a booking and it appears here." />
@@ -64,7 +64,18 @@ export default async function TripsPage({ searchParams }: { searchParams: Promis
             <tbody>
               {[...trips].sort((a, b) => a.margin - b.margin).map((t) => (
                 <tr key={t.analytic_id} className="hover:bg-canvas">
-                  <Td><span className="font-semibold">{t.name}</span></Td>
+                  <Td>
+                    {/*
+                      A plain <a>, not a <Link>: the href is a download route,
+                      and a client-side navigation to one leaves the router
+                      waiting on a response it can never render.
+                    */}
+                    <a href={`/api/exports/trip/${t.analytic_id}`}
+                      className="font-semibold text-brand hover:underline"
+                      title="Download this trip in full — revenue, costs, GST, commissions and every ledger line">
+                      {t.name}
+                    </a>
+                  </Td>
                   <Td>
                     {t.booking_id
                       ? <Link href={`/bookings/${t.booking_id}`} className="font-bold text-brand hover:underline">
