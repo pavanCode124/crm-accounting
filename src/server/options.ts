@@ -1,6 +1,7 @@
 import 'server-only';
 import { all } from './db';
 import { listAccounts, listJournals, listPartners, listPaymentTerms, listProducts } from './accounting/masters';
+import { listDocuments } from './accounting/documents';
 import { listTaxes, listWithholdingTaxes } from './accounting/tax';
 import { listAnalyticAccounts, listBookings } from './accounting/analytics';
 import { livePackages, packagePrice } from './crm/live';
@@ -8,7 +9,7 @@ import { mirroredPackages } from './crm/mirror';
 import { packageTaxMap, saleTaxOptions, defaultTaxOf, splitInclusive } from './crm/packageTax';
 import { GST_STATES, getOrganisation } from './accounting/organisation';
 import type { DocFormProps } from '@/components/DocumentForm';
-import { isDocumentLineKind, type DocType } from '@/lib/accounting';
+import { isDocumentLineKind, fmtDate, type DocType } from '@/lib/accounting';
 
 /**
  * The dropdown contents every form needs, assembled in one place.
@@ -71,6 +72,43 @@ export async function documentFormOptions(orgId: string, docType: DocType, canPo
     // form tags the lines without a second round trip.
     bookings: (await listBookings(orgId, { limit: 100 }))
       .map((b) => ({ id: b.id, label: `${b.ref} — ${b.title}`, hint: b.analytic_id ?? '' })),
+    /*
+     * THE SALES A VENDOR BILL CAN BE RECORDED AGAINST.
+     *
+     * Only on the purchase side, because that is the only side where the
+     * question means anything: a customer invoice is not bought against
+     * another customer invoice.
+     *
+     * POSTED AND DRAFT BOTH, and deliberately. A trip is very often invoiced
+     * and supplied in the same week, and the hotel's bill can easily arrive
+     * before anybody has got round to posting the sale. Offering only posted
+     * invoices would mean the cost could not be tied to the sale at the moment
+     * it is being recorded — which is the moment somebody knows — and nothing
+     * would bring them together afterwards. Cancelled ones are excluded: there
+     * is no sale there to have a margin.
+     *
+     * NEWEST FIRST AND CAPPED, because this is a dropdown and the invoice a
+     * bill is against is almost always a recent one. The label carries the
+     * customer, the date and the total, which is what identifies a sale to the
+     * person holding a supplier's bill — the invoice number alone does not.
+     */
+    invoices: isBill
+      ? (await listDocuments(orgId, { docType: 'out_invoice', limit: 200 }))
+        .filter((d) => d.state !== 'cancelled')
+        .map((d) => ({
+          id: d.id,
+          label: [
+            d.number ?? d.crm_invoice_number ?? '(draft)',
+            d.partner_name,
+            fmtDate(d.doc_date),
+            `₹${(d.total / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`,
+            d.booking_ref,
+          ].filter(Boolean).join(' · '),
+          hint: d.analytic_id ?? '',
+          total: d.total,
+          date: d.doc_date,
+        }))
+      : [],
     paymentTerms: (await listPaymentTerms(orgId)).map((t) => ({ id: t.id, label: t.name })),
     products: await lineCatalogue(orgId, isBill),
     /*

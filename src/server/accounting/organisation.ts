@@ -50,6 +50,52 @@ export const GST_STATES: Array<[string, string]> = [
   ['36', 'Telangana'], ['37', 'Andhra Pradesh'], ['38', 'Ladakh'], ['97', 'Other Territory'],
 ];
 
+/**
+ * THE UNION TERRITORIES THAT LEVY UTGST, by GST state code.
+ *
+ * A supply made WITHIN one of these, by a supplier registered in the same one,
+ * is CGST plus UTGST under the UTGST Act — not CGST plus SGST. The list is the
+ * union territories WITHOUT a legislature, which is the whole of the
+ * distinction: Delhi, Puducherry and Jammu & Kashmir are union territories too
+ * and they have assemblies, so they levy SGST exactly as a state does and are
+ * deliberately absent here.
+ *
+ *   04 Chandigarh                              26 Dadra & Nagar Haveli and
+ *   31 Lakshadweep                                Daman & Diu
+ *   35 Andaman & Nicobar Islands               38 Ladakh
+ *   97 Other Territory
+ *
+ * Ladakh is in it: it was carved out of Jammu & Kashmir in 2019 as a union
+ * territory with no legislature, and it is the one people get wrong because
+ * the state it came from levies SGST.
+ *
+ * A CLOSED SET IN CODE rather than a column, because it is a fact of the
+ * statute and not a property of the agency. An agency cannot configure
+ * Chandigarh into levying SGST, and a settings page that implied it could
+ * would be offering a way to file against the wrong government.
+ */
+export const UTGST_STATES = new Set(['04', '26', '31', '35', '38', '97']);
+
+/**
+ * Whether a supply between these two places is CGST+UTGST.
+ *
+ * BOTH SIDES MUST BE THE SAME UNION TERRITORY. UTGST is the intra-territory
+ * half, so it only arises where the place of supply equals the supplier's own
+ * registration state AND that state is a union territory without a
+ * legislature. A Chandigarh agency supplying Punjab charges IGST; a Punjab
+ * agency supplying Chandigarh charges IGST too. Getting this wrong in the
+ * permissive direction — "the place of supply is a UT, so UTGST" — is how an
+ * inter-state supply comes to be filed as an intra-territory one.
+ */
+export function isUtgstSupply(
+  sellerStateCode: string | null | undefined,
+  placeOfSupply: string | null | undefined,
+): boolean {
+  const seller = (sellerStateCode ?? '').trim();
+  const place = (placeOfSupply ?? '').trim();
+  return !!seller && seller === place && UTGST_STATES.has(seller);
+}
+
 export function stateName(code: string | null): string | null {
   if (!code) return null;
   return GST_STATES.find(([c]) => c === code)?.[1] ?? code;

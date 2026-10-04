@@ -1,6 +1,7 @@
 import 'server-only';
 import { redirect } from 'next/navigation';
 import { ensureDemoBooks } from './seed';
+import { ensureGstComponents } from './provision';
 import { getSession, NotSignedInError, NoAgencyError, type Session } from './auth';
 
 /**
@@ -43,7 +44,19 @@ export async function ctx(): Promise<Session> {
    */
   await ensureDemoBooks();
   try {
-    return await getSession();
+    const session = await getSession();
+    /*
+     * CONFIGURATION THIS BUILD NEEDS AND OLDER BOOKS DO NOT HAVE.
+     *
+     * Provisioning runs once, on an agency's first sign-in, so an agency
+     * onboarded before UTGST existed has no union-territory tax rows and no
+     * account to post them to — and nothing in the ordinary course of work
+     * would ever give it one. This is the top-up, and it only ever ADDS: it
+     * returns at the first read on books that already have the rows, and it is
+     * remembered per process, so the cost after a cold start is nothing.
+     */
+    await ensureGstComponents(session.orgId);
+    return session;
   } catch (e) {
     if (e instanceof NotSignedInError) redirect('/login');
     /*

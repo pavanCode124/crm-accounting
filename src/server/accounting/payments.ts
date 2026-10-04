@@ -520,6 +520,122 @@ export async function settleTargetedForDocument(
 }
 
 /**
+ * ===========================================================================
+ * MONEY THIS DOCUMENT HAS BEEN TAKEN FOR THAT IS NOT IN THE BOOKS YET.
+ * ===========================================================================
+ * A receipt fetched from TripzoCRM is DRAFTED, deliberately: posting is a
+ * person's act, and an importer that posted straight into the ledger would be
+ * another system writing the agency's books. But a draft is also invisible to
+ * every figure that matters — the residual, the Settled line, the AR ageing —
+ * and the consequence was a posted invoice reading "Settled 0.00 · Still owed
+ * 26,999.00" on a screen that said, four inches higher, that ₹8,500 had
+ * already been collected against it. Both statements were true and the page
+ * did not reconcile them, so the reader is left to decide which to believe.
+ *
+ * WHAT IS RETURNED IS A PENDING FIGURE, NOT A SETTLEMENT. The Balance card
+ * prints it on its own row, under its own heading, below the real Settled
+ * figure — never added into it. A draft has not cleared a debt; it is money
+ * somebody has told us about. Naming it is what lets the two figures sit
+ * beside each other honestly, and it is what turns "why does this not add up"
+ * into "post the receipt".
+ *
+ * ONLY WHAT IS STILL UNALLOCATED AND ONLY AGAINST A LIVE DOCUMENT, so a
+ * cancelled receipt or one already matched does not reappear here as money
+ * waiting to arrive twice.
+ */
+export interface PendingReceipt {
+  id: string;
+  number: string | null;
+  pay_date: string;
+  amount: number;
+  method: string;
+  reference: string | null;
+  is_advance: number;
+  state: string;
+}
+
+export async function pendingReceiptsFor(
+  orgId: string, documentId: string,
+): Promise<PendingReceipt[]> {
+  return await all<PendingReceipt>(
+    `SELECT id, number, pay_date, amount, method, reference, is_advance, state
+       FROM payments
+      WHERE org_id = ? AND target_document_id = ? AND state = 'draft'
+      ORDER BY pay_date, number`,
+    orgId, documentId,
+  );
+}
+
+/**
+ * POST EVERY DRAFTED RECEIPT THIS DOCUMENT WAS TAKEN FOR, AND SETTLE THEM.
+ *
+ * ONE DELIBERATE ACT, NOT AN AUTOMATIC ONE. It is a button on the document,
+ * pressed by a person looking at the figure, because posting a receipt debits
+ * the bank and credits the customer — a real entry in a real ledger, in a
+ * period that may be about to be locked and against a bank line somebody will
+ * reconcile. The import stays a draft; this is the step where the agency says
+ * the money is theirs.
+ *
+ * WHAT IT WILL NOT DO:
+ *   NOT POST THE INVOICE. A receipt can post against a draft invoice and will
+ *     simply sit unallocated until the invoice posts — `settleTargeted` runs
+ *     from both sides. Posting the sale on the user's behalf because they
+ *     asked to record a receipt would be deciding something far larger than
+ *     what was clicked.
+ *   NOT GIVE UP ON THE SET BECAUSE ONE FAILED. A locked period or a missing
+ *     bank account stops that receipt and no other; the rest post, and the
+ *     failures come back named. Three receipts and one problem is a far better
+ *     answer than nothing posted because of the third.
+ *
+ * `allocated` IS MEASURED AS THE FALL IN THE DOCUMENT'S RESIDUAL, not counted
+ * up from what this function allocated itself — and that distinction is a bug
+ * this comment exists to stop coming back. `postPayment` already settles each
+ * receipt against its target on the way out, so the sweep below finds nothing
+ * left to do on a posted invoice and returning ITS figure reported "0 settled,
+ * held on account" about a receipt that had in fact just cleared ₹8,500 of the
+ * balance on screen.
+ *
+ * The residual is the one thing that cannot be wrong about this: it is what
+ * the document owes, recomputed from the allocations, whoever wrote them. And
+ * it stays correct for the case the naive count would also have got wrong —
+ * a receipt larger than the balance, which settles the balance and keeps the
+ * rest on account.
+ */
+export async function postReceiptsForDocument(
+  orgId: string, documentId: string, actor: Actor = {},
+): Promise<{ posted: number; amount: number; allocated: number; failures: string[] }> {
+  const pending = await pendingReceiptsFor(orgId, documentId);
+  const before = (await getDocument(orgId, documentId))?.residual ?? 0;
+  const out = { posted: 0, amount: 0, allocated: 0, failures: [] as string[] };
+  for (const r of pending) {
+    try {
+      await postPayment(orgId, r.id, actor);
+      out.posted++;
+      out.amount += r.amount;
+    } catch (e) {
+      out.failures.push(
+        `${r.number ?? (r.reference ?? 'A receipt')} of ${(r.amount / 100).toFixed(2)}: `
+        + (e instanceof Error ? e.message : 'could not be posted.'),
+      );
+    }
+  }
+  /*
+   * AND THEN MATCH, FROM THIS SIDE AS WELL.
+   *
+   * `postPayment` already calls `settleTargeted` for each one, so on a posted
+   * invoice this finds nothing left to do. It is here for the other order: a
+   * receipt posted while the invoice was still a draft stays unallocated, and
+   * this is the sweep that catches it the moment both sides are in the books —
+   * the same call `postDocument` makes, which costs a read when there is
+   * nothing waiting.
+   */
+  await settleTargetedForDocument(orgId, documentId, actor);
+  const after = (await getDocument(orgId, documentId))?.residual ?? 0;
+  out.allocated = Math.max(0, before - after);
+  return out;
+}
+
+/**
  * Settle every payment in the books that is still waiting on its target.
  *
  * THE BACKFILL, and it is why this is a sweep rather than only a hook. The

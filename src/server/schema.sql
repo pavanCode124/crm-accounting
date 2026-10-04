@@ -1434,3 +1434,55 @@ CREATE TABLE IF NOT EXISTS crm_packages (
   PRIMARY KEY (org_id, crm_id)
 );
 CREATE INDEX IF NOT EXISTS ix_crm_pkg_name ON crm_packages(org_id, package_name);
+
+-- ---------------------------------------------------------------------------
+-- WHICH COMPONENT A TAX ROW IS, SAID ON THE TAX ROW
+-- ---------------------------------------------------------------------------
+-- `taxes.tax_group` was modelled for POSTING alone: a CGST+SGST pair is one
+-- parent of group `cgst_sgst` with two children BOTH marked plain `gst`,
+-- because what the engine needed to know was "this is GST, here is its
+-- account". Every report that asks the other question -- which of IGST, CGST,
+-- SGST or UTGST this component IS -- therefore had nothing to read, and the
+-- Tax Report grouped two different liabilities to two different governments
+-- under one heading reading "GST". A GSTR-3B is filed component-wise; a report
+-- that cannot say which component a figure belongs to cannot be filed from.
+--
+-- The children are re-stamped from their own names, which is what they were
+-- always named for -- the seed calls them "CGST 9%" and "SGST 9%" precisely
+-- because that is what the invoice prints. Idempotent, scoped to the children
+-- of a pair, and it never touches a row an agency has classified itself: only
+-- the `gst` catch-all is moved.
+UPDATE taxes SET tax_group = 'cgst'
+ WHERE tax_group = 'gst' AND name ILIKE 'CGST%'
+   AND id IN (SELECT child_id FROM tax_children);
+UPDATE taxes SET tax_group = 'sgst'
+ WHERE tax_group = 'gst' AND name ILIKE 'SGST%'
+   AND id IN (SELECT child_id FROM tax_children);
+UPDATE taxes SET tax_group = 'utgst'
+ WHERE tax_group = 'gst' AND name ILIKE 'UTGST%'
+   AND id IN (SELECT child_id FROM tax_children);
+
+-- ---------------------------------------------------------------------------
+-- A VENDOR BILL'S SALE
+-- ---------------------------------------------------------------------------
+-- WHICH CUSTOMER INVOICE THIS COST WAS INCURRED FOR, stated on the bill.
+--
+-- A travel agency's costs are bought AGAINST a sale: the hotel is booked
+-- because a traveller bought the package, and the margin on that package is
+-- the invoice less every bill raised for it. The bill form asked for the TRIP
+-- instead, which is the right idea one step removed -- a trip is a CRM booking,
+-- and most agencies raise invoices against travellers who have no booking row
+-- at all, so the field was left blank and the cost reached no trip. A sale that
+-- the agency has invoiced always exists, by definition, and the invoice already
+-- carries the trip when there is one.
+--
+-- So the bill names the INVOICE, and the booking and the analytic account are
+-- COPIED FROM IT at save time rather than asked for again. Trip profitability
+-- is unchanged in how it works -- it is still the analytic tag on the GL line
+-- that makes a cost part of a trip -- it simply now gets tagged, because the
+-- question the form asks is one the user can answer.
+--
+-- Nullable: an office rent bill belongs to no sale, and forcing one would be
+-- inventing a relationship to satisfy a column.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS linked_invoice_id TEXT;
+CREATE INDEX IF NOT EXISTS ix_doc_linked_invoice ON documents(org_id, linked_invoice_id);

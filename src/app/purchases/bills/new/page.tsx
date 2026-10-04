@@ -17,7 +17,7 @@ export default async function NewBillPage({ searchParams }: { searchParams: Prom
     <>
       <PageHeader
         title="New Vendor Bill"
-        subtitle="Tag the trip and the cost lands in its margin as well as in the P&L."
+        subtitle="Name the sale this cost was incurred for and it lands in that sale's margin, and its trip's, as well as in the P&L."
         accent="var(--color-sec-purchases)"
       />
       {m.error && <Banner tone="error">{m.error}</Banner>}

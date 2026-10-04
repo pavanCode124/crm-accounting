@@ -136,6 +136,10 @@ export async function DocumentEdit({ orgId, docId, basePath, role, message }: {
           partnerName: doc.partner_name ?? '',
           journalId: doc.journal_id,
           bookingId: doc.booking_id ?? '',
+          // The sale a vendor bill was bought for. Reopening a bill has to
+          // show the invoice it was recorded against, or saving the edit would
+          // quietly unlink it — and the trip's cost would vanish with it.
+          linkedInvoiceId: doc.linked_invoice_id ?? '',
           analyticId: doc.analytic_id ?? '',
           date: doc.doc_date,
           dueDate: doc.due_date ?? '',

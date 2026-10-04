@@ -31,6 +31,25 @@ export interface DocFormProps {
   taxes: TaxOption[];
   analytics: Option[];
   bookings: Option[];
+  /**
+   * VENDOR BILLS: THE CUSTOMER INVOICES A COST CAN BE RECORDED AGAINST.
+   *
+   * This REPLACES the trip picker on a bill, and the replacement is the point.
+   * A trip here is a CRM booking, and most invoices an agency raises — a
+   * traveller typed into the form, a package sold off the catalogue — never
+   * produce one, so the Trip dropdown frequently did not contain the trip the
+   * purchase clerk meant. It was left blank, the cost was tagged to nothing,
+   * and the trip's margin showed revenue with no cost against it.
+   *
+   * The invoice always exists: it is why the cost is being incurred. Picking
+   * it carries the trip across on the server (`deriveTripFromInvoice`), so
+   * profitability is computed exactly as before — from the analytic tag on the
+   * GL line — off a question the user can actually answer.
+   *
+   * `hint` is the trip the invoice already belongs to, so the form can say
+   * which one the bill is about to join.
+   */
+  invoices?: Array<Option & { total?: number; date?: string }>;
   paymentTerms: Option[];
   withholdingTaxes?: TaxOption[];
   products?: Array<{
@@ -90,7 +109,8 @@ export interface DocFormProps {
    */
   existing?: { id: string };
   defaults?: {
-    partnerName?: string; journalId?: string; bookingId?: string; analyticId?: string; date?: string;
+    partnerName?: string; journalId?: string; bookingId?: string; analyticId?: string;
+    linkedInvoiceId?: string; date?: string;
     dueDate?: string; paymentTermsId?: string; supplierRef?: string;
     currency?: string; rate?: string; withholdingTaxId?: string; note?: string;
     placeOfSupply?: string; partyGstin?: string; supplyType?: 'b2b' | 'b2c';
@@ -448,7 +468,7 @@ export function DocumentForm(props: DocFormProps) {
         editing
           ? 'Changing a figure here rewrites the journal entry behind this document, and records that it was changed.'
           : isBill
-            ? 'What a supplier has charged the agency, against the trip it belongs to.'
+            ? 'What a supplier has charged the agency, against the sale it was bought for.'
             : 'What the customer owes. Posting creates the balanced journal entry behind it.'
       }>
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -521,20 +541,55 @@ export function DocumentForm(props: DocFormProps) {
           <Field label="Due date" hint="Left blank, the payment terms decide it.">
             <input type="date" name="due_date" defaultValue={props.defaults?.dueDate ?? ''} className={inputClass} />
           </Field>
-          <Field label="Trip / booking" hint="Tags every line to the trip, which is what makes its margin real.">
-            <select
-              name="booking_id"
-              className={inputClass}
-              defaultValue={props.defaults?.bookingId ?? ''}
-              onChange={(e) => {
-                const b = bookings.find((x) => x.id === e.target.value);
-                setAnalyticId(b?.hint ?? '');
-              }}
-            >
-              <option value="">—</option>
-              {bookings.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}
-            </select>
-          </Field>
+          {/*
+            ON A BILL THIS IS THE SALE; ON AN INVOICE IT IS THE TRIP.
+
+            A cost is bought AGAINST something, and on a vendor bill the thing
+            it was bought against is the customer invoice — the hotel is booked
+            because a traveller bought the package. Naming the invoice is what
+            makes the margin on that sale computable, and it is a question the
+            person recording the bill can always answer, which the trip
+            dropdown was not: a trip is a CRM booking, most invoices never
+            produce one, so the field sat blank and the cost reached no trip.
+
+            The trip itself still comes across — the server copies the
+            invoice's own booking and analytic account onto the bill — so
+            nothing downstream changes. The sale's own trip is named in the
+            hint so the clerk can see which one the cost is joining.
+
+            A SALE KEEPS THE TRIP PICKER. An invoice is not bought against
+            anything; it IS the thing, and the trip is a property of it.
+          */}
+          {isBill ? (
+            <Field label="Against customer invoice"
+              hint="The sale this cost was incurred for. It carries the trip across, which is what makes the margin on that sale real.">
+              <select
+                name="linked_invoice_id"
+                className={inputClass}
+                defaultValue={props.defaults?.linkedInvoiceId ?? ''}
+              >
+                <option value="">— not against a particular sale</option>
+                {(props.invoices ?? []).map((inv) => (
+                  <option key={inv.id} value={inv.id}>{inv.label}</option>
+                ))}
+              </select>
+            </Field>
+          ) : (
+            <Field label="Trip / booking" hint="Tags every line to the trip, which is what makes its margin real.">
+              <select
+                name="booking_id"
+                className={inputClass}
+                defaultValue={props.defaults?.bookingId ?? ''}
+                onChange={(e) => {
+                  const b = bookings.find((x) => x.id === e.target.value);
+                  setAnalyticId(b?.hint ?? '');
+                }}
+              >
+                <option value="">—</option>
+                {bookings.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}
+              </select>
+            </Field>
+          )}
           {/*
             THE PLACE OF SUPPLY IS NOT DECORATION.
 

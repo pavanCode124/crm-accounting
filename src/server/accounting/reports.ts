@@ -429,6 +429,23 @@ export interface TaxLine {
   note_amount: number;
 }
 
+/**
+ * One statutory component's total — IGST, CGST, SGST, UTGST or cess — across
+ * every rate it was charged at.
+ *
+ * `note_*` is the credit/debit-note share of the same figures, kept apart so a
+ * cancellation is a line somebody can point at rather than a number that
+ * silently moved. Same shape as `TaxLine` minus the identity of the tax row,
+ * because at this level there isn't one: "CGST" is three rates added up.
+ */
+export interface TaxComponent {
+  tax_group: string;
+  base: number;
+  amount: number;
+  note_base: number;
+  note_amount: number;
+}
+
 export async function taxReport(orgId: string, p: Period) {
   /*
    * THE TAXABLE VALUE IS SIGNED, BECAUSE THE TAX IS.
@@ -527,8 +544,74 @@ export async function taxReport(orgId: string, p: Period) {
     )
     : 0;
 
+  /*
+   * ===========================================================================
+   * THE SAME FIGURES, GROUPED THE WAY THE RETURN IS FILED
+   * ===========================================================================
+   * The per-TAX tables above answer "what did each configured rate collect",
+   * which is what an accountant checks a rate change against. A GSTR-3B asks
+   * the other question and only the other question: how much IGST, how much
+   * CGST, how much SGST, how much UTGST, how much cess. Table 3.1 has a box
+   * per component, and there is no box for "GST 18% (Sales)".
+   *
+   * It could not be answered from this report at all. A CGST+SGST pair's two
+   * children were both stamped `gst` (see the migration in schema.sql), so
+   * both halves landed in one undifferentiated heap, and UTGST had nowhere to
+   * land because nothing in the product ever wrote it. Two different
+   * liabilities, to two different governments, reported as one figure.
+   *
+   * THE FOUR BOXES THE RETURN HAS ARE PRINTED WHETHER OR NOT THEY WERE USED,
+   * which is the OPPOSITE rule from the per-rate tables above — and the
+   * difference is what a row means in each. A configured rate nobody charged
+   * is noise. An empty IGST box is a STATEMENT: it says no inter-state supply
+   * was made this period, which the filer has to confirm rather than infer
+   * from a row that is not there. The same for UTGST, which is the one people
+   * forget they have at all.
+   *
+   * Cess and anything else — a VAT row on an overseas supply, say — appear
+   * only when they arose, because those are not boxes on the 3B and an agency
+   * that has never charged cess does not need a nil row for it every month.
+   * Nothing is swept into an "other" bucket: a real liability under a heading
+   * somebody has to think about beats a real liability nobody can see.
+   *
+   * THE TAXABLE VALUE IS PER COMPONENT AND DOES NOT ADD DOWN THE COLUMN. Each
+   * half of an intra-state supply carries the whole taxable value, because the
+   * whole of it bore both halves — so "₹1,74,000 bore CGST" and "₹1,74,000
+   * bore SGST" are both true and their sum is not turnover. The net taxable
+   * value for the period is the `outputBase` figure below, taken once per
+   * family, and that is the one Table 3.1 wants.
+   */
+  const FILED_COMPONENTS = ['igst', 'cgst', 'sgst', 'utgst'];
+  const COMPONENT_ORDER = [...FILED_COMPONENTS, 'cess'];
+  const byComponent = (rs: TaxLine[]): TaxComponent[] => {
+    const acc = new Map<string, TaxComponent>(
+      FILED_COMPONENTS.map((g) => [g, { tax_group: g, base: 0, amount: 0, note_base: 0, note_amount: 0 }]),
+    );
+    for (const r of rs) {
+      const key = r.tax_group;
+      const row = acc.get(key) ?? { tax_group: key, base: 0, amount: 0, note_base: 0, note_amount: 0 };
+      row.base += r.base;
+      row.amount += r.amount;
+      row.note_base += r.note_base;
+      row.note_amount += r.note_amount;
+      acc.set(key, row);
+    }
+    return [...acc.values()]
+      .filter((r) => FILED_COMPONENTS.includes(r.tax_group) || r.base !== 0 || r.amount !== 0)
+      .sort((a, b) => {
+        const ai = COMPONENT_ORDER.indexOf(a.tax_group);
+        const bi = COMPONENT_ORDER.indexOf(b.tax_group);
+        return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi);
+      });
+  };
+
   return {
     output, input, withheld,
+    // Component-wise, which is the shape GSTR-3B Table 3.1 and Table 4 are
+    // filed in. The per-tax tables stay beside them: one says what was
+    // charged, the other says what is owed to whom.
+    outputByGroup: byComponent(output),
+    inputByGroup: byComponent(input),
     outputTotal, inputTotal, withheldTotal, withheldUnpaid,
     // Taxable value alongside the tax, and the credit/debit note split out of
     // each, so the screen can show gross → notes → net on both sides.

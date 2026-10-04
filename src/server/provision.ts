@@ -174,6 +174,17 @@ const CHART: Array<[code: string, name: string, kind: string, reconcilable?: boo
   ['170100', 'Input SGST', 'asset_current'],
   ['170200', 'Input IGST', 'asset_current'],
   /*
+   * UTGST IS NOT SGST UNDER ANOTHER NAME, AND IT NEEDS ITS OWN ACCOUNT.
+   *
+   * A supply inside a union territory WITHOUT a legislature -- Chandigarh,
+   * Lakshadweep, Andaman & Nicobar, Dadra & Nagar Haveli and Daman & Diu, and
+   * Other Territory -- is CGST plus UTGST under the UTGST Act, not CGST plus
+   * SGST. The halves are identical in rate and entirely different in who they
+   * are owed to, and GSTR-3B has a column for each. Posting one to the other's
+   * account files the right rupees against the wrong government.
+   */
+  ['170300', 'Input UTGST', 'asset_current'],
+  /*
    * TAX ALREADY PAID ON THE AGENCY'S BEHALF, AND IT IS AN ASSET.
    *
    * A marketplace that remits a payout has already collected TCS and withheld
@@ -189,6 +200,7 @@ const CHART: Array<[code: string, name: string, kind: string, reconcilable?: boo
   ['210000', 'Output CGST', 'liability_tax'],
   ['210100', 'Output SGST', 'liability_tax'],
   ['210200', 'Output IGST', 'liability_tax'],
+  ['210300', 'Output UTGST', 'liability_tax'],
   ['220000', 'TDS Payable', 'liability_tax'],
   ['230000', 'Customer Refunds Payable', 'liability_current'],
   ['240000', 'Customer Advances', 'liability_current', true],
@@ -586,9 +598,28 @@ export async function provisionOrg(input: ProvisionInput): Promise<ProvisionedBo
  * separately would let somebody invoice a package at half the rate it is due
  * at, which is why `saleTaxOptions` filters children out.
  *
- * IGST IS NOT A PAIR. An interstate or overseas supply is one 18% line with no
+ * IGST IS NOT A PAIR. An interstate or overseas supply is one line with no
  * split, and a ledger that modelled it as a pair would file two liabilities
- * where the law has one.
+ * where the law has one. It is written at EVERY slab the pairs are written at,
+ * because the rate and the split are independent facts: a 5% tour package sold
+ * to a customer in the next state is 5% IGST, and an agency offered only an
+ * 18% inter-state row either charges the wrong rate or raises the invoice
+ * intra-state and credits the wrong government.
+ *
+ * UTGST IS A PAIR, AND IT IS NOT THE SGST PAIR. A supply inside a union
+ * territory without a legislature — Chandigarh, Lakshadweep, Andaman &
+ * Nicobar, Dadra & Nagar Haveli and Daman & Diu, Other Territory — is CGST plus
+ * UTGST under the UTGST Act. Same rate, different statute, different column in
+ * GSTR-3B, different government owed. It is a separate parent rather than a
+ * variant of the SGST one so that what an invoice was raised under is a choice
+ * somebody made and a row somebody can read back, not an inference from the
+ * place of supply at report time.
+ *
+ * EVERY COMPONENT SAYS WHICH COMPONENT IT IS. The children carry `cgst`,
+ * `sgst` and `utgst` rather than a shared `gst`, because that is what every
+ * return and every statement column is keyed on. They used to be all `gst`,
+ * and the Tax Report could then only report the pair as one undifferentiated
+ * figure — which is not a figure GSTR-3B has a box for.
  *
  * TDS is a PURCHASE-side tax and never appears in the sale dropdown: it is
  * withheld from what the agency pays a vendor, not charged to a customer. Its
@@ -600,42 +631,67 @@ async function provisionTaxes(
 ): Promise<Record<string, string>> {
   const taxes: Record<string, string> = {};
 
+  /** Half a slab, printed the way an invoice prints it: 9%, 2.5%, 6%. */
+  const halfLabel = (bps: number) => (bps / 200).toFixed(bps % 200 ? 1 : 0);
+
   for (const scope of ['sale', 'purchase'] as const) {
     const sale = scope === 'sale';
-    for (const bps of [500, 1200, 1800]) {
+
+    /** One parent and its two halves, written once for CGST+SGST and CGST+UTGST. */
+    const pair = async (
+      bps: number, other: 'SGST' | 'UTGST', group: 'cgst_sgst' | 'cgst_utgst',
+      otherAccount: string,
+    ) => {
       const parentId = id('tax');
-      const label = `GST ${bps / 100}%`;
       await run(
         `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
                             price_included, account_id, active)
-         VALUES (?,?,?,'percent',?,?,'cgst_sgst',0,NULL,1)`,
-        parentId, orgId, `${label} (${sale ? 'Sales' : 'Purchase'})`, bps, scope,
+         VALUES (?,?,?,'percent',?,?,?,0,NULL,1)`,
+        parentId, orgId,
+        // The parent names the pair it splits into, because that is the choice
+        // being made on the line: "GST 18%" alone cannot tell a Chandigarh
+        // supply from a Maharashtra one, and the two are different statutes.
+        `GST ${bps / 100}% ${other === 'UTGST' ? 'CGST+UTGST ' : ''}(${sale ? 'Sales' : 'Purchase'})`,
+        bps, scope, group,
       );
       for (const [half, account] of [
         ['CGST', sale ? acc['210000'] : acc['170000']],
-        ['SGST', sale ? acc['210100'] : acc['170100']],
+        [other, otherAccount],
       ] as const) {
         const childId = id('tax');
         await run(
           `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
                               price_included, account_id, active)
-           VALUES (?,?,?,'percent',?,?,'gst',0,?,1)`,
-          childId, orgId, `${half} ${(bps / 200).toFixed(bps % 200 ? 1 : 0)}%`, bps / 2, scope, account,
+           VALUES (?,?,?,'percent',?,?,?,0,?,1)`,
+          childId, orgId, `${half} ${halfLabel(bps)}%`, bps / 2, scope,
+          half.toLowerCase(), account,
         );
         await run('INSERT INTO tax_children (parent_id, child_id) VALUES (?,?)', parentId, childId);
       }
-      taxes[`${scope}_${bps}`] = parentId;
-    }
+      return parentId;
+    };
 
-    const igstId = id('tax');
-    await run(
-      `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
-                          price_included, account_id, active)
-       VALUES (?,?,?,'percent',1800,?,'igst',0,?,1)`,
-      igstId, orgId, `IGST 18% (${sale ? 'Sales' : 'Purchase'})`, scope,
-      sale ? acc['210200'] : acc['170200'],
-    );
-    taxes[`igst_${scope}`] = igstId;
+    for (const bps of [500, 1200, 1800]) {
+      taxes[`${scope}_${bps}`] = await pair(
+        bps, 'SGST', 'cgst_sgst', sale ? acc['210100'] : acc['170100'],
+      );
+      taxes[`${scope}_ut_${bps}`] = await pair(
+        bps, 'UTGST', 'cgst_utgst', sale ? acc['210300'] : acc['170300'],
+      );
+
+      const igstId = id('tax');
+      await run(
+        `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
+                            price_included, account_id, active)
+         VALUES (?,?,?,'percent',?,?,'igst',0,?,1)`,
+        igstId, orgId, `IGST ${bps / 100}% (${sale ? 'Sales' : 'Purchase'})`, bps, scope,
+        sale ? acc['210200'] : acc['170200'],
+      );
+      taxes[`igst_${scope}_${bps}`] = igstId;
+      // The 18% row keeps its old key: it is the one everything else in this
+      // file resolves by name, and renaming it would silently unset defaults.
+      if (bps === 1800) taxes[`igst_${scope}`] = igstId;
+    }
   }
 
   for (const [name, bps, threshold] of [
@@ -654,6 +710,123 @@ async function provisionTaxes(
   }
 
   return taxes;
+}
+
+/**
+ * BRING AN EXISTING SET OF BOOKS UP TO THE GST COMPONENTS IT IS MISSING.
+ *
+ * ===========================================================================
+ * WHY A TOP-UP RATHER THAN A CHANGE TO `provisionTaxes` ALONE
+ * ===========================================================================
+ * `provisionTaxes` runs ONCE, on the first sign-in of an agency, and never
+ * again. Every agency provisioned before UTGST existed therefore has a chart
+ * with no UTGST account in it and no CGST+UTGST row to pick on an invoice — and
+ * no amount of ordinary work creates one, because nothing re-runs provisioning
+ * on books that already exist. Their accountant's only route to a Chandigarh
+ * invoice would be to hand-build two accounts, three parents and six children
+ * and wire them together, which nobody will do and nobody should have to.
+ *
+ * IDEMPOTENT, AND IT ONLY EVER ADDS. The accounts go in through
+ * `upsertAccount`, which matches on the code; the tax rows are written only
+ * when the org has no `utgst` component at all, so an agency that has made its
+ * own is left entirely alone. Nothing existing is renamed, re-rated or
+ * retired: a rate an agency edited is that agency's decision, and a migration
+ * that overwrote it would restate invoices already raised under it.
+ *
+ * ONCE PER PROCESS PER ORG. The check is two cheap reads, but it is on the path
+ * of every page, so the answer is remembered — a cold start pays for it once.
+ */
+const gstComponentsReady = new Set<string>();
+
+export async function ensureGstComponents(orgId: string): Promise<void> {
+  if (gstComponentsReady.has(orgId)) return;
+  const have = await one<{ n: number }>(
+    `SELECT COUNT(*)::int AS n FROM taxes WHERE org_id = ? AND tax_group = 'utgst'`, orgId,
+  );
+  if ((have?.n ?? 0) > 0) { gstComponentsReady.add(orgId); return; }
+
+  /*
+   * THE PAIR IS ONLY WRITTEN IF ITS ACCOUNTS CAN BE FOUND BY CODE.
+   *
+   * An agency that renumbered its chart has no 210000 and must not have a
+   * stray one created underneath it — that is the one way this could make a
+   * ledger worse rather than better. The UTGST accounts themselves are
+   * upserted because they are the thing being added; the CGST halves have to
+   * already exist, since the pair is CGST plus UTGST and inventing the CGST
+   * side would be creating a second output CGST account beside the real one.
+   */
+  const codes = ['210000', '170000'];
+  const existing = new Map<string, string>();
+  for (const code of codes) {
+    const a = await one<{ id: string }>(
+      'SELECT id FROM accounts WHERE org_id = ? AND code = ?', orgId, code,
+    );
+    if (a) existing.set(code, a.id);
+  }
+  if (existing.size < codes.length) { gstComponentsReady.add(orgId); return; }
+
+  const outputUt = await upsertAccount(orgId, {
+    code: '210300', name: 'Output UTGST', kind: 'liability_tax',
+  });
+  const inputUt = await upsertAccount(orgId, {
+    code: '170300', name: 'Input UTGST', kind: 'asset_current',
+  });
+
+  for (const scope of ['sale', 'purchase'] as const) {
+    const sale = scope === 'sale';
+    for (const bps of [500, 1200, 1800]) {
+      const parentId = id('tax');
+      await run(
+        `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
+                            price_included, account_id, active)
+         VALUES (?,?,?,'percent',?,?,'cgst_utgst',0,NULL,1)`,
+        parentId, orgId,
+        `GST ${bps / 100}% CGST+UTGST (${sale ? 'Sales' : 'Purchase'})`, bps, scope,
+      );
+      for (const [half, group, account] of [
+        ['CGST', 'cgst', existing.get(sale ? '210000' : '170000')!],
+        ['UTGST', 'utgst', sale ? outputUt : inputUt],
+      ] as const) {
+        const childId = id('tax');
+        await run(
+          `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
+                              price_included, account_id, active)
+           VALUES (?,?,?,'percent',?,?,?,0,?,1)`,
+          childId, orgId, `${half} ${(bps / 200).toFixed(bps % 200 ? 1 : 0)}%`,
+          bps / 2, scope, group, account,
+        );
+        await run('INSERT INTO tax_children (parent_id, child_id) VALUES (?,?)', parentId, childId);
+      }
+    }
+
+    /*
+     * AND THE INTER-STATE SLABS THE ORIGINAL PROVISIONING LEFT OUT. Only 18%
+     * IGST was ever written, so a 5% package sold to the next state had no row
+     * to be raised under. Written per rate, and only where that rate is
+     * genuinely absent, so an agency that has already added its own 12% IGST
+     * does not acquire a second one.
+     */
+    const igstAccount = await one<{ id: string }>(
+      'SELECT id FROM accounts WHERE org_id = ? AND code = ?', orgId, sale ? '210200' : '170200',
+    );
+    if (!igstAccount) continue;
+    for (const bps of [500, 1200, 1800]) {
+      const already = await one<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM taxes
+          WHERE org_id = ? AND tax_group = 'igst' AND scope = ? AND rate_bps = ?`,
+        orgId, scope, bps,
+      );
+      if ((already?.n ?? 0) > 0) continue;
+      await run(
+        `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
+                            price_included, account_id, active)
+         VALUES (?,?,?,'percent',?,?,'igst',0,?,1)`,
+        id('tax'), orgId, `IGST ${bps / 100}% (${sale ? 'Sales' : 'Purchase'})`,
+        bps, scope, igstAccount.id,
+      );
+    }
+  }
+  gstComponentsReady.add(orgId);
 }
 
 /**

@@ -75,6 +75,30 @@ export interface DocInput {
   journalId: string;
   bookingId?: string | null;
   analyticId?: string | null;
+  /**
+   * VENDOR BILLS: THE CUSTOMER INVOICE THIS COST WAS INCURRED FOR.
+   *
+   * A travel agency's costs are bought AGAINST a sale — the hotel is booked
+   * because somebody bought the package — and the margin on that sale is the
+   * invoice less every bill raised for it. The bill form used to ask for the
+   * TRIP instead, which is the same idea one step removed and in practice
+   * unanswerable: a trip is a CRM booking, most invoices are raised against
+   * travellers with no booking row at all, so the field stayed blank and the
+   * cost reached no trip. The invoice always exists, by definition, because
+   * the agency raised it.
+   *
+   * IT IS NOT A SECOND WAY OF TAGGING A TRIP. `deriveTripFromInvoice` copies
+   * the invoice's own booking and analytic account onto the bill when the bill
+   * does not state them itself, and from there everything downstream is
+   * unchanged: it is still the analytic tag on the GL line that makes a cost
+   * part of a trip's margin. What changed is that the tag now gets set,
+   * because the question the form asks is one the user can answer.
+   *
+   * WHAT THE BILL STATES ITSELF STILL WINS. Someone who picks an invoice AND a
+   * trip has said something deliberate, and a derivation that overrode it
+   * would be the system disagreeing with the person typing.
+   */
+  linkedInvoiceId?: string | null;
   docDate: string;
   dueDate?: string | null;
   paymentTermsId?: string | null;
@@ -157,6 +181,13 @@ export interface DocRow {
   id: string; org_id: string; doc_type: DocType; number: string | null;
   partner_id: string; partner_name?: string; journal_id: string;
   booking_id: string | null; booking_ref?: string | null; analytic_id: string | null;
+  /** Vendor bills: the customer invoice this cost was incurred for. */
+  linked_invoice_id: string | null;
+  /** Joined for display — the invoice's own number and what it was raised for. */
+  linked_invoice_number?: string | null;
+  linked_invoice_date?: string | null;
+  linked_invoice_total?: number | null;
+  linked_invoice_partner?: string | null;
   doc_date: string; due_date: string | null; supplier_ref: string | null;
   currency: string; rate_e6: number; state: string; payment_state: string;
   untaxed: number; tax_total: number; total: number; residual: number;
@@ -193,17 +224,20 @@ export async function createDocument(input: DocInput, actor: Actor = {}): Promis
     // B2B supply is not allowed to reach the ledger without a registration.
     const gstin = await derivePartyGstin(input);
     const supplyType = resolveSupplyType(input, gstin);
+    // A bill records what was spent AGAINST a sale, and the trip comes off
+    // that sale rather than being asked for twice. See `deriveTripFromInvoice`.
+    const trip = await deriveTripFromInvoice(input);
     await run(
       `INSERT INTO documents
-         (id, org_id, doc_type, partner_id, journal_id, booking_id, analytic_id,
+         (id, org_id, doc_type, partner_id, journal_id, booking_id, analytic_id, linked_invoice_id,
           doc_date, due_date, payment_terms_id, supplier_ref, currency, rate_e6,
           state, payment_state, withholding_tax_id, note,
           place_of_supply, party_gstin, supply_type, irn, irn_ack_no, irn_ack_date, order_ref, order_date,
           stated_discount, stated_tax, stated_advance,
           created_by, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'draft','not_paid',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft','not_paid',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       docId, input.orgId, input.docType, input.partnerId, input.journalId,
-      input.bookingId ?? null, input.analyticId ?? null, input.docDate, due,
+      trip.bookingId, trip.analyticId, trip.linkedInvoiceId, input.docDate, due,
       input.paymentTermsId ?? null, input.supplierRef ?? null,
       input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
       input.withholdingTaxId ?? null, input.note ?? null,
@@ -213,7 +247,12 @@ export async function createDocument(input: DocInput, actor: Actor = {}): Promis
       nonNegative(input.statedDiscount), nonNegative(input.statedTax), nonNegative(input.statedAdvance),
       actor.id ?? null, nowIso(),
     );
-    await replaceLines(input.orgId, docId, input.lines, input.analyticId ?? null,
+    // THE DERIVED analytic, not the input's: a bill whose trip came off its
+    // invoice has to tag its LINES with it, because the analytic distribution
+    // the margin is built from is written per line. Passing the raw input here
+    // was the difference between a bill that says which trip it is for and a
+    // trip that knows what it cost.
+    await replaceLines(input.orgId, docId, input.lines, trip.analyticId,
       nonNegative(input.statedTax));
     await recomputeTotals(input.orgId, docId, input.withholdingTaxId ?? null);
     await audit(input.orgId, actor, 'created', 'document', docId,
@@ -232,14 +271,16 @@ export async function updateDocument(docId: string, input: DocInput, actor: Acto
     if (doc.state !== 'draft') throw new PostingError('A posted document cannot be edited here. Use "Amend" on the document, which rewrites its ledger entry in place.');
     const gstin = await derivePartyGstin(input);
     const supplyType = resolveSupplyType(input, gstin);
+    const trip = await deriveTripFromInvoice(input);
     await run(
       `UPDATE documents SET partner_id=?, journal_id=?, booking_id=?, analytic_id=?,
+              linked_invoice_id=?,
               doc_date=?, due_date=?, payment_terms_id=?, supplier_ref=?, currency=?, rate_e6=?,
               withholding_tax_id=?, note=?, place_of_supply=?, party_gstin=?, supply_type=?,
               irn=?, irn_ack_no=?, irn_ack_date=?, order_ref=?, order_date=?,
               stated_discount=?, stated_tax=?, stated_advance=?
          WHERE id=? AND org_id=?`,
-      input.partnerId, input.journalId, input.bookingId ?? null, input.analyticId ?? null,
+      input.partnerId, input.journalId, trip.bookingId, trip.analyticId, trip.linkedInvoiceId,
       input.docDate, input.dueDate ?? await deriveDueDate(input), input.paymentTermsId ?? null,
       input.supplierRef ?? null, input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
       input.withholdingTaxId ?? null, input.note ?? null,
@@ -249,13 +290,86 @@ export async function updateDocument(docId: string, input: DocInput, actor: Acto
       nonNegative(input.statedDiscount), nonNegative(input.statedTax), nonNegative(input.statedAdvance),
       docId, input.orgId,
     );
-    await replaceLines(input.orgId, docId, input.lines, input.analyticId ?? null,
+    await replaceLines(input.orgId, docId, input.lines, trip.analyticId,
       nonNegative(input.statedTax));
     // '' rather than null: null means "leave the withheld amount alone", and an
     // edit that clears the TDS dropdown has to clear the deduction with it.
     await recomputeTotals(input.orgId, docId, input.withholdingTaxId ?? '');
     await audit(input.orgId, actor, 'modified', 'document', docId, 'Draft edited');
   });
+}
+
+/**
+ * THE TRIP A VENDOR BILL BELONGS TO, TAKEN FROM THE SALE IT WAS BOUGHT FOR.
+ *
+ * ===========================================================================
+ * WHY THE BILL ASKS FOR AN INVOICE AND NOT FOR A TRIP
+ * ===========================================================================
+ * Trip profitability is the analytic tag on the GL line — that has not changed
+ * and must not: it is what makes a trip's margin reconcile to the P&L instead
+ * of merely resembling it. What changed is where the tag comes from.
+ *
+ * The bill form used to ask for the TRIP directly, and the honest answer is
+ * that nobody filled it in. A trip here is a `bookings` row, which exists only
+ * for sales that came through the CRM with a lead behind them; the invoices an
+ * agency raises by typing a traveller's name have none. So the purchase clerk
+ * recording what the hotel charged was shown a dropdown that frequently did
+ * not contain the trip they meant, left it blank, and the cost landed in the
+ * P&L tagged to nothing. The margin report then showed revenue with no cost
+ * against it — which does not read as a missing tag, it reads as a very
+ * profitable trip.
+ *
+ * THE INVOICE IS ALWAYS THERE. The agency raised it; that is why the cost is
+ * being incurred. And the invoice already carries the booking and the analytic
+ * account when there is one, so naming the invoice names the trip transitively
+ * and names the sale directly — which is the better answer anyway, because
+ * "what did we spend against this sale" is the question an agency asks about a
+ * one-off package that never became a booking record.
+ *
+ * WHAT THE BILL SAYS ITSELF IS LEFT ALONE. This only ever fills a blank. A
+ * purchase clerk who picked an invoice AND a different trip has said something
+ * deliberate — a shared coach across two departures, say — and a derivation
+ * that overrode it would be the system disagreeing with the person typing.
+ *
+ * AND IT IS ONLY READ ON THE PURCHASE SIDE. An `out_invoice` pointing at
+ * another `out_invoice` is not a cost against a sale, it is a mapping fault,
+ * and copying a trip across it would move one sale's revenue onto another's
+ * margin.
+ */
+async function deriveTripFromInvoice(
+  input: DocInput,
+): Promise<{ bookingId: string | null; analyticId: string | null; linkedInvoiceId: string | null }> {
+  const bookingId = input.bookingId ?? null;
+  const analyticId = input.analyticId ?? null;
+  const linkedInvoiceId = (input.linkedInvoiceId ?? '').trim() || null;
+  if (!linkedInvoiceId || !input.docType.startsWith('in_')) {
+    return { bookingId, analyticId, linkedInvoiceId: input.docType.startsWith('in_') ? linkedInvoiceId : null };
+  }
+
+  const inv = await one<{ id: string; doc_type: string; booking_id: string | null; analytic_id: string | null; number: string | null }>(
+    'SELECT id, doc_type, booking_id, analytic_id, number FROM documents WHERE id = ? AND org_id = ?',
+    linkedInvoiceId, input.orgId,
+  );
+  /*
+   * A LINK TO SOMETHING THAT IS NOT A SALE IS REFUSED RATHER THAN IGNORED.
+   *
+   * Silently dropping it would leave the bill looking linked on the form the
+   * user submitted and unlinked in the books, and the margin they were trying
+   * to build would be short by this cost with nothing on screen to say why.
+   */
+  if (!inv) throw new PostingError('The invoice this bill is against no longer exists.');
+  if (!inv.doc_type.startsWith('out_')) {
+    throw new PostingError(
+      'A vendor bill is recorded against a CUSTOMER INVOICE — the sale the cost was incurred for. '
+      + `${inv.number ?? 'That document'} is not one.`,
+    );
+  }
+
+  return {
+    bookingId: bookingId ?? inv.booking_id,
+    analyticId: analyticId ?? inv.analytic_id,
+    linkedInvoiceId,
+  };
 }
 
 /**
@@ -586,27 +700,33 @@ async function replaceLines(
 /**
  * Which statement column a tax component belongs in.
  *
- * The `taxes` table's own `tax_group` is modelled for POSTING: a CGST+SGST pair
- * is one parent of group `cgst_sgst` with two children that are both plain
- * `gst`, because what the ledger needs to know is "this is GST and here is its
- * account". A statement needs the opposite — which of CGST, SGST, IGST or cess
- * this particular component IS — and the children only differ by name.
+ * The `taxes` table's own `tax_group` now says which component a child is —
+ * `cgst`, `sgst`, `utgst` — and that is the answer whenever it is there. It was
+ * not always: a CGST+SGST pair used to be one parent of group `cgst_sgst` with
+ * two children BOTH marked plain `gst`, because what the ledger needed to know
+ * was "this is GST and here is its account". A statement needs the opposite,
+ * and on rows written under the old shape the group cannot give it.
  *
- * So the name decides, and the group is the fallback. Matching on the name is
- * uncomfortable and it is still the right answer: the seed names them "CGST
- * 9%" and "SGST 9%" precisely because that is what the invoice prints, and a
- * second column duplicating the distinction would be one more thing to get out
- * of step with the one the reader can see.
+ * So the group is consulted first and the NAME is the fallback, which is the
+ * right way round and used to be the wrong one. The seed names them "CGST 9%"
+ * and "UTGST 9%" precisely because that is what the invoice prints, so a
+ * document raised before the groups were split still reports component-wise.
+ *
+ * UTGST IS NOT FOLDED INTO SGST, and that is a correction rather than a
+ * refinement. It used to be, and the two are different statutes owed to
+ * different governments with a column each in GSTR-3B: a Chandigarh supply
+ * reported under SGST credits a state that was never party to it.
  */
 function normaliseTaxGroup(name: string, group: string | null | undefined): string {
+  if (group && ['igst', 'cgst', 'sgst', 'utgst', 'cess', 'tcs', 'tds'].includes(group)) {
+    return group;
+  }
   const n = name.toUpperCase();
   if (n.includes('CESS')) return 'cess';
   if (n.includes('IGST')) return 'igst';
+  if (n.includes('UTGST')) return 'utgst';
   if (n.includes('CGST')) return 'cgst';
-  if (n.includes('SGST') || n.includes('UTGST')) return 'sgst';
-  if (group === 'igst') return 'igst';
-  if (group === 'cess') return 'cess';
-  if (group === 'tcs' || group === 'tds') return group;
+  if (n.includes('SGST')) return 'sgst';
   return group ?? 'other';
 }
 
@@ -908,15 +1028,17 @@ export async function amendDocument(docId: string, input: DocInput, actor: Actor
 
     const gstin = await derivePartyGstin(input);
     const supplyType = resolveSupplyType(input, gstin);
+    const trip = await deriveTripFromInvoice(input);
 
     await run(
       `UPDATE documents SET partner_id=?, journal_id=?, booking_id=?, analytic_id=?,
+              linked_invoice_id=?,
               doc_date=?, due_date=?, payment_terms_id=?, supplier_ref=?, currency=?, rate_e6=?,
               withholding_tax_id=?, note=?, place_of_supply=?, party_gstin=?, supply_type=?,
               irn=?, irn_ack_no=?, irn_ack_date=?, order_ref=?, order_date=?,
               stated_discount=?, stated_tax=?, stated_advance=?
          WHERE id=? AND org_id=?`,
-      input.partnerId, input.journalId, input.bookingId ?? null, input.analyticId ?? null,
+      input.partnerId, input.journalId, trip.bookingId, trip.analyticId, trip.linkedInvoiceId,
       input.docDate, input.dueDate ?? await deriveDueDate(input), input.paymentTermsId ?? null,
       input.supplierRef ?? null, input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
       input.withholdingTaxId ?? null, input.note ?? null,
@@ -926,7 +1048,7 @@ export async function amendDocument(docId: string, input: DocInput, actor: Actor
       nonNegative(input.statedDiscount), nonNegative(input.statedTax), nonNegative(input.statedAdvance),
       docId, input.orgId,
     );
-    await replaceLines(input.orgId, docId, input.lines, input.analyticId ?? null,
+    await replaceLines(input.orgId, docId, input.lines, trip.analyticId,
       nonNegative(input.statedTax));
     await recomputeTotals(input.orgId, docId, input.withholdingTaxId ?? '');
 
@@ -1108,6 +1230,19 @@ export async function createCreditNote(
       journalId: opts.journalId ?? doc.journal_id,
       bookingId: doc.booking_id,
       analyticId: doc.analytic_id,
+      /*
+       * AND THE SALE THE ORIGINAL WAS BOUGHT FOR, on a DEBIT NOTE.
+       *
+       * A supplier's credit for a room the trip never used is a reversal of a
+       * cost against that sale, and it has to reach the same place the cost
+       * did or the margin keeps a cost the agency was refunded. Carried across
+       * rather than asked for again: the note reverses a specific bill, and
+       * that bill already says which sale it was for.
+       *
+       * Null on a CUSTOMER credit note, where `deriveTripFromInvoice` drops it
+       * anyway — a credit note against a sale is not a cost of that sale.
+       */
+      linkedInvoiceId: doc.linked_invoice_id,
       docDate: opts.date,
       dueDate: opts.date,
       currency: doc.currency,
@@ -1222,10 +1357,18 @@ export async function getDocument(orgId: string, docId: string): Promise<DocRow 
             COALESCE(d.party_gstin, p.gstin) AS partner_gstin, p.gst_name AS partner_gst_name,
             p.city AS partner_city, p.state_code AS partner_state_code,
             p.address AS partner_address,
-            c.invoice_number AS crm_invoice_number
+            c.invoice_number AS crm_invoice_number,
+            -- The sale a vendor bill was bought for, named rather than left as
+            -- an id: the screen, the export and the margin report all want the
+            -- invoice's own number, and joining it once here is cheaper than
+            -- three separate reads of the same row.
+            li.number AS linked_invoice_number, li.doc_date AS linked_invoice_date,
+            li.total AS linked_invoice_total, lp.name AS linked_invoice_partner
        FROM documents d
        LEFT JOIN partners p ON p.id = d.partner_id
        LEFT JOIN bookings b ON b.id = d.booking_id
+       LEFT JOIN documents li ON li.id = d.linked_invoice_id AND li.org_id = d.org_id
+       LEFT JOIN partners lp ON lp.id = li.partner_id
        /*
         * The CRM invoice this document was drafted from, if any.
         *
@@ -1334,19 +1477,104 @@ export async function documentLineTaxes(orgId: string, docId: string): Promise<M
  */
 export function taxByGroup(taxes: LineTaxRow[] | undefined) {
   const out = {
-    igst: 0, cgst: 0, sgst: 0, cess: 0, other: 0,
-    igstBps: 0, cgstBps: 0, sgstBps: 0, cessBps: 0,
+    igst: 0, cgst: 0, sgst: 0, utgst: 0, cess: 0, other: 0,
+    igstBps: 0, cgstBps: 0, sgstBps: 0, utgstBps: 0, cessBps: 0,
   };
   for (const t of taxes ?? []) {
     switch (t.tax_group) {
       case 'igst': out.igst += t.amount; out.igstBps += t.rate_bps; break;
       case 'cgst': out.cgst += t.amount; out.cgstBps += t.rate_bps; break;
       case 'sgst': out.sgst += t.amount; out.sgstBps += t.rate_bps; break;
+      /*
+       * ITS OWN COLUMN, NOT THE SGST ONE. A union territory without a
+       * legislature levies UTGST under its own Act and GSTR-3B asks for it
+       * separately; adding it into SGST reports the right rupees against the
+       * wrong government, and leaves the UTGST box of the return at nil on a
+       * month the agency plainly owed it.
+       */
+      case 'utgst': out.utgst += t.amount; out.utgstBps += t.rate_bps; break;
       case 'cess': out.cess += t.amount; out.cessBps += t.rate_bps; break;
       default: out.other += t.amount;
     }
   }
   return out;
+}
+
+/**
+ * ===========================================================================
+ * WHAT WAS SPENT AGAINST ONE SALE — THE MARGIN ON A PACKAGE, DOCUMENT BY
+ * DOCUMENT.
+ * ===========================================================================
+ * The other end of `linked_invoice_id`. Trip Profitability answers this for a
+ * TRIP, out of the analytic distributions, and that remains the authoritative
+ * answer because it is the general ledger sliced rather than a second set of
+ * figures. This answers it for a SALE, which is the question an agency
+ * actually asks about a one-off package: "we invoiced him ₹27,000 — what did
+ * it cost us?"
+ *
+ * THE TWO DO NOT COMPETE. Every bill counted here is tagged to the trip as
+ * well — the server copies the invoice's analytic account onto it, which is
+ * what makes the cost reach the trip at all — so a sale that belongs to a trip
+ * contributes to both and the figures agree. A sale with no trip behind it
+ * contributes only here, and before this feature it contributed nowhere.
+ *
+ * COST IS NET OF TAX, AND THAT IS THE WHOLE OF WHY `untaxed` IS SUMMED RATHER
+ * THAN `total`. Input GST is reclaimed; it is a receivable from the
+ * government, not a cost of the trip. Taking the gross would overstate the
+ * cost of every bill by its GST and understate the margin by the same, which
+ * on an 18% book is the difference between a profitable package and a
+ * loss-making one. The same reasoning applies on the sale side, which is why
+ * the caller compares this against the invoice's own `untaxed`.
+ *
+ * A DEBIT NOTE SUBTRACTS. `in_refund` is a credit from the supplier — the
+ * hotel refunding a room that was not used — and it reduces what the trip
+ * cost. Counting it as another cost would double the error.
+ *
+ * POSTED ONLY. A drafted bill is not a cost; it is an intention. Including
+ * drafts would make a margin that moves when somebody opens a form.
+ */
+export interface LinkedCostRow {
+  id: string;
+  doc_type: string;
+  number: string | null;
+  doc_date: string;
+  partner_name: string | null;
+  supplier_ref: string | null;
+  state: string;
+  untaxed: number;
+  tax_total: number;
+  total: number;
+  residual: number;
+}
+
+export async function costsAgainstInvoice(
+  orgId: string, invoiceId: string,
+): Promise<LinkedCostRow[]> {
+  return await all<LinkedCostRow>(
+    `SELECT d.id, d.doc_type, d.number, d.doc_date, p.name AS partner_name,
+            d.supplier_ref, d.state, d.untaxed, d.tax_total, d.total, d.residual
+       FROM documents d
+       LEFT JOIN partners p ON p.id = d.partner_id
+      WHERE d.org_id = ? AND d.linked_invoice_id = ?
+        AND d.doc_type IN ('in_invoice','in_refund')
+        AND d.state <> 'cancelled'
+      ORDER BY d.doc_date, d.number`,
+    orgId, invoiceId,
+  );
+}
+
+/**
+ * The cost of a sale as one figure: net of input tax, net of supplier credits,
+ * posted bills only.
+ *
+ * Shared between the screen and the payout statement so the two cannot differ
+ * about what a package cost — which they would, written twice, the first time
+ * anybody changed their mind about debit notes.
+ */
+export function costOfLinked(rows: LinkedCostRow[]): number {
+  return rows
+    .filter((r) => r.state === 'posted')
+    .reduce((t, r) => t + (r.doc_type === 'in_refund' ? -r.untaxed : r.untaxed), 0);
 }
 
 export interface DocFilter {
@@ -1413,10 +1641,18 @@ export async function listDocuments(orgId: string, f: DocFilter = {}): Promise<D
             COALESCE(d.party_gstin, p.gstin) AS partner_gstin, p.gst_name AS partner_gst_name,
             p.city AS partner_city, p.state_code AS partner_state_code,
             p.address AS partner_address,
-            c.invoice_number AS crm_invoice_number
+            c.invoice_number AS crm_invoice_number,
+            -- The sale a vendor bill was bought for, named rather than left as
+            -- an id: the screen, the export and the margin report all want the
+            -- invoice's own number, and joining it once here is cheaper than
+            -- three separate reads of the same row.
+            li.number AS linked_invoice_number, li.doc_date AS linked_invoice_date,
+            li.total AS linked_invoice_total, lp.name AS linked_invoice_partner
        FROM documents d
        LEFT JOIN partners p ON p.id = d.partner_id
        LEFT JOIN bookings b ON b.id = d.booking_id
+       LEFT JOIN documents li ON li.id = d.linked_invoice_id AND li.org_id = d.org_id
+       LEFT JOIN partners lp ON lp.id = li.partner_id
        /*
         * The CRM invoice this document was drafted from, if any.
         *

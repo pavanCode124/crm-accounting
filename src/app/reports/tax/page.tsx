@@ -63,6 +63,33 @@ export default async function TaxReportPage({ searchParams }: { searchParams: Pr
         </Banner>
       )}
 
+      {/*
+        THE COMPONENT SPLIT, ABOVE THE RATE TABLES, BECAUSE IT IS WHAT IS FILED.
+
+        GSTR-3B Table 3.1 has one box each for IGST, CGST, SGST/UTGST and cess,
+        and no box at all for "GST 18% (Sales)". The rate tables underneath
+        answer a different and also necessary question — what each configured
+        rate collected, which is how a rate change is checked — but the figures
+        that go on the return are these.
+
+        UTGST IS ITS OWN ROW AND NOT A FOOTNOTE TO SGST. A supply inside
+        Chandigarh, Lakshadweep, the Andamans, Dadra & Nagar Haveli and Daman &
+        Diu, Ladakh or Other Territory is CGST plus UTGST under its own Act,
+        owed to a different government, with its own column on the return.
+      */}
+      <div className="mb-5 grid gap-5 lg:grid-cols-2">
+        <Card title="Output GST by component"
+          subtitle="What goes in GSTR-3B Table 3.1 — one box per component, not per rate."
+          padded={false}>
+          <ComponentTable rows={tax.outputByGroup} netBase={tax.outputBase} total={tax.outputTotal} />
+        </Card>
+        <Card title="Input GST by component"
+          subtitle="The credit claimed, component-wise — GSTR-3B Table 4(A)(5)."
+          padded={false}>
+          <ComponentTable rows={tax.inputByGroup} netBase={tax.inputBase} total={tax.inputTotal} />
+        </Card>
+      </div>
+
       <div className="mb-5 grid gap-5 lg:grid-cols-2">
         <Card title="Output GST"
           subtitle="Charged to customers, net of credit notes raised against them."
@@ -106,6 +133,62 @@ export default async function TaxReportPage({ searchParams }: { searchParams: Pr
 
 function rupees(v: number) {
   return `₹${(v / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+}
+
+/**
+ * The five statutory components, each with the taxable value that bore it.
+ *
+ * THE TAXABLE VALUE COLUMN DOES NOT ADD DOWN, and the footer says so rather
+ * than printing a sum that would be wrong. Both halves of an intra-state
+ * supply are charged on the whole of it, so ₹1,74,000 appears against CGST and
+ * again against SGST and the period's turnover is ₹1,74,000, not ₹3,48,000.
+ * The one figure that IS the period's taxable value is in the footer, taken
+ * once per tax family.
+ *
+ * TAX DOES add down: CGST and SGST are two liabilities and the agency owes
+ * both.
+ */
+function ComponentTable({ rows, netBase, total }: {
+  rows: Array<{ tax_group: string; base: number; amount: number }>;
+  netBase: number; total: number;
+}) {
+  if (rows.length === 0) return <EmptyState title="Nothing in this period." />;
+  return (
+    <Table>
+      <thead>
+        <tr>
+          <Th>Component</Th>
+          <Th align="right">Taxable value</Th>
+          <Th align="right">Tax</Th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => (
+          <tr key={r.tax_group} className="hover:bg-canvas">
+            <Td><span className="font-semibold">{taxGroupLabel(r.tax_group)}</span></Td>
+            <Td align="right"><Money value={r.base} /></Td>
+            <Td align="right"><Money value={r.amount} bold /></Td>
+          </tr>
+        ))}
+      </tbody>
+      <tfoot>
+        <tr>
+          <Td colSpan={2}>
+            <span className="text-[11.5px] text-ink-faint">
+              The taxable value is stated per component and does not add down the column: an
+              intra-state supply bears both halves, so the whole of it appears twice.
+            </span>
+          </Td>
+          <Td />
+        </tr>
+        <tr className="bg-brand-soft">
+          <Td><span className="font-extrabold">Total</span></Td>
+          <Td align="right"><Money value={netBase} bold dash={false} /></Td>
+          <Td align="right"><Money value={total} bold dash={false} /></Td>
+        </tr>
+      </tfoot>
+    </Table>
+  );
 }
 
 /**

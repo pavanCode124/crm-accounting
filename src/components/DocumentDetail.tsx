@@ -2,15 +2,19 @@ import Link from 'next/link';
 import { DOC_TYPES, fmtDate, titleise, isoDate, daysBetween } from '@/lib/accounting';
 import { stateName } from '@/server/accounting/organisation';
 import { fmt, qtyFromMilli, bpsToPct } from '@/lib/money';
-import { getDocument, documentLines, documentLineTaxes } from '@/server/accounting/documents';
-import { allocationsFor, listPayments, openInvoicesFor } from '@/server/accounting/payments';
+import {
+  getDocument, documentLines, documentLineTaxes, costsAgainstInvoice, costOfLinked,
+} from '@/server/accounting/documents';
+import {
+  allocationsFor, listPayments, openInvoicesFor, pendingReceiptsFor,
+} from '@/server/accounting/payments';
 import { auditFor } from '@/server/accounting/audit';
 import { journalEntry } from '@/server/accounting/reports';
 import { bankAccountOptions, journalOptions } from '@/server/options';
 import { mirroredInvoiceOfDocument, mirroredPayments } from '@/server/crm/mirror';
 import {
   postDocumentAction, reverseDocumentAction, creditNoteAction, registerPaymentAction, unallocateAction,
-  allocateAction, applyCreditAction,
+  allocateAction, applyCreditAction, postCrmReceiptsAction,
 } from '@/app/actions';
 import {
   PageHeader, Card, Table, Th, Td, Money, Chip, DefList, btn, inputClass, Field, Banner, RefLink,
@@ -88,6 +92,34 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
   const settledTotal = doc.total - doc.withheld_tax - doc.residual;
   const creditedTotal = allocations.reduce((t, a) => t + (a.credit_doc_id ? a.amount : 0), 0);
   const receivedTotal = settledTotal - creditedTotal;
+  /*
+   * MONEY TAKEN FOR THIS DOCUMENT THAT HAS NOT REACHED THE LEDGER.
+   *
+   * TripzoCRM records a receipt against the invoice it was taken for, and the
+   * importer DRAFTS it rather than posting it — another system does not write
+   * this agency's books. The cost of that correctness was a Balance card
+   * reading "Settled 0.00 · Still owed 26,999.00" four inches under a panel
+   * saying ₹8,500 had been collected: two true statements and no relationship
+   * between them on the page.
+   *
+   * So the drafted receipts are read here and shown on their own row, BELOW
+   * the real Settled figure and never added into it. A draft has settled
+   * nothing; it is money somebody has told us about, and the row says exactly
+   * that with the button that makes it real beside it.
+   */
+  const pendingReceipts = await pendingReceiptsFor(orgId, docId);
+  const pendingTotal = pendingReceipts.reduce((t, p) => t + p.amount, 0);
+  /*
+   * WHAT THIS SALE COST, on the sale itself.
+   *
+   * Only on a customer invoice, because only a sale has a margin. The bills
+   * are the ones recorded AGAINST this invoice — see `linked_invoice_id` —
+   * and the comparison is net of tax on both sides: output GST is the
+   * government's and input GST is reclaimed, so neither belongs in a margin.
+   */
+  const linkedCosts = doc.doc_type === 'out_invoice' ? await costsAgainstInvoice(orgId, docId) : [];
+  const linkedCost = costOfLinked(linkedCosts);
+  const grossMargin = doc.untaxed - linkedCost;
   const openInvoices = isCreditNote && doc.state === 'posted' && doc.residual > 0 && doc.partner_id
     ? await openInvoicesFor(orgId, doc.partner_id, isBill ? 'in_invoice' : 'out_invoice')
     : [];
@@ -156,6 +188,21 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
                   {doc.irn_ack_no && <span className="text-ink-faint"> · ack {doc.irn_ack_no}</span>}
                 </span>] as [string, React.ReactNode]] : []),
               ...(doc.supplier_ref ? [['Supplier reference', doc.supplier_ref] as [string, string]] : []),
+              /*
+               * THE SALE A BILL WAS BOUGHT FOR, and it links BOTH WAYS — plan
+               * section 49, Rule 3. From the cost to the sale it belongs to,
+               * and from the sale to everything spent against it, which is the
+               * margin on that package down to the rupee.
+               */
+              ...(doc.linked_invoice_id ? [['Against invoice',
+                <Link key="li" href={`/sales/invoices/${doc.linked_invoice_id}`}
+                  className="text-brand hover:underline">
+                  {doc.linked_invoice_number ?? '(draft)'}
+                  <span className="text-ink-faint">
+                    {doc.linked_invoice_partner ? ` · ${doc.linked_invoice_partner}` : ''}
+                    {doc.linked_invoice_total ? ` · ${fmt(doc.linked_invoice_total)}` : ''}
+                  </span>
+                </Link>] as [string, React.ReactNode]] : []),
               ...(doc.booking_id ? [['Booking',
                 <Link key="b" href={`/bookings/${doc.booking_id}`} className="text-brand hover:underline">
                   {doc.booking_ref}
@@ -288,6 +335,92 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
           )}
 
           {/*
+            THE MARGIN ON THIS SALE, BUILT FROM DOCUMENTS RATHER THAN ASSERTED.
+
+            Every row is a vendor bill somebody recorded against this invoice,
+            so the figure at the bottom is not an estimate and not a second set
+            of books — it is the same documents the ledger holds, selected by
+            the link the purchase clerk made when they recorded the cost.
+
+            NET OF TAX ON BOTH SIDES. Output GST is collected for the
+            government and input GST is reclaimed from it; a margin that
+            counted either would move with the tax rate rather than with the
+            trading. So the sale's taxable value is compared against the bills'
+            taxable values, and the tax column is shown beside them for the
+            reader rather than inside the arithmetic.
+
+            A DRAFTED BILL IS LISTED BUT NOT COUNTED, and the row says so: it
+            is a cost somebody knows about and the ledger does not, which is
+            worth seeing on this card precisely because it is the figure that
+            is about to change the margin.
+          */}
+          {doc.doc_type === 'out_invoice' && linkedCosts.length > 0 && (
+            <Card title="Spent against this sale"
+              subtitle="Vendor bills recorded against this invoice. Net of tax on both sides — input GST is reclaimed, so it is not a cost."
+              padded={false}>
+              <Table>
+                <thead>
+                  <tr>
+                    <Th>Date</Th><Th>Bill</Th><Th>Supplier</Th>
+                    <Th align="right">Cost</Th><Th align="right">Input GST</Th><Th>State</Th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {linkedCosts.map((c) => (
+                    <tr key={c.id} className="hover:bg-canvas">
+                      <Td><span className="num !text-left">{fmtDate(c.doc_date)}</span></Td>
+                      <Td>
+                        <Link href={`/purchases/bills/${c.id}`} className="font-semibold text-brand hover:underline">
+                          {c.number ?? '(draft)'}
+                        </Link>
+                        {c.doc_type === 'in_refund' && (
+                          <span className="text-ink-faint"> · debit note</span>
+                        )}
+                      </Td>
+                      <Td><span className="text-ink-muted">{c.partner_name}</span></Td>
+                      <Td align="right">
+                        <Money value={c.doc_type === 'in_refund' ? -c.untaxed : c.untaxed} />
+                      </Td>
+                      <Td align="right"><Money value={c.tax_total} /></Td>
+                      <Td><Chip state={c.state} /></Td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr>
+                    <Td colSpan={3}><span className="text-ink-muted">Sale, net of GST</span></Td>
+                    <Td align="right"><Money value={doc.untaxed} /></Td>
+                    <Td colSpan={2} />
+                  </tr>
+                  <tr>
+                    <Td colSpan={3}><span className="text-ink-muted">Cost of sale (posted bills)</span></Td>
+                    <Td align="right"><Money value={linkedCost} /></Td>
+                    <Td colSpan={2} />
+                  </tr>
+                  <tr className="bg-brand-soft">
+                    <Td colSpan={3}><span className="font-extrabold">Gross margin</span></Td>
+                    <Td align="right"><Money value={grossMargin} bold dash={false} /></Td>
+                    <Td colSpan={2}>
+                      <span className="font-semibold">
+                        {doc.untaxed > 0
+                          ? `${((grossMargin / doc.untaxed) * 100).toFixed(1)}%`
+                          : '—'}
+                      </span>
+                    </Td>
+                  </tr>
+                </tfoot>
+              </Table>
+              {linkedCosts.some((c) => c.state !== 'posted') && (
+                <p className="px-5 py-3 text-[12px] text-ink-faint">
+                  A bill still in draft is listed above and is NOT in the cost figure — it has not
+                  reached the ledger, so counting it would make this margin disagree with the P&amp;L.
+                  Post it and the margin moves with it.
+                </p>
+              )}
+            </Card>
+          )}
+
+          {/*
             * THE TWO SYSTEMS' FIGURES, SIDE BY SIDE.
             *
             * An imported document is this ledger's answer about a sale whose
@@ -372,6 +505,8 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
                     then settles it against this document without being asked: TripzoCRM already
                     recorded which invoice the money was taken against, and re-asking here is how
                     the same rupees come to be offered against two invoices.
+                    {pendingTotal > 0 && ' The Balance panel carries the figure still waiting and '
+                      + 'the button that posts all of them at once.'}
                   </p>
                 </div>
               )}
@@ -416,7 +551,36 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
                 <SummaryRow label="Settled" value={settledTotal} />
               )}
               <SummaryRow label={doc.residual > 0 ? 'Still owed' : 'Cleared'} value={doc.residual} bold />
+              {/*
+                * NOT PART OF THE ARITHMETIC ABOVE, AND PLACED BELOW THE TOTAL
+                * TO SAY SO. Everything above this line is the ledger; this is
+                * what another system says it has collected and this one has
+                * not posted. Folding it into Settled would be reporting a
+                * residual that no journal entry supports — which is the whole
+                * reason the import leaves it a draft.
+                */}
+              {pendingTotal > 0 && (
+                <SummaryRow label="Collected in TripzoCRM, not posted" value={pendingTotal} muted />
+              )}
             </dl>
+            {pendingTotal > 0 && (
+              <div className="mt-3 space-y-2 no-print">
+                <p className="text-[12px] text-ink-faint">
+                  {fmt(pendingTotal)} has been received against this {meta.label.toLowerCase()} in
+                  TripzoCRM and drafted here as {pendingReceipts.length} receipt
+                  {pendingReceipts.length === 1 ? '' : 's'}. It is not in Settled above because a
+                  draft has not touched the ledger — posting it debits the bank, credits{' '}
+                  {doc.partner_name}, and settles it against this document without being asked.
+                </p>
+                <form action={postCrmReceiptsAction}>
+                  <input type="hidden" name="id" value={doc.id} />
+                  <input type="hidden" name="doc_type" value={doc.doc_type} />
+                  <button className={`${btn.primary} w-full`}>
+                    Post {pendingReceipts.length === 1 ? 'the receipt' : `${pendingReceipts.length} receipts`} &amp; settle
+                  </button>
+                </form>
+              </div>
+            )}
             {creditedTotal > 0 && !isCreditNote && (
               <p className="mt-3 text-[12px] text-ink-faint">
                 {fmt(creditedTotal)} of this was cancelled by a credit note, not collected.
@@ -685,11 +849,24 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
   );
 }
 
-function SummaryRow({ label, value, bold }: { label: string; value: number; bold?: boolean }) {
+/**
+ * One line of the Balance card.
+ *
+ * `muted` is for a figure that is NOT part of the arithmetic the rest of the
+ * card does — money another system reports and this ledger has not posted.
+ * It is set apart visually, above a rule, because a figure in the same weight
+ * as Settled reads as though it had been added in, and the one thing this row
+ * must never do is look like part of the total.
+ */
+function SummaryRow(
+  { label, value, bold, muted }: { label: string; value: number; bold?: boolean; muted?: boolean },
+) {
   return (
-    <div className="flex justify-between gap-6">
-      <dt className={bold ? 'font-bold' : 'text-ink-muted'}>{label}</dt>
-      <dd><Money value={value} bold={bold} dash={false} /></dd>
+    <div className={`flex justify-between gap-6${muted ? ' mt-2 border-t border-line pt-2' : ''}`}>
+      <dt className={bold ? 'font-bold' : muted ? 'text-ink-faint' : 'text-ink-muted'}>{label}</dt>
+      <dd className={muted ? 'text-ink-faint' : undefined}>
+        <Money value={value} bold={bold} dash={false} />
+      </dd>
     </div>
   );
 }

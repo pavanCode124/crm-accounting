@@ -434,7 +434,10 @@ export interface TripDocItemRow {
   account_code: string | null; account_name: string | null;
   qty_milli: number; unit_price: number; discount_bps: number;
   taxable: number; igst_bps: number; igst: number; cgst_bps: number; cgst: number;
-  sgst_bps: number; sgst: number; cess: number; tax_total: number; total: number;
+  sgst_bps: number; sgst: number;
+  /** The union-territory half, which is a different liability from SGST. */
+  utgst_bps: number; utgst: number;
+  cess: number; tax_total: number; total: number;
   /** Whether this particular line is the one tagged to the trip. */
   on_trip: number;
 }
@@ -576,6 +579,8 @@ export async function tripDossier(orgId: string, analyticId: string): Promise<Tr
               COALESCE(SUM(CASE WHEN lt.tax_group='cgst' THEN lt.amount END),0) AS cgst,
               COALESCE(SUM(CASE WHEN lt.tax_group='sgst' THEN lt.rate_bps END),0) AS sgst_bps,
               COALESCE(SUM(CASE WHEN lt.tax_group='sgst' THEN lt.amount END),0) AS sgst,
+              COALESCE(SUM(CASE WHEN lt.tax_group='utgst' THEN lt.rate_bps END),0) AS utgst_bps,
+              COALESCE(SUM(CASE WHEN lt.tax_group='utgst' THEN lt.amount END),0) AS utgst,
               COALESCE(SUM(CASE WHEN lt.tax_group='cess' THEN lt.amount END),0) AS cess,
               dl.tax_amount AS tax_total, dl.total,
               CASE WHEN dl.analytic_id = ? OR d.analytic_id = ? THEN 1 ELSE 0 END AS on_trip

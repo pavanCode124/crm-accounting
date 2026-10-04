@@ -190,7 +190,7 @@ export function titleise(s: string): string {
 export function taxGroupLabel(group: string): string {
   const known: Record<string, string> = {
     cgst: 'CGST', sgst: 'SGST', igst: 'IGST', utgst: 'UTGST',
-    cess: 'Cess', gst: 'GST', cgst_sgst: 'CGST + SGST',
+    cess: 'Cess', gst: 'GST', cgst_sgst: 'CGST + SGST', cgst_utgst: 'CGST + UTGST',
     tds: 'TDS', tcs: 'TCS', vat: 'VAT',
   };
   return known[group] ?? titleise(group);

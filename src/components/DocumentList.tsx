@@ -210,7 +210,7 @@ export function DocumentFilters({ action, filter, docType }: {
         // download finishes. Navigating the page itself to a file download
         // leaves some browsers on a blank document with no way back.
         formTarget="_blank"
-        title="Download these rows as an Excel workbook, item by item, with the HSN and the tax split per line."
+        title="Download these rows as a payout workbook: a Payout Breakup, Forward Orders and Cancelled or Returned Orders, item by item, with the HSN and the rate-wise tax split per line."
       >
         Export to Excel
       </button>

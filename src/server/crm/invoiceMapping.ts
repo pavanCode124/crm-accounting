@@ -1,6 +1,6 @@
 import 'server-only';
 import { all, one } from '../db';
-import { getOrganisation } from '../accounting/organisation';
+import { getOrganisation, isUtgstSupply } from '../accounting/organisation';
 import type { DocLineInput } from '../accounting/documents';
 
 /**
@@ -157,7 +157,7 @@ export interface MappingContext {
   /** The agency's own GST state, which decides CGST+SGST against IGST. */
   sellerStateCode: string | null;
   /** Active sale taxes that can carry a rate, by rate in basis points. */
-  saleTaxOfRate: Map<number, { intra: string | null; inter: string | null }>;
+  saleTaxOfRate: Map<number, { intra: string | null; inter: string | null; territory: string | null }>;
 }
 
 export async function loadMappingContext(orgId: string): Promise<MappingContext> {
@@ -212,10 +212,22 @@ export async function loadMappingContext(orgId: string): Promise<MappingContext>
       ORDER BY rate_bps`,
     orgId,
   );
-  const saleTaxOfRate = new Map<number, { intra: string | null; inter: string | null }>();
+  /*
+   * THREE WAYS OF CHARGING ONE RATE, NOT TWO.
+   *
+   * `intra` is the CGST+SGST pair, `inter` the IGST row — and `territory` the
+   * CGST+UTGST pair, which is what an intra-TERRITORY supply is charged under.
+   * It used to fall into `intra` by default, because anything not marked
+   * `igst` did, and the importer then drafted a Chandigarh invoice as CGST+SGST
+   * — the right rupees credited to a state that is not party to the supply.
+   */
+  const saleTaxOfRate = new Map<number, {
+    intra: string | null; inter: string | null; territory: string | null;
+  }>();
   for (const t of taxRows) {
-    const slot = saleTaxOfRate.get(t.rate_bps) ?? { intra: null, inter: null };
+    const slot = saleTaxOfRate.get(t.rate_bps) ?? { intra: null, inter: null, territory: null };
     if (t.tax_group === 'igst') slot.inter ??= t.id;
+    else if (t.tax_group === 'cgst_utgst') slot.territory ??= t.id;
     else slot.intra ??= t.id;
     saleTaxOfRate.set(t.rate_bps, slot);
   }
@@ -343,27 +355,39 @@ export function resolveSaleTax(
   const interState = Boolean(
     ctx.sellerStateCode && opts.placeOfSupply && opts.placeOfSupply !== ctx.sellerStateCode,
   );
+  /*
+   * AND WHEN IT IS NOT INTER-STATE, WHICH INTRA IS IT.
+   *
+   * An intra-TERRITORY supply — a Chandigarh agency supplying Chandigarh — is
+   * CGST plus UTGST, not CGST plus SGST. `isUtgstSupply` requires both sides to
+   * be the same union territory without a legislature, which is the whole of
+   * the rule: Delhi and Puducherry have assemblies and levy SGST like any
+   * state, and a UT place of supply against a mainland seller is inter-state.
+   */
+  const territory = !interState && isUtgstSupply(ctx.sellerStateCode, opts.placeOfSupply);
   const slot = ctx.saleTaxOfRate.get(bestRate)!;
-  const taxId = interState ? (slot.inter ?? slot.intra) : (slot.intra ?? slot.inter);
+  const kind = interState ? 'inter' : territory ? 'territory' : 'intra';
+  const label = { inter: 'IGST', territory: 'CGST+UTGST', intra: 'CGST+SGST' }[kind];
+  const wanted = slot[kind];
+  // Preference order after the right row: whatever else can carry the rate.
+  // Better a posted liability in the wrong column than an unposted one — but
+  // never silently, which is what the warning below is for.
+  const taxId = wanted ?? slot.intra ?? slot.territory ?? slot.inter;
 
   if (!taxId) {
     return {
       taxId: null, rateBps: bestRate,
       warning:
-        `Invoice ${opts.invoiceNumber} is a ${interState ? 'inter' : 'intra'}-state supply at `
-        + `${bestRate / 100}%, and this agency has no ${interState ? 'IGST' : 'CGST+SGST'} row at `
-        + 'that rate. The drafted document carries no tax.',
+        `Invoice ${opts.invoiceNumber} is a ${kind === 'territory' ? 'intra-territory' : `${kind}-state`} `
+        + `supply at ${bestRate / 100}%, and this agency has no ${label} row at that rate. `
+        + 'The drafted document carries no tax.',
     };
   }
 
-  // The agency has the rate but only one of the two ways of charging it. The
-  // document still gets a tax — better a posted liability in the wrong column
-  // than an unposted one — but the report says so, by name.
-  const wanted = interState ? slot.inter : slot.intra;
   const warning = wanted ? null
-    : `Invoice ${opts.invoiceNumber} is a ${interState ? 'inter' : 'intra'}-state supply, but only `
-      + `the ${interState ? 'CGST+SGST' : 'IGST'} row exists at ${bestRate / 100}%, so that is what `
-      + 'the draft carries. Check the split before posting — it decides which government is paid.';
+    : `Invoice ${opts.invoiceNumber} is a ${kind === 'territory' ? 'intra-territory' : `${kind}-state`} `
+      + `supply, but this agency has no ${label} row at ${bestRate / 100}%, so the draft carries the `
+      + 'one it has. Check the split before posting — it decides which government is paid.';
 
   return { taxId, rateBps: bestRate, warning };
 }

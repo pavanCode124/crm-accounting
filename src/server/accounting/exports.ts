@@ -17,6 +17,7 @@ import {
   getSettlement, settlementDocuments, settlementCharges, CHARGE_KINDS,
   type SettlementRow, type SettlementDocRow, type SettlementChargeRow,
 } from './settlements';
+import { allocationsFor, pendingReceiptsFor } from './payments';
 import {
   buildXlsx, money, moneyOrDash, rate, text, type Cell, type CellInput, type Sheet,
 } from '../xlsx';
@@ -279,10 +280,25 @@ function valueColumns(r: ItemRow): CellInput[] {
     rate(r.tax.igstBps),
     rate(r.tax.cgstBps),
     rate(r.tax.sgstBps),
+    /*
+     * UTGST HAS ITS OWN PAIR OF COLUMNS, beside SGST rather than inside it.
+     *
+     * The channels' own sheets carry IGST/CGST/SGST/CESS and stop, because a
+     * marketplace selling goods across the mainland rarely meets one — but a
+     * travel agency does: a Chandigarh, Andamans, Lakshadweep or Ladakh
+     * operator's entire intra-territory book is CGST+UTGST, and folding it
+     * into the SGST column reports every rupee of it against a state
+     * government that is not party to the supply. The column is added rather
+     * than substituted, so the sheet still lines up with a channel statement
+     * for every other column, and it reads "-" for the agencies that never
+     * make one.
+     */
+    rate(r.tax.utgstBps),
     rate(r.tax.cessBps),
     moneyOrDash(r.tax.igst),
     moneyOrDash(r.tax.cgst),
     moneyOrDash(r.tax.sgst),
+    moneyOrDash(r.tax.utgst),
     moneyOrDash(r.tax.cess),
     money(r.line.tax_amount),
     money(r.line.total),
@@ -326,8 +342,8 @@ const FORWARD_HEADERS = [
   'Item ID', 'Product Name', 'Variant Description', 'Business Category',
   'L0 Category', 'L1 Category', 'L2 Category', 'Order Status', 'HSN Code',
   'Quantity', 'MRP (Rs)', 'Selling Price (Rs)',
-  'IGST %', 'CGST %', 'SGST %', 'CESS %',
-  'IGST Value', 'CGST Value', 'SGST Value', 'CESS Value',
+  'IGST %', 'CGST %', 'SGST %', 'UTGST %', 'CESS %',
+  'IGST Value', 'CGST Value', 'SGST Value', 'UTGST Value', 'CESS Value',
   'Total Tax', 'Total Gross Bill Amount',
   'Commission %', 'Commission Charge (Rs)', 'Commission GST (Rs)',
   'Shipping Charge (Rs)', 'Shipping GST (Rs)',
@@ -336,8 +352,21 @@ const FORWARD_HEADERS = [
   'Bank UTR', 'Settlement Date', 'Settlement Status', 'Unsettled Amount',
 ];
 
+/**
+ * `title` is what the sheet's first cell says and `name` is what the TAB says,
+ * and they are deliberately allowed to differ.
+ *
+ * The tab is part of the contract described at the top of this file: a payout
+ * workbook has a Payout Breakup, a Forward Orders and a Cancelled or Returned
+ * Orders, in that order, and anything reading these files by sheet name —
+ * including the person who has the channel's own workbook open beside it —
+ * must find them where they always are. The TITLE is free to carry what this
+ * particular export is of ("Customer Invoices", "Orders", a date range), which
+ * is the context the tab cannot hold without breaking the contract.
+ */
 function forwardSheet(
-  rows: ItemRow[], seller: Seller, settlement: SettlementRow | null, title = 'Forward Orders',
+  rows: ItemRow[], seller: Seller, settlement: SettlementRow | null,
+  title = 'Forward Orders', name = 'Forward Orders',
 ): Sheet {
   const body: CellInput[][] = [
     [text(title, 'title')],
@@ -381,13 +410,13 @@ function forwardSheet(
   });
 
   return {
-    name: title,
+    name,
     rows: body,
     // Measured against the headings, which are long: a column narrower than its
     // own heading shows "########" for money and clips the heading, and the
     // reader cannot tell which column they are looking at.
     cols: [7, 20, 16, 11, 13, 22, 26, 22, 16, 20, 16, 16, 20, 11, 30, 26, 20,
-      18, 18, 18, 14, 11, 10, 12, 14, 9, 9, 9, 9, 12, 12, 12, 12, 12, 16,
+      18, 18, 18, 14, 11, 10, 12, 14, 9, 9, 9, 10, 9, 12, 12, 12, 13, 12, 12, 16,
       13, 15, 15, 14, 14, 12, 14, 14, 14, 13, 15, 18, 15, 16, 15],
     // The header row stays put and so do the first two columns: a 50-column
     // sheet scrolled to the charges has otherwise lost both the heading and the
@@ -409,8 +438,8 @@ const RETURN_HEADERS = [
   'Item ID', 'Product Name', 'Variant Description', 'Business Category',
   'L0 Category', 'L1 Category', 'L2 Category', 'Order Status', 'HSN Code',
   'Quantity', 'MRP (Rs)', 'Selling Price (Rs)',
-  'IGST (%)', 'CGST (%)', 'SGST (%)', 'Cess (%)',
-  'IGST Value', 'CGST Value', 'SGST Value', 'CESS Value',
+  'IGST (%)', 'CGST (%)', 'SGST (%)', 'UTGST (%)', 'Cess (%)',
+  'IGST Value', 'CGST Value', 'SGST Value', 'UTGST Value', 'CESS Value',
   'Total Tax', 'Total Gross Bill Amount',
   'Commission %', 'Commission Charge (Rs)', 'Commission GST (Rs)',
   'Shipping Charge (Rs)', 'Shipping GST (Rs)',
@@ -474,8 +503,8 @@ function returnSheet(rows: ItemRow[], seller: Seller, settlement: SettlementRow 
     name: 'Cancelled or Returned Orders',
     rows: body,
     cols: [7, 20, 20, 20, 16, 18, 22, 22, 26, 16, 16, 20, 16, 16, 20, 11, 30,
-      26, 20, 18, 18, 18, 14, 11, 10, 12, 14, 10, 10, 10, 10, 12, 12, 12, 12,
-      12, 16, 13, 15, 15, 14, 14, 12, 14, 14, 14, 18, 16, 16, 15, 15],
+      26, 20, 18, 18, 18, 14, 11, 10, 12, 14, 10, 10, 10, 11, 10, 12, 12, 12, 13,
+      12, 12, 16, 13, 15, 15, 14, 14, 12, 14, 14, 14, 18, 16, 16, 15, 15],
     freezeRows: 5,
     freezeCols: 2,
   };
@@ -735,6 +764,52 @@ export async function taxWorkbook(
     ],
   });
 
+  /*
+   * THE COMPONENT BLOCK, AND IT IS THE PART THAT GETS FILED.
+   *
+   * GSTR-3B Table 3.1 has a box for IGST, a box for CGST, a box for SGST/UTGST
+   * and a box for cess. It has no box for "GST 18% (Sales)", which is what
+   * every other table in this workbook is keyed on — so without this the
+   * person filing has to add the rate rows up by component themselves, by
+   * reading the names, which is exactly the re-keying these exports exist to
+   * remove.
+   *
+   * IGST AND UTGST ARE WRITTEN EVEN AT NIL, and `taxReport` is what guarantees
+   * it — the four statutory components always come back, in the order the
+   * return prints them, so this is a plain map rather than a merge against a
+   * list of its own. The rate tables drop what did not arise because a
+   * configured rate nobody used is noise; a RETURN BOX is the opposite, and an
+   * empty IGST box is the statement that no inter-state supply was made.
+   */
+  const componentRows = (
+    rows: Array<{ tax_group: string; base: number; amount: number }>,
+  ): CellInput[][] => rows.map(
+    (r) => [text(taxGroupLabel(r.tax_group)), moneyOrDash(r.base), moneyOrDash(r.amount)],
+  );
+
+  const componentSheet = (name: string, title: string, rows: Array<{
+    tax_group: string; base: number; amount: number;
+  }>, netBase: number, total: number): Sheet => ({
+    name,
+    cols: [22, 20, 20],
+    freezeRows: 5,
+    rows: [
+      ...head(title),
+      [text('Component', 'header'), text('Taxable value', 'header'), text('Tax', 'header')],
+      ...componentRows(rows),
+      [],
+      // The taxable value is per component and does not add down — both halves
+      // of an intra-state supply bear the whole of it. The footer carries the
+      // figure that IS the period's turnover, taken once per tax family, so
+      // nobody adds the column above and files the double.
+      [text('Taxable value for the period', 'section'), money(netBase, 'sectionMoney'),
+        money(total, 'sectionMoney')],
+      [],
+      [text('Stated per component: an intra-state supply bears CGST and SGST on the whole of its', 'muted')],
+      [text('value, so the column above repeats it. The total is taken once per supply.', 'muted')],
+    ],
+  });
+
   const summary: Sheet = {
     name: 'Summary',
     cols: [34, 20],
@@ -746,6 +821,14 @@ export async function taxWorkbook(
       [],
       [text('TDS withheld this period', 'bold'), money(t.withheldTotal)],
       [text('TDS Payable outstanding', 'bold'), money(t.withheldUnpaid)],
+      [],
+      // Component-wise on the summary too, because this is the sheet somebody
+      // opens with the return form beside them.
+      [text('Output GST by component', 'section'), text('', 'section')],
+      ...componentRows(t.outputByGroup).map((r) => [r[0], r[2]]),
+      [],
+      [text('Input GST by component', 'section'), text('', 'section')],
+      ...componentRows(t.inputByGroup).map((r) => [r[0], r[2]]),
       [],
       [text('GST is filed in GSTR-3B by the 20th; TDS is deposited by challan by the 7th.', 'muted')],
       [text('The two are never set off against each other.', 'muted')],
@@ -772,6 +855,10 @@ export async function taxWorkbook(
 
   return buildXlsx([
     summary,
+    componentSheet('Output by component', 'Output GST by component',
+      t.outputByGroup, t.outputBase, t.outputTotal),
+    componentSheet('Input by component', 'Input GST by component',
+      t.inputByGroup, t.inputBase, t.inputTotal),
     gstSheet('Output GST', 'Output GST', t.output, t.outputTotal, t.outputBase,
       t.outputNotes, t.outputNotesBase, 'Invoices', 'Less credit notes'),
     gstSheet('Input GST', 'Input GST', t.input, t.inputTotal, t.inputBase,
@@ -807,6 +894,301 @@ export async function payoutWorkbook(orgId: string, settlementId: string): Promi
   return { buffer, settlement };
 }
 
+// ---------------------------------------------------------------------------
+// Sheet 1 — Payout Breakup, built from the ledger rather than from a cycle
+// ---------------------------------------------------------------------------
+
+/**
+ * ===========================================================================
+ * THE SAME BREAKUP, FOR AN AGENCY THAT IS NOT BEING PAID BY A CHANNEL.
+ * ===========================================================================
+ * `payoutBreakupSheet` above reconciles a CYCLE: the channel collected the
+ * fare, kept its charges, and remitted one net amount, and the sheet proves
+ * the arithmetic the channel did. That is the right sheet when there is a
+ * statement to check against, and it is useless when there is not — which is
+ * most of a travel agency's trading, where the agency collects from the
+ * traveller itself and pays its own suppliers.
+ *
+ * So this is the same sheet asking the question that version of the business
+ * has: of everything invoiced in this period, how much is actually the
+ * agency's? And it is answered from the ledger, not from a statement:
+ *
+ *   Customer Payable      what was invoiced, gross — the figure the traveller
+ *                         was sent, which is where any reconciliation starts.
+ *   Output GST            collected FOR the government and owed to it in this
+ *                         month's 3B. It was never the agency's money, and
+ *                         leaving it in is the single most common way a
+ *                         travel agency overstates what it earned.
+ *   Supplier Cost         every vendor bill recorded against those invoices,
+ *                         NET of tax, because the input GST is reclaimed. It
+ *                         is the link made on the bill form that makes this
+ *                         row possible at all — see `linked_invoice_id`.
+ *   Agent Commission      what the selling agent earns on those sales, with
+ *                         its GST. Both are deducted: the agency pays them.
+ *   TCS / TDS             tax collected or withheld on the sale. An ASSET,
+ *                         set off at assessment — but it does not arrive in
+ *                         the bank, so it comes off the payout and the sheet
+ *                         says why rather than losing it.
+ *
+ * THE CHANNEL'S OWN ROWS ARE STILL PRINTED, AT NIL. Storage, ads, recall,
+ * credit and debit notes: the whole `CHARGE_KINDS` catalogue, exactly as the
+ * cycle version walks it. An agency that sells through a channel SOME of the
+ * time needs the two sheets to line up row for row, and a sheet that silently
+ * drops what did not arise cannot be put beside one that does.
+ *
+ * THE RETURNED COLUMN IS CREDIT NOTES, and every figure in it is negative,
+ * because every figure in it is a reversal: the fare goes back, the GST on it
+ * goes back, and the cost goes back if the supplier credited us.
+ */
+interface LedgerBreakup {
+  /** Gross invoiced and gross credited, both as positive magnitudes. */
+  forwardGross: number;
+  returnGross: number;
+  forwardTax: number;
+  returnTax: number;
+  /** Vendor bills linked to these sales, net of reclaimable tax. */
+  supplierCost: number;
+  supplierTax: number;
+  returnSupplierCost: number;
+  commission: number;
+  commissionGst: number;
+  tcs: number;
+  tds: number;
+  /** What has actually been collected against these sales, and what has not. */
+  received: number;
+  outstanding: number;
+}
+
+async function ledgerBreakup(
+  orgId: string, docIds: string[], returnIds: string[],
+): Promise<LedgerBreakup> {
+  const out: LedgerBreakup = {
+    forwardGross: 0, returnGross: 0, forwardTax: 0, returnTax: 0,
+    supplierCost: 0, supplierTax: 0, returnSupplierCost: 0,
+    commission: 0, commissionGst: 0, tcs: 0, tds: 0, received: 0, outstanding: 0,
+  };
+  const every = [...docIds, ...returnIds];
+  if (!every.length) return out;
+  const marks = (xs: string[]) => xs.map(() => '?').join(',');
+
+  const totals = await all<{ doc_type: string; total: number; tax_total: number; residual: number }>(
+    `SELECT doc_type, COALESCE(SUM(total),0) AS total, COALESCE(SUM(tax_total),0) AS tax_total,
+            COALESCE(SUM(residual),0) AS residual
+       FROM documents WHERE id IN (${marks(every)}) GROUP BY doc_type`,
+    ...every,
+  );
+  for (const t of totals) {
+    if (t.doc_type === 'out_refund' || t.doc_type === 'in_refund') {
+      out.returnGross += t.total;
+      out.returnTax += t.tax_total;
+    } else {
+      out.forwardGross += t.total;
+      out.forwardTax += t.tax_total;
+      out.outstanding += t.residual;
+    }
+  }
+  out.received = out.forwardGross - out.outstanding;
+
+  if (docIds.length) {
+    /*
+     * THE COSTS BOUGHT AGAINST THESE SALES.
+     *
+     * Posted only — a drafted bill is an intention, and a payout figure that
+     * moved when somebody opened a form would be unusable. A supplier's own
+     * credit note comes back out, because that is what it is: cost reversed.
+     */
+    const bills = await all<{ doc_type: string; untaxed: number; tax_total: number }>(
+      `SELECT doc_type, COALESCE(SUM(untaxed),0) AS untaxed, COALESCE(SUM(tax_total),0) AS tax_total
+         FROM documents
+        WHERE linked_invoice_id IN (${marks(docIds)})
+          AND doc_type IN ('in_invoice','in_refund') AND state = 'posted'
+        GROUP BY doc_type`,
+      ...docIds,
+    );
+    for (const b of bills) {
+      if (b.doc_type === 'in_refund') out.returnSupplierCost += b.untaxed;
+      else { out.supplierCost += b.untaxed; out.supplierTax += b.tax_total; }
+    }
+
+    /*
+     * AGENT COMMISSION ON THE TRIPS THESE SALES BELONG TO.
+     *
+     * Reached through the booking, because that is what a commission is
+     * recorded against: an agent earns on the trip, not on the piece of paper
+     * it was invoiced on. A sale with no booking behind it contributes no
+     * commission, which is exact rather than approximate — there is no
+     * commission row to find.
+     *
+     * DISTINCT ON THE BOOKING, not on the invoice. Two invoices raised against
+     * one trip must not count the agent's commission twice, which is precisely
+     * what a plain join through `documents` does.
+     */
+    const commission = await one<{ amount: number }>(
+      `SELECT COALESCE(SUM(c.amount),0) AS amount
+         FROM commissions c
+        WHERE c.org_id = ? AND c.state IN ('posted','paid')
+          AND c.booking_id IN (
+            SELECT DISTINCT booking_id FROM documents
+             WHERE id IN (${marks(docIds)}) AND booking_id IS NOT NULL
+          )`,
+      orgId, ...docIds,
+    );
+    out.commission = commission?.amount ?? 0;
+  }
+
+  /*
+   * TCS AND TDS ON THESE SALES, FROM THE LEDGER'S OWN TAX LINES.
+   *
+   * Not a rate applied to a total. What matters is what was actually posted,
+   * because that is what a 26AS reconciliation is done against — so it is read
+   * off the journal entries the documents produced, and a deduction somebody
+   * adjusted by hand is the one that appears.
+   */
+  const withheld = await all<{ tax_group: string; amount: number }>(
+    `SELECT t.tax_group, COALESCE(SUM(l.credit - l.debit),0) AS amount
+       FROM journal_entry_lines l
+       JOIN taxes t ON t.id = l.tax_id
+       JOIN journal_entries e ON e.id = l.entry_id AND e.source_model = 'document'
+      WHERE l.org_id = ? AND l.state = 'posted' AND e.source_id IN (${marks(every)})
+        AND t.tax_group IN ('tcs','tds')
+      GROUP BY t.tax_group`,
+    orgId, ...every,
+  );
+  for (const w of withheld) {
+    if (w.tax_group === 'tcs') out.tcs += Math.abs(w.amount);
+    else out.tds += Math.abs(w.amount);
+  }
+  return out;
+}
+
+function ledgerBreakupSheet(b: LedgerBreakup, label: string, period: string | null): Sheet {
+  /*
+   * EVERY CHANNEL ROW, AT NIL, so this sheet and a cycle's can be read side by
+   * side. Same reasoning `payoutBreakupSheet` gives for walking the catalogue:
+   * a printed "-" says the charge did not arise, while an absent row leaves
+   * the reader wondering whether it was missed.
+   */
+  const nilBlock = (which: 'additions' | 'deductions' | 'one_time', from: number): BreakupLine[] => {
+    const rows: BreakupLine[] = [];
+    let n = from;
+    for (const k of CHARGE_KINDS.filter((c) => c.block === which)) {
+      rows.push({ sNo: ++n, label: `  ${k.label} (Rs)`, forward: 0, returned: 0, section: k.section });
+      if (k.gst) {
+        rows.push({
+          sNo: null,
+          label: `  GST on ${k.code === 'credit_note' ? 'CN' : k.code === 'debit_note' ? 'DN' : k.label} (Rs)`,
+          forward: 0, returned: 0, section: k.section,
+        });
+      }
+    }
+    return rows;
+  };
+
+  /*
+   * THE INPUT-GST ROW IS AN ADDITION PRINTED INSIDE A DEDUCTIONS BLOCK, and
+   * that is deliberate rather than untidy. The supplier's bill was paid gross;
+   * the cost of the trip is the net; the difference is a receivable from the
+   * government. Showing the cost net and NOT showing the tax would leave this
+   * sheet unable to reconcile against the bills it was built from, and showing
+   * the cost gross would overstate it. So both appear, and `section` on each
+   * row — not the block it prints under — decides the arithmetic.
+   */
+  const orderDeductions: BreakupLine[] = [
+    {
+      sNo: 2, section: 'deduction',
+      label: '  Output GST on the supply (Rs)',
+      forward: b.forwardTax, returned: -b.returnTax,
+    },
+    {
+      sNo: 3, section: 'deduction',
+      label: '  Supplier Cost, net of GST (Rs)',
+      forward: b.supplierCost, returned: -b.returnSupplierCost,
+    },
+    {
+      sNo: null, section: 'addition',
+      label: '  Input GST on supplier bills (reclaimed, not a cost) (Rs)',
+      forward: b.supplierTax, returned: 0,
+    },
+    { sNo: 4, label: '  Agent Commission (Rs)', forward: b.commission, returned: 0, section: 'deduction' },
+    { sNo: null, label: '  GST on Commission (Rs)', forward: b.commissionGst, returned: 0, section: 'deduction' },
+    { sNo: 5, label: '  TCS Charge (Rs)', forward: b.tcs, returned: 0, section: 'deduction' },
+    { sNo: 6, label: '  TDS Charge (194O & Q)(Rs)', forward: b.tds, returned: 0, section: 'deduction' },
+  ];
+
+  const numbered = (rows: BreakupLine[]) => rows.filter((l) => l.sNo !== null).length;
+  const additions = nilBlock('additions', 6);
+  const deductions = nilBlock('deductions', 6 + numbered(additions));
+  const oneTime = nilBlock('one_time', 6 + numbered(additions) + numbered(deductions));
+
+  const signedForward = (rows: BreakupLine[]) =>
+    rows.reduce((t, l) => t + (l.section === 'deduction' ? -l.forward : l.forward), 0);
+  const signedReturned = (rows: BreakupLine[]) =>
+    rows.reduce((t, l) => t + (l.section === 'deduction' ? -l.returned : l.returned), 0);
+
+  const cycleRows = [...additions, ...deductions, ...oneTime];
+  const forwardTotal = b.forwardGross + signedForward(orderDeductions) + signedForward(cycleRows);
+  const returnTotal = -b.returnGross + signedReturned(orderDeductions) + signedReturned(cycleRows);
+  const cycleTotal = forwardTotal + returnTotal;
+
+  return {
+    name: 'Payout Breakup',
+    cols: [3, 9, 52, 20, 22, 20],
+    merges: ['B2:F2'],
+    rows: [
+      [],
+      [null, text('Payout Breakup', 'title')],
+      [null, text('S. No.', 'header'), text('Particular', 'header'), text('Delivered Orders', 'header'),
+        text('Cancelled/Returned', 'header'), text('Total', 'header')],
+      [],
+      breakupRow({
+        sNo: 1, label: 'Customer Payable (Rs)', section: 'addition',
+        forward: b.forwardGross, returned: -b.returnGross,
+      }),
+      [],
+      sectionRow('Order Level Deductions (Rs)'),
+      ...orderDeductions.map(breakupRow),
+      [],
+      sectionRow('Other Additions (Rs)'),
+      ...additions.map(breakupRow),
+      [],
+      sectionRow('Other Deductions (Rs)'),
+      ...deductions.map(breakupRow),
+      [],
+      sectionRow('One-Timer Adjustments (Rs)'),
+      ...oneTime.map(breakupRow),
+      [],
+      totalRow('Amount calculated from present cycle', forwardTotal, returnTotal, cycleTotal),
+      [],
+      /*
+       * WHAT THE AGENCY HAS, AGAINST WHAT IT IS STILL OWED.
+       *
+       * On a channel cycle the two closing rows are the remittance and the
+       * carry-forward. Books that collect their own money have the same
+       * question in a different shape — receipts posted against these sales,
+       * and the receivable still standing — so those are the rows, and they
+       * are kept apart from the earnings figure above because they answer
+       * about CASH rather than about trading. A profitable month with nothing
+       * collected is a real and important state, and one line cannot say it.
+       */
+      totalRow('Received against these orders', null, null, b.received),
+      [],
+      totalRow('Still to collect', null, null, b.outstanding),
+      [],
+      totalRow('Net earned in this period', null, null, cycleTotal),
+      [],
+      [null, text(label, 'muted')],
+      ...(period ? [[null, text(period, 'muted')]] : []),
+      [null, text(
+        'Built from the ledger rather than from a channel statement: output GST is collected for '
+        + 'the government and is not earnings, supplier cost is every bill recorded against these '
+        + 'sales net of reclaimable input GST, and the channel rows above print at nil so this '
+        + 'sheet can be read beside one that has them.',
+        'muted',
+      )],
+    ],
+  };
+}
+
 /**
  * The same item-level sheet, for a set of invoices with no settlement behind
  * them.
@@ -825,18 +1207,43 @@ export async function documentListWorkbook(
   const docs = await listDocuments(orgId, { ...filter, limit: filter.limit ?? 2000 });
   const forward: ItemRow[] = [];
   const returned: ItemRow[] = [];
+  const forwardIds: string[] = [];
+  const returnIds: string[] = [];
   for (const d of docs) {
     const ctx = await loadOrder(orgId, d.id, null);
     if (!ctx) continue;
-    (d.doc_type === 'out_refund' || d.doc_type === 'in_refund' ? returned : forward)
-      .push(...itemRows(ctx));
+    const isReturn = d.doc_type === 'out_refund' || d.doc_type === 'in_refund';
+    (isReturn ? returned : forward).push(...itemRows(ctx));
+    (isReturn ? returnIds : forwardIds).push(d.id);
   }
   const s = await seller(orgId);
-  const sheets: Sheet[] = [forwardSheet(forward, s, null, label)];
-  // Only when there is something in it: an empty third sheet in a workbook of
-  // invoices is a question ("why is this blank?") rather than information.
-  if (returned.length) sheets.push(returnSheet(returned, s, null));
-  return buildXlsx(sheets);
+
+  /*
+   * ALL THREE SHEETS, ALWAYS, AND THE BREAKUP FIRST.
+   *
+   * This export used to be the item grid alone, on the reasoning that a set of
+   * orders with no settlement behind them had nothing to summarise. That was
+   * wrong twice over. The person opening a payout workbook reads the breakup
+   * first and the item rows only when a figure on it needs explaining, so
+   * leading with four hundred rows of detail puts the answer at the bottom.
+   * And the ledger does know the figures: what was invoiced, the GST inside it
+   * that belongs to the government, the supplier bills recorded against those
+   * sales, the commission, the withholding. That IS the breakup — it simply
+   * was not being asked for.
+   *
+   * THE THIRD SHEET IS WRITTEN EVEN WHEN IT IS EMPTY, which is a change. A
+   * workbook whose tabs vary with whether anything happened to be cancelled
+   * cannot be dropped into the same process twice, and "Cancelled or Returned
+   * Orders, and there were none" is information where a missing tab is a
+   * question about the export itself.
+   */
+  const breakup = await ledgerBreakup(orgId, forwardIds, returnIds);
+  const period = filter.from && filter.to ? `${fmtDate(filter.from)} to ${fmtDate(filter.to)}` : null;
+  return buildXlsx([
+    ledgerBreakupSheet(breakup, label, period),
+    forwardSheet(forward, s, null, label),
+    returnSheet(returned, s, null),
+  ]);
 }
 
 /**
@@ -902,6 +1309,7 @@ export async function documentWorkbook(orgId: string, docId: string): Promise<{ 
       text('IGST %', 'header'), text('IGST', 'header'),
       text('CGST %', 'header'), text('CGST', 'header'),
       text('SGST %', 'header'), text('SGST', 'header'),
+      text('UTGST %', 'header'), text('UTGST', 'header'),
       text('Cess', 'header'), text('Total', 'header'),
     ],
   ];
@@ -920,20 +1328,119 @@ export async function documentWorkbook(orgId: string, docId: string): Promise<{ 
       rate(t.igstBps), moneyOrDash(t.igst),
       rate(t.cgstBps), moneyOrDash(t.cgst),
       rate(t.sgstBps), moneyOrDash(t.sgst),
+      // Printed on every invoice, nil on most of them. A tax invoice that
+      // omits the component it was actually charged under is not a tax
+      // invoice, and which component that is depends on where the agency is
+      // registered — so the column is always there rather than conditional on
+      // this one document having used it.
+      rate(t.utgstBps), moneyOrDash(t.utgst),
       moneyOrDash(t.cess),
       money(l.total, 'moneyBold'),
     ]);
   });
 
+  /*
+   * ===========================================================================
+   * WHAT HAS BEEN SETTLED, AND BY WHAT
+   * ===========================================================================
+   * The footer used to run Taxable → Tax → Total → Still owed, which asks the
+   * reader to do the subtraction and then tells them nothing about where the
+   * difference came from. On an invoice half-paid by a receipt and half
+   * cancelled by a credit note those are two completely different facts, and
+   * the single figure they produce is the one that cannot be checked against
+   * anything.
+   *
+   * SETTLED IS SPLIT THE WAY THE SCREEN SPLITS IT — cash apart from credit —
+   * for the same reason it is split there: a cancelled trip is settled in
+   * both, and the first question anyone asks is how much of it actually
+   * arrived. And the allocations themselves are listed under it, so every
+   * rupee of the settled figure names the receipt or the note it came from.
+   * Reconciling a customer's statement against this file is then reading,
+   * not arithmetic.
+   *
+   * TDS IS DEDUCTED BEFORE SETTLED, not after, because that is the order it
+   * happens in: the supplier is never going to pay the withheld amount — it
+   * goes to the department — so what the document can be settled against is
+   * the total less the deduction. `residual` is computed the same way.
+   */
+  const allocations = await allocationsFor(orgId, docId);
+  const credited = allocations.reduce((t, a) => t + (a.credit_doc_id ? a.amount : 0), 0);
+  const settled = doc.total - doc.withheld_tax - doc.residual;
+  const received = settled - credited;
+  const isCredit = meta.sign === -1;
+
   const blank = (n: number) => Array.from({ length: n }, () => null as CellInput);
+  const footer = (label: string, amount: number) =>
+    rows.push([...blank(6), text(label, 'section'), money(amount, 'sectionMoney')]);
+
   rows.push([]);
-  rows.push([...blank(6), text('Taxable', 'section'), money(doc.untaxed, 'sectionMoney')]);
-  rows.push([...blank(6), text('Tax', 'section'), money(doc.tax_total, 'sectionMoney')]);
-  rows.push([...blank(6), text('Total', 'section'), money(doc.total, 'sectionMoney')]);
-  if (doc.withheld_tax) {
-    rows.push([...blank(6), text('TDS withheld', 'section'), money(-doc.withheld_tax, 'sectionMoney')]);
+  footer('Taxable', doc.untaxed);
+  footer('Tax', doc.tax_total);
+  footer('Total', doc.total);
+  if (doc.withheld_tax) footer('TDS withheld', -doc.withheld_tax);
+  if (credited) {
+    footer(isBill ? 'Paid in cash' : 'Received in cash', received);
+    footer(isBill ? 'Debit notes applied' : 'Credit notes applied', credited);
   }
-  rows.push([...blank(6), text('Still owed', 'section'), money(doc.residual, 'sectionMoney')]);
+  footer('Settled', settled);
+  footer(doc.residual > 0 ? 'Still owed' : 'Cleared', doc.residual);
+
+  if (allocations.length) {
+    rows.push([]);
+    rows.push([null, text(isCredit ? 'Applied against' : 'Settled by', 'section'),
+      text('', 'section'), text('', 'section'), text('', 'section')]);
+    rows.push([null, text('Date', 'header'), text('Reference', 'header'),
+      text('Kind', 'header'), text('Amount', 'header')]);
+    for (const a of allocations) {
+      rows.push([
+        null,
+        text(a.pay_date ? fmtDate(a.pay_date) : fmtDate(a.at.slice(0, 10))),
+        text(a.credit_number ?? a.payment_number),
+        // What cleared the debt, named rather than implied by a blank column:
+        // a credit note and a receipt both reduce the residual and only one of
+        // them is money.
+        text(a.credit_doc_id ? (isBill ? 'Debit note' : 'Credit note') : titleise(a.method ?? 'Payment')),
+        money(a.amount),
+      ]);
+    }
+    rows.push([null, text('Total settled', 'section'), text('', 'section'), text('', 'section'),
+      money(settled, 'sectionMoney')]);
+  }
+
+  /*
+   * AND THE MONEY THAT HAS NOT REACHED THE LEDGER YET, STATED AS SUCH.
+   *
+   * A receipt fetched from TripzoCRM is drafted, not posted, so it is in
+   * neither the settled figure nor the residual — correctly, because nothing
+   * has been posted. But an export that simply omits it is how a workbook
+   * showing "Still owed 26,999.00" is sent to a customer who paid ₹8,500 three
+   * weeks ago. It is printed BELOW the settled block, under its own heading,
+   * as a figure that is pending rather than one that has been taken.
+   */
+  const pending = await pendingReceiptsFor(orgId, docId);
+  if (pending.length) {
+    const pendingTotal = pending.reduce((t, r) => t + r.amount, 0);
+    rows.push([]);
+    rows.push([null, text('Collected in TripzoCRM, not yet posted', 'section'),
+      text('', 'section'), text('', 'section'), text('', 'section')]);
+    rows.push([null, text('Date', 'header'), text('Reference', 'header'),
+      text('Kind', 'header'), text('Amount', 'header')]);
+    for (const r of pending) {
+      rows.push([
+        null,
+        text(fmtDate(r.pay_date)),
+        text(r.number ?? r.reference),
+        text(r.is_advance ? 'Advance' : titleise(r.method)),
+        money(r.amount),
+      ]);
+    }
+    rows.push([null, text('Pending', 'section'), text('', 'section'), text('', 'section'),
+      money(pendingTotal, 'sectionMoney')]);
+    rows.push([null, text(
+      'Drafted from TripzoCRM and not posted, so it is in neither Settled nor Still owed above.',
+      'muted',
+    )]);
+  }
 
   if (doc.note) {
     rows.push([]);
@@ -943,7 +1450,7 @@ export async function documentWorkbook(orgId: string, docId: string): Promise<{ 
   const buffer = buildXlsx([{
     name: meta.short,
     rows,
-    cols: [5, 38, 12, 8, 12, 13, 8, 14, 9, 12, 9, 12, 9, 12, 12, 14],
+    cols: [5, 38, 12, 8, 12, 13, 8, 14, 9, 12, 9, 12, 9, 12, 10, 12, 12, 14],
   }]);
   return { buffer, doc };
 }
@@ -978,11 +1485,12 @@ export async function documentWorkbook(orgId: string, docId: string): Promise<{ 
 const ITEM_HEADERS = [
   'S.No.', 'Date', 'Document', 'Type', 'Party', 'GSTIN', 'Description', 'HSN / SAC',
   'Account', 'Qty', 'Rate (Rs)', 'Disc %', 'Taxable (Rs)',
-  'IGST %', 'IGST (Rs)', 'CGST %', 'CGST (Rs)', 'SGST %', 'SGST (Rs)', 'Cess (Rs)',
+  'IGST %', 'IGST (Rs)', 'CGST %', 'CGST (Rs)', 'SGST %', 'SGST (Rs)',
+  'UTGST %', 'UTGST (Rs)', 'Cess (Rs)',
   'Total Tax (Rs)', 'Total (Rs)', 'On this trip',
 ];
 
-const ITEM_COLS = [7, 12, 18, 14, 26, 18, 38, 12, 24, 8, 13, 8, 14, 8, 13, 8, 13, 8, 13, 11, 14, 14, 12];
+const ITEM_COLS = [7, 12, 18, 14, 26, 18, 38, 12, 24, 8, 13, 8, 14, 8, 13, 8, 13, 8, 13, 9, 13, 11, 14, 14, 12];
 
 function itemSheet(
   name: string, title: string, subtitle: string, rows: TripDocItemRow[],
@@ -1012,6 +1520,7 @@ function itemSheet(
       rate(r.igst_bps), moneyOrDash(r.igst),
       rate(r.cgst_bps), moneyOrDash(r.cgst),
       rate(r.sgst_bps), moneyOrDash(r.sgst),
+      rate(r.utgst_bps), moneyOrDash(r.utgst),
       moneyOrDash(r.cess),
       money(r.tax_total),
       money(r.total, 'moneyBold'),
@@ -1028,6 +1537,7 @@ function itemSheet(
     { v: null, s: 'section' }, money(sum((r) => r.igst), 'sectionMoney'),
     { v: null, s: 'section' }, money(sum((r) => r.cgst), 'sectionMoney'),
     { v: null, s: 'section' }, money(sum((r) => r.sgst), 'sectionMoney'),
+    { v: null, s: 'section' }, money(sum((r) => r.utgst), 'sectionMoney'),
     money(sum((r) => r.cess), 'sectionMoney'),
     money(sum((r) => r.tax_total), 'sectionMoney'),
     money(sum((r) => r.total), 'sectionMoney'),

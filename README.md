@@ -118,8 +118,10 @@ shapes Indian banks actually export, duplicate-safe re-import, ranked
 reconciliation suggestions with a human confirming each one, internal transfers.
 
 **Taxes** — GST as a parent rate with CGST/SGST children posting to their own
-accounts, IGST, tax-inclusive pricing, TDS, and a tax report read from the
-ledger's tax lines.
+accounts, CGST/UTGST for a supply inside a union territory without a
+legislature, IGST at every slab, tax-inclusive pricing, TDS, and a tax report
+read from the ledger's tax lines — component-wise, in the shape GSTR-3B Table
+3.1 is filed from, as well as rate by rate.
 
 **Travel** — a financial tab on every booking, trip profitability backed by
 analytic accounts, package and agent profitability, agent commissions on

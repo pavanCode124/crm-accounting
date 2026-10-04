@@ -13,7 +13,7 @@ import {
 } from '@/server/accounting/documents';
 import {
   createPayment, postPayment, allocate, unallocate, applyCreditNote, applyCreditToSource, reversePayment,
-  cancelAdvance,
+  cancelAdvance, postReceiptsForDocument,
 } from '@/server/accounting/payments';
 import { draftEntry, postDraft, postEntry, reverseEntry } from '@/server/accounting/engine';
 import {
@@ -454,6 +454,14 @@ export async function saveDocumentAction(formData: FormData) {
       journalId: str(formData, 'journal_id'),
       bookingId: opt(formData, 'booking_id'),
       analyticId: opt(formData, 'analytic_id'),
+      /*
+       * THE SALE A VENDOR BILL WAS BOUGHT FOR. Sent from the bill form in
+       * place of the trip picker; the server copies the invoice's own booking
+       * and analytic account onto the bill, so the cost reaches the trip's
+       * margin. Blank on an invoice form, and ignored there — see
+       * `deriveTripFromInvoice`.
+       */
+      linkedInvoiceId: opt(formData, 'linked_invoice_id'),
       docDate: str(formData, 'doc_date') || isoDate(),
       dueDate: opt(formData, 'due_date'),
       paymentTermsId: opt(formData, 'payment_terms_id'),
@@ -733,6 +741,49 @@ export async function applyCreditAction(formData: FormData) {
     s.orgId, str(formData, 'credit_id'), str(formData, 'invoice_id'), money(formData, 'amount'), actorOf(s),
   ));
   back(str(formData, 'return_to') || '/sales/credit-notes', r.error ? r : { ok: 'Credit applied.' });
+}
+
+/**
+ * POST THE RECEIPTS TRIPZOCRM ALREADY TOOK AGAINST THIS DOCUMENT.
+ *
+ * The button beside the "Collected in TripzoCRM" figure on the Balance card.
+ * The import drafts receipts rather than posting them — another system must
+ * not write this agency's ledger — so the money sits visible and uncounted
+ * until somebody says it is theirs. This is that act, in one click instead of
+ * one visit per receipt to the payments screen.
+ *
+ * `payment.create` rather than a CRM capability: what it does is post
+ * receipts, and whoever may record a receipt here may record these.
+ *
+ * THE SUMMARY NAMES BOTH FIGURES, because they are legitimately different: a
+ * receipt larger than the residual posts in full and settles only what was
+ * owed, keeping the rest on account. Saying only "8,500.00 posted" against a
+ * Settled line that moved by less is how the next question starts.
+ */
+export async function postCrmReceiptsAction(formData: FormData) {
+  const s = await requireCap('payment.create');
+  const docId = str(formData, 'id');
+  const isBill = str(formData, 'doc_type').startsWith('in_');
+  const listPath = isBill ? '/purchases/bills' : '/sales/invoices';
+  const r = await guard(async () => await postReceiptsForDocument(s.orgId, docId, actorOf(s)));
+  if (r.error) back(`${listPath}/${docId}`, r);
+
+  const out = r.value!;
+  if (!out.posted && !out.failures.length) {
+    back(`${listPath}/${docId}`, { ok: 'Nothing was waiting to be posted.' });
+  }
+  const posted = `${out.posted} receipt(s) posted — ${(out.amount / 100).toFixed(2)}`;
+  const settled = out.allocated > 0
+    ? `, ${(out.allocated / 100).toFixed(2)} settled against this document`
+    : out.posted
+      // Posted and nothing settled is not a failure and must not read like
+      // one: a receipt against a DRAFT invoice is correctly left on account
+      // until that invoice is posted, and the sentence says which.
+      ? ', held on account until this document is posted'
+      : '';
+  back(`${listPath}/${docId}`, out.failures.length
+    ? { error: `${posted}${settled}. ${out.failures.join(' ')}` }
+    : { ok: `${posted}${settled}.` });
 }
 
 export async function reversePaymentAction(formData: FormData) {
