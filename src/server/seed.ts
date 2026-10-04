@@ -1,9 +1,10 @@
 import 'server-only';
-import { exec, all, one, run, scalar, tx, id, nowIso } from './db';
+import { exec, all, one, run, scalar, tx, id } from './db';
 import { isoDate, addDays, fiscalYearOf } from '@/lib/accounting';
-import { setSetting } from './accounting/settings';
-import { createFiscalYear, postOpeningBalances } from './accounting/periods';
-import { upsertAccount, upsertJournal, upsertPartner, createBooking, upsertProduct, createBudget } from './accounting/masters';
+import { provisionOrg, type ProvisionedBooks } from './provision';
+import { CRM_CONFIGURED as AUTH_REQUIRED } from './crm/client';
+import { postOpeningBalances } from './accounting/periods';
+import { upsertPartner, createBooking, createBudget } from './accounting/masters';
 import { createDocument, postDocument, createCreditNote } from './accounting/documents';
 import { createPayment, applyCreditNote } from './accounting/payments';
 import { createExpense, approveExpense, createCommission, postCommission } from './accounting/expenses';
@@ -43,7 +44,7 @@ declare global {
 }
 
 /**
- * Seed once, however many callers ask at once.
+ * Seed the DEMO books once, however many callers ask at once.
  *
  * ONE REQUEST ASKS TWICE. The root layout resolves `ctx()` for the masthead and
  * the page resolves it for its own data, and React renders them concurrently —
@@ -60,7 +61,24 @@ declare global {
  * the insert conflicts rather than duplicating. A shared advisory lock is the
  * fix if that ever stops being acceptable.
  */
-export async function ensureSeeded() {
+export async function ensureDemoBooks() {
+  /*
+   * ============================================================
+   * NEVER ON A CRM-CONNECTED DEPLOYMENT. THIS GUARD IS THE POINT.
+   * ============================================================
+   * `AUTH_REQUIRED` is true exactly when there is a TripzoCRM to authenticate
+   * against, and in that case the books are per-agency and arrive from
+   * `provisionOrg` on first sign-in. Seeding here as well would write a
+   * fictional agency into the agency's own Postgres, which is both a privacy
+   * problem — Wander Travels' customer names, phone numbers and invoices in a
+   * production database — and an accounting one, because those postings land
+   * in whichever ledger adopts them.
+   *
+   * CHECKED HERE RATHER THAN AT THE CALL SITE so there is no second caller
+   * that can forget. `scripts/reset.mjs` and the Reset button go through
+   * `resetAndSeed`, which is a deliberate act by someone looking at a demo.
+   */
+  if (AUTH_REQUIRED) return;
   return (globalThis.__tripzoSeeding ??= (async () => {
     if (!await isSeeded()) await seed();
   })().catch((err) => {
@@ -72,6 +90,35 @@ export async function ensureSeeded() {
 }
 
 export async function resetAndSeed() {
+  /*
+   * =======================================================================
+   * A DEMO-ONLY BUTTON, AND IT HAS TO BE SAID IN CODE RATHER THAN IN THE UI
+   * =======================================================================
+   * What follows TRUNCATES every table in this schema. That was the right
+   * shape of operation while the schema held one set of demo books. It is
+   * catastrophic once it holds several agencies': one agency's administrator
+   * pressing "Reset and re-seed" would destroy EVERY OTHER AGENCY'S LEDGER on
+   * the deployment — their invoices, their receipts, their posted entries,
+   * their filed GST figures — from a button that reads like it belongs to them.
+   *
+   * Hiding the button on the screen is a courtesy; a server action is a public
+   * endpoint and anyone can POST to it. So the refusal lives here, at the only
+   * place that cannot be bypassed.
+   *
+   * A per-agency reset is a legitimate feature and is NOT this function: it
+   * would delete `WHERE org_id = ?` across the tables in dependency order,
+   * leave every other tenant untouched, and re-provision rather than re-seed.
+   * Until that exists, a connected deployment has no reset, which is the
+   * correct answer for a production ledger anyway.
+   */
+  if (AUTH_REQUIRED) {
+    throw new Error(
+      'Resetting the books is only available on a demo deployment. This one is connected to '
+      + 'TripzoCRM and holds real agencies’ ledgers, which a reset would destroy — '
+      + 'including other agencies’. Delete the individual records you meant to remove, or '
+      + 'ask for a separate demo deployment.',
+    );
+  }
   /*
    * One TRUNCATE over every table at once.
    *
@@ -99,35 +146,115 @@ export async function resetAndSeed() {
   await seed();
 }
 
+/**
+ * The DEMONSTRATION books.
+ *
+ * -------------------------------------------------------------------------
+ * ONLY THE DEMONSTRATION, NOW. THE CONFIGURATION MOVED.
+ * -------------------------------------------------------------------------
+ * This used to build a chart of accounts, journals, GST, TDS, analytic plans
+ * and every default account, and then post a season of trading on top. The
+ * first half is what EVERY agency needs and is now `provisionOrg` in
+ * server/provision.ts, called per organisation the first time somebody from it
+ * signs in. What is left here is the second half: Wander Travels, a fictional
+ * Hyderabad agency, and one season of its trading.
+ *
+ * Wander Travels is a DEMO and is marked as one (`demo_data = 1`), which is
+ * load-bearing rather than documentation: `resolveBooks` refuses to let a real
+ * CRM agency adopt books carrying that flag. Before it existed, the first
+ * agency to sign in to a deployment that had ever been seeded inherited these
+ * invoices — and inherited them into its trial balance, its receivables and
+ * its GST summary.
+ */
 export async function seed() {
-  const orgId = 'org_wander';
-  const today = isoDate();
+  const books = await tx(async () => {
+    /*
+     * WANDER TRAVELS' OWN IDENTITY, which a provisioned agency does not get.
+     *
+     * 36 is Telangana, and it is the GSTIN's own first two digits — the pair
+     * has to agree or `updateOrganisation` refuses the save. It is also what
+     * decides CGST+SGST against IGST on every invoice this agency raises,
+     * which is why the demo has one at all: without it the sample invoices
+     * would carry no place of supply and the GST reports nothing to show.
+     */
+    const provisioned = await provisionOrg({
+      orgId: 'org_wander',
+      name: 'Wander Travels',
+      demoData: true,
+      identity: {
+        legalName: 'Wander Travels Private Limited',
+        gstin: '36AABCW1234F1Z5',
+        pan: 'AABCW1234F',
+        stateCode: '36',
+        address: 'Road No. 12, Banjara Hills, Hyderabad 500034',
+        city: 'Hyderabad',
+        email: 'accounts@wandertravels.in',
+        phone: '+91 40 4000 1234',
+        website: 'https://wandertravels.in',
+        invoiceTerms:
+          'Cancellation within 15 days of departure attracts 50% of the package value. '
+          + 'Visa fees and airline penalties are non-refundable.',
+        invoiceFooter: 'Subject to Hyderabad jurisdiction',
+      },
+      /*
+       * The agency's real banks, rather than the generic pair a fresh ledger
+       * opens with. The second one is load-bearing for the demo: receipts land
+       * in collections and supplier payments leave the current account, which
+       * is what makes the two bank books tell different stories and gives the
+       * reconciliation screen something to reconcile.
+       */
+      banks: [
+        {
+          key: 'hdfc', name: 'HDFC Bank — Current', bankName: 'HDFC Bank',
+          accountNo: '50100234561234', ifsc: 'HDFC0000123',
+          journalCode: 'BNK', journalName: 'HDFC Bank', accountCode: '101000',
+        },
+        {
+          key: 'icici', name: 'ICICI Collections', bankName: 'ICICI Bank',
+          accountNo: '002105001234', ifsc: 'ICIC0000021',
+          journalCode: 'COL', journalName: 'ICICI Collections', accountCode: '101100',
+        },
+        {
+          key: 'cash', name: 'Petty Cash', isCash: true,
+          journalCode: 'CSH', journalName: 'Cash', accountCode: '100000',
+        },
+      ],
+      analyticMembers: {
+        BRANCH: ['Hyderabad', 'Chennai', 'Mumbai'],
+        AGENT: ['Sai Kiran', 'Meera Rao', 'Arjun Das'],
+      },
+      // Rates as at today. A real deployment refreshes these daily; what
+      // matters architecturally is that a rate is a DATED row, not a constant.
+      fxRates: [['USD', 84.25], ['AED', 22.94], ['EUR', 91.10], ['THB', 2.42]],
+      /*
+       * PRICED, unlike the generic list a real agency is provisioned with,
+       * because the demo's whole job is to produce invoices with figures on
+       * them. The MRP is the published price the sale price discounts from,
+       * which is what the exported statement's "MRP" column wants beside the
+       * selling price.
+       */
+      products: [
+        { name: 'Bali 5D/4N Package', category: 'package', salePrice: 150_000_00, costPrice: 112_000_00, incomeAccountCode: '400000', expenseAccountCode: '507000', hsnCode: '998555', mrp: 169_000_00, variant: 'Deluxe · twin sharing' },
+        { name: 'Dubai 4D/3N Package', category: 'package', salePrice: 95_000_00, costPrice: 71_000_00, incomeAccountCode: '400000', expenseAccountCode: '507000', hsnCode: '998555', mrp: 109_000_00, variant: 'Standard · twin sharing' },
+        { name: 'Goa Weekend Package', category: 'package', salePrice: 32_000_00, costPrice: 22_000_00, incomeAccountCode: '400000', expenseAccountCode: '507000', hsnCode: '998555', mrp: 38_000_00, variant: 'Beach resort · twin sharing' },
+        { name: 'Hotel Booking', category: 'hotel', incomeAccountCode: '401000', expenseAccountCode: '500000', hsnCode: '996311', variant: 'Per room, per night' },
+        { name: 'Flight Ticket', category: 'flight', incomeAccountCode: '402000', expenseAccountCode: '501000', hsnCode: '996425', variant: 'Economy' },
+        { name: 'Visa Processing', category: 'visa', salePrice: 10_000_00, costPrice: 6_500_00, incomeAccountCode: '403000', expenseAccountCode: '503000', hsnCode: '998599', mrp: 12_000_00, variant: 'Tourist, single entry' },
+        { name: 'Airport Transfer', category: 'transport', salePrice: 5_000_00, costPrice: 3_200_00, incomeAccountCode: '404000', expenseAccountCode: '502000', hsnCode: '996412', mrp: 6_000_00, variant: 'Sedan · up to 3 pax' },
+        { name: 'Sightseeing Tour', category: 'sightseeing', salePrice: 8_000_00, costPrice: 5_000_00, incomeAccountCode: '405000', expenseAccountCode: '504000', hsnCode: '998555', mrp: 9_500_00, variant: 'Full day · guided' },
+        { name: 'Service Fee', category: 'fee', salePrice: 2_500_00, incomeAccountCode: '406000', expenseAccountCode: '505000', hsnCode: '998599' },
+      ],
+    });
 
-  await tx(async () => {
-    // ----------------------------------------------------------- the agency
-    await run(
-      `INSERT INTO organizations (id, name, legal_name, currency, country, gstin, pan, state_code,
-                                  fy_start_month, address, city, email, phone, website,
-                                  invoice_terms, invoice_footer, default_hsn_code, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      orgId, 'Wander Travels', 'Wander Travels Private Limited', 'INR', 'IN',
-      // 36 is Telangana, and it is the GSTIN's own first two digits — the pair
-      // has to agree or `updateOrganisation` refuses the save. It is also what
-      // decides CGST+SGST against IGST on every invoice this agency raises.
-      '36AABCW1234F1Z5', 'AABCW1234F', '36', 4,
-      'Road No. 12, Banjara Hills, Hyderabad 500034', 'Hyderabad',
-      'accounts@wandertravels.in', '+91 40 4000 1234', 'https://wandertravels.in',
-      'Cancellation within 15 days of departure attracts 50% of the package value. '
-      + 'Visa fees and airline penalties are non-refundable.',
-      'Subject to Hyderabad jurisdiction',
-      // 998555 is "tour operator services", which is what most of this agency's
-      // book is. The last resort in the HSN chain, so a line that is neither a
-      // catalogued product nor on a classified account still reaches the invoice
-      // with a code on it rather than with a blank Rule 46 column.
-      '998555',
-      nowIso(),
-    );
-
+    /*
+     * THE DEMO'S STAFF, and the only place in the product that invents a user.
+     *
+     * A real agency's people arrive from the CRM — `mirrorUser` in auth.ts
+     * gives each one a local row on first sign-in, so every audit entry and
+     * every posted entry names somebody who exists. A demo has no CRM to ask,
+     * and a ledger whose entries were all posted by "System" tells a worse
+     * story about the audit trail than one where they are not.
+     */
     const users: Array<[string, string, string, string]> = [
       ['usr_admin', 'Admin User', 'admin@wandertravels.in', 'admin'],
       ['usr_priya', 'Priya Nair', 'priya@wandertravels.in', 'accountant'],
@@ -136,359 +263,13 @@ export async function seed() {
     ];
     for (const [uid, name, email, role] of users) {
       await run('INSERT INTO users (id, org_id, name, email, role, active) VALUES (?,?,?,?,?,1)',
-        uid, orgId, name, email, role);
+        uid, provisioned.orgId, name, email, role);
     }
 
-    for (const [code, name, symbol] of [
-      ['INR', 'Indian Rupee', '₹'], ['USD', 'US Dollar', '$'],
-      ['AED', 'UAE Dirham', 'د.إ'], ['EUR', 'Euro', '€'], ['THB', 'Thai Baht', '฿'],
-    ]) {
-      await run('INSERT INTO currencies (code, name, symbol, decimals) VALUES (?,?,?,2) ON CONFLICT DO NOTHING', code, name, symbol);
-    }
-    // Rates as at today. A real deployment refreshes these daily; what matters
-    // architecturally is that a rate is a DATED row, not a constant.
-    for (const [code, rate] of [['USD', 84.25], ['AED', 22.94], ['EUR', 91.10], ['THB', 2.42]] as const) {
-      await run('INSERT INTO exchange_rates (org_id, code, on_date, rate_e6) VALUES (?,?,?,?) ON CONFLICT DO NOTHING',
-        orgId, code, today, Math.round(rate * 1_000_000));
-    }
-
-    // -------------------------------------------------- chart of accounts
-    const acc: Record<string, string> = {};
-    const chart: Array<[string, string, string, boolean?]> = [
-      // Assets
-      ['100000', 'Cash on Hand', 'asset_cash'],
-      ['101000', 'HDFC Bank — Current', 'asset_cash'],
-      ['101100', 'ICICI Bank — Collections', 'asset_cash'],
-      ['110000', 'Accounts Receivable', 'asset_receivable', true],
-      ['120000', 'Customer Advances (Asset Contra)', 'asset_current', true],
-      ['130000', 'Supplier Advances', 'asset_prepaid', true],
-      ['135000', 'Employee Advances', 'asset_prepaid', true],
-      ['140000', 'Prepaid Expenses', 'asset_prepaid'],
-      ['150000', 'Office Equipment', 'asset_fixed'],
-      ['151000', 'Furniture & Fixtures', 'asset_fixed'],
-      ['155000', 'Accumulated Depreciation', 'asset_fixed'],
-      ['160000', 'Security Deposits', 'asset_current'],
-      ['170000', 'Input CGST', 'asset_current'],
-      ['170100', 'Input SGST', 'asset_current'],
-      ['170200', 'Input IGST', 'asset_current'],
-      /*
-       * TAX ALREADY PAID ON THE AGENCY'S BEHALF, AND IT IS AN ASSET.
-       *
-       * A marketplace that remits a payout has already collected TCS and
-       * withheld TDS out of it. Both are income tax the agency has effectively
-       * paid in advance and will set off at assessment — so booking them as
-       * expenses (the easy mistake, because they arrive looking like
-       * deductions) understates the profit AND loses the set-off, and the
-       * agency pays the same tax twice.
-       */
-      ['171000', 'TCS Receivable', 'asset_current'],
-      ['171100', 'TDS Receivable (Income Tax)', 'asset_current'],
-      // Liabilities
-      ['200000', 'Accounts Payable', 'liability_payable', true],
-      ['210000', 'Output CGST', 'liability_tax'],
-      ['210100', 'Output SGST', 'liability_tax'],
-      ['210200', 'Output IGST', 'liability_tax'],
-      ['220000', 'TDS Payable', 'liability_tax'],
-      ['230000', 'Customer Refunds Payable', 'liability_current'],
-      ['240000', 'Customer Advances', 'liability_current', true],
-      ['245000', 'Commission Payable', 'liability_current'],
-      ['246000', 'Deferred Revenue', 'liability_current'],
-      ['250000', 'Bank Loan', 'liability_noncurrent'],
-      // Equity
-      ['300000', 'Owner Capital', 'equity'],
-      ['310000', 'Retained Earnings', 'equity_unaffected'],
-      // Revenue
-      ['400000', 'Package Revenue', 'income'],
-      ['401000', 'Hotel Revenue', 'income'],
-      ['402000', 'Flight Revenue', 'income'],
-      ['403000', 'Visa Service Revenue', 'income'],
-      ['404000', 'Transport Revenue', 'income'],
-      ['405000', 'Sightseeing Revenue', 'income'],
-      ['406000', 'Service Fees', 'income'],
-      ['407000', 'Cancellation Fees', 'income'],
-      ['408000', 'Commission Income', 'income'],
-      ['409000', 'Other Travel Revenue', 'income_other'],
-      ['410000', 'Foreign Exchange Gain', 'income_other'],
-      // What a channel pays BACK: a reimbursement for inventory it lost, a
-      // credit note reversing its own charge. Not revenue from a traveller, so
-      // it is kept out of the trip revenue accounts the margin is read from.
-      ['411000', 'Channel Recoveries', 'income_other'],
-      // Direct trip costs
-      ['500000', 'Hotel Cost', 'expense_direct'],
-      ['501000', 'Flight Cost', 'expense_direct'],
-      ['502000', 'Transport Cost', 'expense_direct'],
-      ['503000', 'Visa Cost', 'expense_direct'],
-      ['504000', 'Sightseeing Cost', 'expense_direct'],
-      ['505000', 'Supplier Charges', 'expense_direct'],
-      ['506000', 'Tour Guide Cost', 'expense_direct'],
-      ['507000', 'Package Direct Cost', 'expense_direct'],
-      // Operating expenses
-      ['600000', 'Salaries', 'expense_operating'],
-      ['601000', 'Rent', 'expense_operating'],
-      ['602000', 'Marketing', 'expense_operating'],
-      ['603000', 'Software Subscriptions', 'expense_operating'],
-      ['604000', 'Internet & Telephone', 'expense_operating'],
-      ['605000', 'Office Expenses', 'expense_operating'],
-      ['606000', 'Bank Charges', 'expense_operating'],
-      ['607000', 'Staff Travel', 'expense_operating'],
-      ['608000', 'Professional Fees', 'expense_operating'],
-      ['610000', 'Agent Commission', 'expense_operating'],
-      ['611000', 'Foreign Exchange Loss', 'expense_operating'],
-      /*
-       * WHAT A SALES CHANNEL KEEPS, in three accounts rather than one.
-       *
-       * They are read differently. Commission scales with what was sold and
-       * belongs beside the gross margin; shipping and return fees are logistics
-       * and scale with order COUNT; storage and advertising are neither — they
-       * are what the channel charges whether anything sold or not. One bucket
-       * hides exactly the comparison an agency makes when it decides whether a
-       * channel is worth selling through.
-       */
-      ['612000', 'Channel Commission', 'expense_operating'],
-      ['612100', 'Channel Shipping & Returns', 'expense_operating'],
-      ['612200', 'Channel Charges — Storage, Ads & Other', 'expense_operating'],
-      ['609000', 'Depreciation', 'expense_depreciation'],
-    ];
-    /*
-     * THE SAC EACH REVENUE AND COST ACCOUNT IMPLIES.
-     *
-     * The middle step of the chain that fills an invoice line's HSN — product,
-     * then account, then the agency's own. Separate from `chart` above rather
-     * than a fifth column on seventy rows, because only these dozen carry one:
-     * an account like Rent or Retained Earnings never appears on a tax invoice
-     * line and a code against it would be noise.
-     *
-     * These are the Chapter 99 service codes a travel agency actually invoices
-     * under: 998551 air ticketing, 996311 accommodation, 996412/996423 passenger
-     * transport, 998555 tour operator, 998599 other support services. They are
-     * DEFAULTS and the agency is answerable for them, which is why each is
-     * editable on the account — it is a starting chart, not advice.
-     */
-    const sacOfAccount: Record<string, string> = {
-      '400000': '998555', '401000': '996311', '402000': '998551', '403000': '998599',
-      '404000': '996412', '405000': '998555', '406000': '998599', '407000': '998599',
-      '408000': '998551', '409000': '998555',
-      '500000': '996311', '501000': '998551', '502000': '996412', '503000': '998599',
-      '504000': '998555', '505000': '998599', '506000': '998555', '507000': '998555',
-    };
-    for (const [code, name, kind, reconcilable] of chart) {
-      acc[code] = await upsertAccount(orgId, {
-        code, name, kind, reconcilable, defaultHsnCode: sacOfAccount[code] ?? null,
-      });
-    }
-
-    // ---------------------------------------------------------- journals
-    const jrn: Record<string, string> = {};
-    const journals: Array<[string, string, string, string | null]> = [
-      ['SAL', 'Customer Invoices', 'sale', null],
-      ['SCN', 'Customer Credit Notes', 'sale', null],
-      ['PUR', 'Vendor Bills', 'purchase', null],
-      ['PCN', 'Vendor Credit Notes', 'purchase', null],
-      ['BNK', 'HDFC Bank', 'bank', acc['101000']],
-      ['COL', 'ICICI Collections', 'bank', acc['101100']],
-      ['CSH', 'Cash', 'cash', acc['100000']],
-      ['EXP', 'Employee Expenses', 'general', null],
-      ['MSC', 'Miscellaneous', 'general', null],
-    ];
-    for (const [code, name, type, account] of journals) {
-      jrn[code] = await upsertJournal(orgId, { code, name, type, defaultAccountId: account });
-    }
-
-    // Bank accounts, which are what the Banking screen actually lists.
-    const bankAccounts: Array<[string, string, string, string, string, number]> = [
-      ['bnk_hdfc', 'HDFC Bank — Current', 'HDFC Bank', '50100234561234', acc['101000'], 0],
-      ['bnk_icici', 'ICICI Collections', 'ICICI Bank', '002105001234', acc['101100'], 0],
-      ['bnk_cash', 'Petty Cash', '', '', acc['100000'], 1],
-    ];
-    for (const [bid, name, bank, no, accountId, isCash] of bankAccounts) {
-      await run(
-        `INSERT INTO bank_accounts (id, org_id, name, bank_name, account_no, ifsc, currency, is_cash, account_id, journal_id, active)
-         VALUES (?,?,?,?,?,?, 'INR', ?,?,?,1)`,
-        bid, orgId, name, bank || null, no || null, bank ? 'HDFC0000123' : null,
-        isCash, accountId, isCash ? jrn.CSH : bid === 'bnk_hdfc' ? jrn.BNK : jrn.COL,
-      );
-    }
-    await run('UPDATE journals SET bank_account_id=? WHERE id=?', 'bnk_hdfc', jrn.BNK);
-    await run('UPDATE journals SET bank_account_id=? WHERE id=?', 'bnk_icici', jrn.COL);
-    await run('UPDATE journals SET bank_account_id=? WHERE id=?', 'bnk_cash', jrn.CSH);
-    // The default is what every money form opens on. Without one the first
-    // account alphabetically becomes the default by accident.
-    await run('UPDATE bank_accounts SET is_default=1 WHERE id=?', 'bnk_hdfc');
-
-    // ------------------------------------------------------- payment terms
-    const terms: Array<[string, string, number]> = [
-      ['pt_imm', 'Immediate', 0],
-      ['pt_7', '7 days', 7],
-      ['pt_15', '15 days', 15],
-      ['pt_30', '30 days', 30],
-      ['pt_45', '45 days', 45],
-    ];
-    for (const [tid, name, days] of terms) {
-      await run('INSERT INTO payment_terms (id, org_id, name, days) VALUES (?,?,?,?)', tid, orgId, name, days);
-    }
-
-    // --------------------------------------------------------------- taxes
-    // A CGST+SGST pair is one tax on screen and two in the ledger. The parent
-    // carries the rate the customer sees; the children carry half each and the
-    // accounts the return is filed from.
-    const tax: Record<string, string> = {};
-    const gstPairs: Array<[string, number, 'sale' | 'purchase']> = [
-      ['GST 5%', 500, 'sale'], ['GST 12%', 1200, 'sale'], ['GST 18%', 1800, 'sale'],
-      ['GST 5%', 500, 'purchase'], ['GST 12%', 1200, 'purchase'], ['GST 18%', 1800, 'purchase'],
-    ];
-    for (const [name, bps, scope] of gstPairs) {
-      const parentId = id('tax');
-      const sale = scope === 'sale';
-      await run(
-        `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
-                            price_included, account_id, active)
-         VALUES (?,?,?,'percent',?,?,'cgst_sgst',0,NULL,1)`,
-        parentId, orgId, `${name} (${sale ? 'Sales' : 'Purchase'})`, bps, scope,
-      );
-      for (const [half, account] of [
-        ['CGST', sale ? acc['210000'] : acc['170000']],
-        ['SGST', sale ? acc['210100'] : acc['170100']],
-      ] as const) {
-        const childId = id('tax');
-        await run(
-          `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
-                              price_included, account_id, active)
-           VALUES (?,?,?,'percent',?,?,'gst',0,?,1)`,
-          childId, orgId, `${half} ${(bps / 200).toFixed(bps % 200 ? 1 : 0)}%`, bps / 2, scope, account,
-        );
-        await run('INSERT INTO tax_children (parent_id, child_id) VALUES (?,?)', parentId, childId);
-      }
-      tax[`${scope}_${bps}`] = parentId;
-    }
-    // Interstate and overseas supply: one 18% IGST line, no split.
-    for (const scope of ['sale', 'purchase'] as const) {
-      const igstId = id('tax');
-      await run(
-        `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
-                            price_included, account_id, active)
-         VALUES (?,?,?,'percent',1800,?,'igst',0,?,1)`,
-        igstId, orgId, `IGST 18% (${scope === 'sale' ? 'Sales' : 'Purchase'})`, scope,
-        scope === 'sale' ? acc['210200'] : acc['170200'],
-      );
-      tax[`igst_${scope}`] = igstId;
-    }
-    // Withholding. Thresholds are annual limits under the relevant section and
-    // are configuration, not code: change the row, not this file.
-    const tdsRows: Array<[string, number, number]> = [
-      ['TDS 194C — Contractors 2%', 200, 10_000_00],
-      ['TDS 194H — Commission 5%', 500, 2_000_00],
-      ['TDS 194J — Professional 10%', 1000, 5_000_00],
-    ];
-    for (const [name, bps, threshold] of tdsRows) {
-      const tid = id('tax');
-      await run(
-        `INSERT INTO taxes (id, org_id, name, computation, rate_bps, scope, tax_group,
-                            price_included, account_id, threshold, active)
-         VALUES (?,?,?,'percent',?,'purchase','tds',0,?,?,1)`,
-        tid, orgId, name, bps, acc['220000'], threshold,
-      );
-      tax[`tds_${bps}`] = tid;
-    }
-
-    // ----------------------------------------------- analytic plans (§24–25)
-    const plans: Array<[string, string, string[]]> = [
-      ['TRIPS', 'Trips', []],
-      ['DEPT', 'Departments', ['Sales', 'Operations', 'Marketing', 'Administration']],
-      ['BRANCH', 'Branches', ['Hyderabad', 'Chennai', 'Mumbai']],
-      ['AGENT', 'Agents', ['Sai Kiran', 'Meera Rao', 'Arjun Das']],
-    ];
-    for (const [code, name, members] of plans) {
-      const planId = id('plan');
-      await run('INSERT INTO analytic_plans (id, org_id, name, code) VALUES (?,?,?,?)', planId, orgId, name, code);
-      for (const [i, m] of members.entries()) {
-        await run(
-          'INSERT INTO analytic_accounts (id, org_id, plan_id, code, name, active) VALUES (?,?,?,?,?,1)',
-          id('ana'), orgId, planId, `${code}-${i + 1}`, m,
-        );
-      }
-    }
-
-    // ---------------------------------------------------- default accounts
-    const settings: Array<[Parameters<typeof setSetting>[1], string]> = [
-      ['account.receivable', acc['110000']],
-      ['account.payable', acc['200000']],
-      ['account.customer_advance', acc['240000']],
-      ['account.supplier_advance', acc['130000']],
-      ['account.customer_refund_payable', acc['230000']],
-      ['account.input_tax', acc['170000']],
-      ['account.output_tax', acc['210000']],
-      ['account.tds_payable', acc['220000']],
-      ['account.retained_earnings', acc['310000']],
-      ['account.current_year', acc['310000']],
-      ['account.fx_gain', acc['410000']],
-      ['account.fx_loss', acc['611000']],
-      ['account.bank_charges', acc['606000']],
-      ['account.commission_expense', acc['610000']],
-      ['account.commission_payable', acc['245000']],
-      ['account.channel_commission', acc['612000']],
-      ['account.channel_shipping', acc['612100']],
-      ['account.channel_charges', acc['612200']],
-      ['account.channel_recovery', acc['411000']],
-      ['account.tcs_receivable', acc['171000']],
-      ['account.tds_receivable', acc['171100']],
-      ['account.employee_advance', acc['135000']],
-      ['account.rounding', acc['409000']],
-      ['account.opening_balance', acc['300000']],
-      ['journal.sale', jrn.SAL],
-      ['journal.sale_refund', jrn.SCN],
-      ['journal.purchase', jrn.PUR],
-      ['journal.purchase_refund', jrn.PCN],
-      ['journal.bank', jrn.BNK],
-      ['journal.cash', jrn.CSH],
-      ['journal.customer_payment', jrn.COL],
-      ['journal.vendor_payment', jrn.BNK],
-      ['journal.general', jrn.MSC],
-      ['journal.expense', jrn.EXP],
-      ['journal.asset', jrn.MSC],
-    ];
-    for (const [key, value] of settings) await setSetting(orgId, key, value);
-
-    // ------------------------------------------------------------ products
-    /*
-     * EVERY SEEDED PRODUCT CARRIES ITS SAC, and that is not decoration.
-     *
-     * A GST tax invoice must state an HSN (goods) or SAC (services) per line —
-     * CGST Rule 46 — and these are the real codes for what a travel agency
-     * sells: 998555 tour-operator services, 996311 hotel accommodation, 996425
-     * road transport of passengers, 998599 other support services. Seeding them
-     * means the demo books produce a COMPLIANT invoice rather than one that
-     * looks right until an auditor reads it, and it is also the only way the
-     * HSN column on the exported statement has anything in it out of the box.
-     *
-     * The MRP is the published price the sale price discounts from, which is
-     * what the statement's "MRP" column wants beside the selling price.
-     */
-    const products: Array<[string, string, number, number, string, string, string, number, string]> = [
-      ['Bali 5D/4N Package', 'package', 150_000_00, 112_000_00, acc['400000'], acc['507000'], '998555', 169_000_00, 'Deluxe · twin sharing'],
-      ['Dubai 4D/3N Package', 'package', 95_000_00, 71_000_00, acc['400000'], acc['507000'], '998555', 109_000_00, 'Standard · twin sharing'],
-      ['Goa Weekend Package', 'package', 32_000_00, 22_000_00, acc['400000'], acc['507000'], '998555', 38_000_00, 'Beach resort · twin sharing'],
-      ['Hotel Booking', 'hotel', 0, 0, acc['401000'], acc['500000'], '996311', 0, 'Per room, per night'],
-      ['Flight Ticket', 'flight', 0, 0, acc['402000'], acc['501000'], '996425', 0, 'Economy'],
-      ['Visa Processing', 'visa', 10_000_00, 6_500_00, acc['403000'], acc['503000'], '998599', 12_000_00, 'Tourist, single entry'],
-      ['Airport Transfer', 'transport', 5_000_00, 3_200_00, acc['404000'], acc['502000'], '996412', 6_000_00, 'Sedan · up to 3 pax'],
-      ['Sightseeing Tour', 'sightseeing', 8_000_00, 5_000_00, acc['405000'], acc['504000'], '998555', 9_500_00, 'Full day · guided'],
-      ['Service Fee', 'fee', 2_500_00, 0, acc['406000'], acc['505000'], '998599', 0, null as unknown as string],
-    ];
-    for (const [name, category, sale, cost, income, expense, hsn, mrp, variant] of products) {
-      await upsertProduct(orgId, {
-        name, category, salePrice: sale, costPrice: cost,
-        incomeAccountId: income, expenseAccountId: expense,
-        saleTaxId: tax.sale_500, purchaseTaxId: tax.purchase_1800,
-        hsnCode: hsn, mrp, variant: variant ?? null,
-      });
-    }
-
-    // ------------------------------------------------------- fiscal periods
-    const fy = fiscalYearOf(today, 4);
-    await createFiscalYear(orgId, fy.from);
+    return provisioned;
   });
 
-  if (DEMO) await seedDemo(orgId);
+  if (DEMO) await seedDemo(books);
 }
 
 /**
@@ -499,7 +280,17 @@ export async function seed() {
  * advance, invoice, partial payment, supplier bill with TDS, cancellation and
  * credit note, employee expense, depreciation, commission, FX purchase.
  */
-async function seedDemo(orgId: string) {
+async function seedDemo(books: ProvisionedBooks) {
+  /*
+   * THE HANDLE, NOT A STRING. `provisionOrg` generates every id it writes —
+   * which is what lets two agencies be provisioned into one database at all —
+   * so the demo addresses the bank accounts and payment terms it needs through
+   * `books` rather than through the `bnk_hdfc` and `pt_30` literals it used to
+   * hard-code. Accounts, journals and taxes are still looked up BY CODE below,
+   * because a code is a stable business identifier and reads better here than
+   * a map lookup.
+   */
+  const orgId = books.orgId;
   const actor = { id: 'usr_admin', name: 'Admin User', role: 'admin' };
   const today = isoDate();
   const acc = async (code: string) =>
@@ -550,7 +341,7 @@ async function seedDemo(orgId: string) {
   for (const [name, type, email, phone, limit, city, state] of customers) {
     cust[name] = await upsertPartner(orgId, {
       name, isCustomer: true, partnerType: type, email, phone,
-      creditLimit: limit, paymentTermsId: limit ? 'pt_30' : 'pt_imm',
+      creditLimit: limit, paymentTermsId: limit ? books.terms.d30 : books.terms.imm,
       gstin: type === 'b2b' ? '29AAACI1681G1ZR' : null,
       gstName: type === 'b2b' ? 'INFOSYS LIMITED' : null,
       city, stateCode: state,
@@ -569,7 +360,7 @@ async function seedDemo(orgId: string) {
   for (const [name, note, tds] of suppliers) {
     supp[name] = await upsertPartner(orgId, {
       name, isSupplier: true, partnerType: 'b2b', address: note,
-      tdsSection: tds, paymentTermsId: 'pt_15',
+      tdsSection: tds, paymentTermsId: books.terms.d15,
     }, actor);
   }
 
@@ -602,7 +393,7 @@ async function seedDemo(orgId: string) {
   // Advance first, as travel actually works: money before the invoice exists.
   const advance = await createPayment({
     orgId, direction: 'inbound', partnerId: cust['Rahul Mehta'],
-    journalId: await jrn('COL'), bankAccountId: 'bnk_icici', bookingId: bkg['BK-1023'],
+    journalId: await jrn('COL'), bankAccountId: books.banks.icici, bookingId: bkg['BK-1023'],
     payDate: d(-160), amount: 50_000_00, method: 'upi', reference: 'UPI/4412093',
     isAdvance: true,
   }, actor);
@@ -610,7 +401,7 @@ async function seedDemo(orgId: string) {
   const inv1023 = await createDocument({
     orgId, docType: 'out_invoice', partnerId: cust['Rahul Mehta'],
     journalId: await jrn('SAL'), bookingId: bkg['BK-1023'], analyticId: await analyticOf(bkg['BK-1023']),
-    docDate: d(-150), paymentTermsId: 'pt_15',
+    docDate: d(-150), paymentTermsId: books.terms.d15,
     lines: [
       { name: 'Bali 5D/4N Package — 2 pax', qtyMilli: 1000, unitPrice: 1_50_000_00, accountId: await acc('400000'), taxId: gstSale5 },
       { name: 'Visa Services', qtyMilli: 2000, unitPrice: 5_000_00, accountId: await acc('403000'), taxId: gstSale18 },
@@ -624,13 +415,13 @@ async function seedDemo(orgId: string) {
   await applyAdvance(orgId, advance, inv1023, 50_000_00, actor);
   await createPayment({
     orgId, direction: 'inbound', partnerId: cust['Rahul Mehta'], journalId: await jrn('BNK'),
-    bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1023'], payDate: d(-140),
+    bankAccountId: books.banks.hdfc, bookingId: bkg['BK-1023'], payDate: d(-140),
     amount: 90_000_00, method: 'neft', reference: 'NEFT/HDFC/88231',
     allocations: [{ documentId: inv1023, amount: 90_000_00 }],
   }, actor);
   await createPayment({
     orgId, direction: 'inbound', partnerId: cust['Rahul Mehta'], journalId: await jrn('BNK'),
-    bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1023'], payDate: d(-132),
+    bankAccountId: books.banks.hdfc, bookingId: bkg['BK-1023'], payDate: d(-132),
     amount: Math.min(40_000_00, invTotal - 1_40_000_00), method: 'upi', reference: 'UPI/5590231',
     allocations: [{ documentId: inv1023, amount: Math.min(40_000_00, invTotal - 1_40_000_00) }],
   }, actor);
@@ -639,7 +430,7 @@ async function seedDemo(orgId: string) {
   const billHotel = await createDocument({
     orgId, docType: 'in_invoice', partnerId: supp['Taj Resorts Bali'],
     journalId: await jrn('PUR'), bookingId: bkg['BK-1023'], analyticId: await analyticOf(bkg['BK-1023']),
-    docDate: d(-148), supplierRef: 'TRB/2026/4471', paymentTermsId: 'pt_15',
+    docDate: d(-148), supplierRef: 'TRB/2026/4471', paymentTermsId: books.terms.d15,
     lines: [{ name: 'Bali — 4 nights, deluxe twin', qtyMilli: 1000, unitPrice: 80_000_00, accountId: await acc('500000') }],
   }, actor);
   await postDocument(orgId, billHotel, actor);
@@ -647,7 +438,7 @@ async function seedDemo(orgId: string) {
   const billFlight = await createDocument({
     orgId, docType: 'in_invoice', partnerId: supp['SkyWings Air Consolidator'],
     journalId: await jrn('PUR'), bookingId: bkg['BK-1023'], analyticId: await analyticOf(bkg['BK-1023']),
-    docDate: d(-147), supplierRef: 'SW-99211', paymentTermsId: 'pt_7',
+    docDate: d(-147), supplierRef: 'SW-99211', paymentTermsId: books.terms.d7,
     withholdingTaxId: tds194c,
     lines: [{ name: 'HYD–DPS return, 2 pax', qtyMilli: 1000, unitPrice: 60_000_00, accountId: await acc('501000') }],
   }, actor);
@@ -658,7 +449,7 @@ async function seedDemo(orgId: string) {
     const partner = (await one<{ partner_id: string }>('SELECT partner_id FROM documents WHERE id=?', billId))!.partner_id;
     await createPayment({
       orgId, direction: 'outbound', partnerId: partner, journalId: await jrn('BNK'),
-      bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1023'], payDate: date,
+      bankAccountId: books.banks.hdfc, bookingId: bkg['BK-1023'], payDate: date,
       amount: Math.min(amount, residual), method: 'neft',
       allocations: [{ documentId: billId, amount: Math.min(amount, residual) }],
     }, actor);
@@ -677,7 +468,7 @@ async function seedDemo(orgId: string) {
   const inv1024 = await createDocument({
     orgId, docType: 'out_invoice', partnerId: cust['Sneha Reddy'],
     journalId: await jrn('SAL'), bookingId: bkg['BK-1024'], analyticId: await analyticOf(bkg['BK-1024']),
-    docDate: d(-100), paymentTermsId: 'pt_imm',
+    docDate: d(-100), paymentTermsId: books.terms.imm,
     lines: [
       { name: 'Goa Weekend — 4 pax', qtyMilli: 4000, unitPrice: 32_000_00, accountId: await acc('400000'), taxId: gstSale5 },
     ],
@@ -685,7 +476,7 @@ async function seedDemo(orgId: string) {
   await postDocument(orgId, inv1024, actor);
   await createPayment({
     orgId, direction: 'inbound', partnerId: cust['Sneha Reddy'], journalId: await jrn('COL'),
-    bankAccountId: 'bnk_icici', bookingId: bkg['BK-1024'], payDate: d(-99),
+    bankAccountId: books.banks.icici, bookingId: bkg['BK-1024'], payDate: d(-99),
     amount: 1_34_400_00, method: 'card', reference: 'CARD/4411',
     allocations: [{ documentId: inv1024, amount: 1_34_400_00 }],
   }, actor);
@@ -711,7 +502,7 @@ async function seedDemo(orgId: string) {
     await createPayment({
       orgId, direction: 'outbound', side: 'customer',
       partnerId: cust['Sneha Reddy'], journalId: await jrn('COL'),
-      bankAccountId: 'bnk_icici', bookingId: bkg['BK-1024'], payDate: d(-88),
+      bankAccountId: books.banks.icici, bookingId: bkg['BK-1024'], payDate: d(-88),
       amount: cnResidual, method: 'neft', reference: 'Refund — cancellation',
       allocations: [{ documentId: cn, amount: cnResidual }],
     }, actor);
@@ -722,7 +513,7 @@ async function seedDemo(orgId: string) {
   const inv1025 = await createDocument({
     orgId, docType: 'out_invoice', partnerId: cust['Infosys Travel Desk'],
     journalId: await jrn('SAL'), bookingId: bkg['BK-1025'], analyticId: await analyticOf(bkg['BK-1025']),
-    docDate: d(-58), paymentTermsId: 'pt_30',
+    docDate: d(-58), paymentTermsId: books.terms.d30,
     lines: [
       { name: 'Dubai 4D/3N — 12 pax', qtyMilli: 12000, unitPrice: 95_000_00, accountId: await acc('400000'), taxId: gstSale5 },
       { name: 'Corporate service fee', qtyMilli: 1000, unitPrice: 25_000_00, accountId: await acc('406000'), taxId: gstSale18 },
@@ -731,7 +522,7 @@ async function seedDemo(orgId: string) {
   await postDocument(orgId, inv1025, actor);
   await createPayment({
     orgId, direction: 'inbound', partnerId: cust['Infosys Travel Desk'], journalId: await jrn('BNK'),
-    bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1025'], payDate: d(-40),
+    bankAccountId: books.banks.hdfc, bookingId: bkg['BK-1025'], payDate: d(-40),
     amount: 8_00_000_00, method: 'neft', reference: 'INFY/PO/88213',
     allocations: [{ documentId: inv1025, amount: 8_00_000_00 }],
   }, actor);
@@ -747,7 +538,7 @@ async function seedDemo(orgId: string) {
   await postDocument(orgId, billDmc, actor);
   await createPayment({
     orgId, direction: 'outbound', partnerId: supp['Dubai DMC Services'], journalId: await jrn('BNK'),
-    bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1025'], payDate: d(-45),
+    bankAccountId: books.banks.hdfc, bookingId: bkg['BK-1025'], payDate: d(-45),
     amount: 4_00_000_00, method: 'neft', reference: 'SWIFT/AED',
     allocations: [{ documentId: billDmc, amount: 4_00_000_00 }],
   }, actor);
@@ -756,7 +547,7 @@ async function seedDemo(orgId: string) {
   const inv1026 = await createDocument({
     orgId, docType: 'out_invoice', partnerId: cust['Arun Prakash'],
     journalId: await jrn('SAL'), bookingId: bkg['BK-1026'], analyticId: await analyticOf(bkg['BK-1026']),
-    docDate: d(-30), paymentTermsId: 'pt_15',
+    docDate: d(-30), paymentTermsId: books.terms.d15,
     lines: [
       { name: 'Singapore 6D — 3 pax', qtyMilli: 3000, unitPrice: 1_05_000_00, accountId: await acc('400000'), taxId: gstSale5 },
       { name: 'Visa Processing — 3 pax', qtyMilli: 3000, unitPrice: 5_000_00, accountId: await acc('403000'), taxId: gstSale18 },
@@ -774,13 +565,13 @@ async function seedDemo(orgId: string) {
   // ------------------------------------------- BK-1027: upcoming, advance
   await createPayment({
     orgId, direction: 'inbound', partnerId: cust['Skyline Holidays (Reseller)'],
-    journalId: await jrn('BNK'), bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1027'],
+    journalId: await jrn('BNK'), bankAccountId: books.banks.hdfc, bookingId: bkg['BK-1027'],
     payDate: d(-10), amount: 3_00_000_00, method: 'neft', reference: 'SKY/ADV/2211',
     isAdvance: true,
   }, actor);
   await createPayment({
     orgId, direction: 'outbound', partnerId: supp['Taj Resorts Bali'], journalId: await jrn('BNK'),
-    bankAccountId: 'bnk_hdfc', bookingId: bkg['BK-1027'], payDate: d(-8),
+    bankAccountId: books.banks.hdfc, bookingId: bkg['BK-1027'], payDate: d(-8),
     amount: 1_50_000_00, method: 'neft', reference: 'Advance — Bali Oct block',
     isAdvance: true,
   }, actor);
@@ -809,7 +600,7 @@ async function seedDemo(orgId: string) {
     gstName: 'WANDERLY TECHNOLOGIES PRIVATE LIMITED',
     city: 'Bengaluru',
     stateCode: '29',
-    paymentTermsId: 'pt_15',
+    paymentTermsId: books.terms.d15,
   }, actor);
 
   /*
@@ -846,7 +637,7 @@ async function seedDemo(orgId: string) {
     const p = await product(productName);
     const docId = await createDocument({
       orgId, docType: 'out_invoice', partnerId: channel,
-      journalId: await jrn('SAL'), docDate: d(-18 + i), paymentTermsId: 'pt_15',
+      journalId: await jrn('SAL'), docDate: d(-18 + i), paymentTermsId: books.terms.d15,
       // The channel is in Karnataka and the agency in Telangana, so this is an
       // inter-state supply — which is exactly the case the place-of-supply
       // field exists to decide.
@@ -886,7 +677,7 @@ async function seedDemo(orgId: string) {
     previousUnsettled: 0,
     payDate: d(-4),
     utr: 'CMS5643191908',
-    bankAccountId: 'bnk_icici',
+    bankAccountId: books.banks.icici,
     note: 'Wanderly payout cycle — statement WDL/PAY/2026/0417',
   }, actor);
 
@@ -975,7 +766,7 @@ async function seedDemo(orgId: string) {
   // ------------------------------------------- an unreconciled statement
   // Left deliberately unmatched, so the Reconciliation screen has real work in
   // it on a fresh install — including one line that is not a customer receipt.
-  await importStatement(orgId, 'bnk_hdfc', [
+  await importStatement(orgId, books.banks.hdfc, [
     { date: d(-4), description: 'UPI/ARUN PRAKASH/SINGAPORE TRIP', reference: 'UPI/77120', amount: 1_00_000_00 },
     { date: d(-3), description: 'NEFT INFOSYS LTD BALANCE PO 88213', reference: 'NEFT/99120', amount: 2_00_000_00 },
     { date: d(-3), description: 'BANK CHARGES QTR', reference: 'CHG/0926', amount: -1_180_00 },

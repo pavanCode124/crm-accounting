@@ -110,6 +110,8 @@ declare global {
   // eslint-disable-next-line no-var
   var __tripzoReady: Promise<void> | undefined;
   // eslint-disable-next-line no-var
+  var __tripzoSchemaStamp: string | undefined;
+  // eslint-disable-next-line no-var
   var __tripzoTxQueue: Promise<unknown> | undefined;
 }
 
@@ -211,6 +213,31 @@ function schemaSql(): string {
 }
 
 /**
+ * How long the schema file is, as a cheap stand-in for which version of it ran.
+ *
+ * ONLY CONSULTED IN DEVELOPMENT, and it exists because of a failure that costs
+ * an hour every time it happens. The bootstrap runs ONCE PER PROCESS, and
+ * `next dev` is one process that survives every edit — so adding a column to
+ * schema.sql changes the file, hot-reloads the code that reads the column, and
+ * never runs the ALTER. What the screen then says is `column "x" of relation
+ * "documents" does not exist`, which reads like a bug in the query rather than
+ * like "restart your server".
+ *
+ * So in development the file is re-applied when it changes. Every statement in
+ * it is `IF NOT EXISTS`, which is what makes that safe to repeat. A production
+ * instance is never in this position — a deploy is a new process — and pays
+ * nothing for this: the length is only read when NODE_ENV is not production.
+ */
+function schemaStamp(): string | null {
+  if (process.env.NODE_ENV === 'production') return null;
+  try {
+    return String(schemaSql().length);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Create the schema if it is not there yet, once per process.
  *
  * Under an advisory lock on the real driver, because several instances can
@@ -219,6 +246,11 @@ function schemaSql(): string {
  * doing nothing. The demo is one process with one connection and needs none.
  */
 async function ready(): Promise<void> {
+  const stamp = schemaStamp();
+  if (stamp !== null && globalThis.__tripzoSchemaStamp !== stamp) {
+    globalThis.__tripzoSchemaStamp = stamp;
+    globalThis.__tripzoReady = undefined;
+  }
   return (globalThis.__tripzoReady ??= (async () => {
     if (isDemoMode()) {
       const db = await demo();

@@ -21,6 +21,18 @@ export async function DocumentList({ orgId, docType, basePath, filter, emptyHint
   // raised from the document it corrects, never typed from scratch.
   const editable = docType === 'out_invoice' || docType === 'in_invoice';
 
+  /*
+   * THE CRM NUMBER IS SHOWN ONLY WHERE THERE IS ONE TO SHOW.
+   *
+   * A column of dashes on a list of invoices typed in this app teaches nothing
+   * and costs a column's width on every screen; on a list drafted from
+   * TripzoCRM it is the only number the agent who raised it recognises, because
+   * the ledger number does not exist until the document is posted and every
+   * draft reads "Draft". Decided from the rows rather than from `docType` so a
+   * bill mirrored from the CRM later gets it for free.
+   */
+  const showCrmNumber = docs.some((d) => d.crm_invoice_number);
+
   const totals = docs.reduce(
     (t, d) => ({ total: t.total + d.total, residual: t.residual + d.residual }),
     { total: 0, residual: 0 },
@@ -51,6 +63,7 @@ export async function DocumentList({ orgId, docType, basePath, filter, emptyHint
           <thead>
             <tr>
               <Th width="130px">Number</Th>
+              {showCrmNumber && <Th width="130px">CRM invoice</Th>}
               <Th>{isBill ? 'Supplier' : 'Customer'}</Th>
               <Th>Trip</Th>
               <Th width="110px">Date</Th>
@@ -69,6 +82,17 @@ export async function DocumentList({ orgId, docType, basePath, filter, emptyHint
                     <RefLink href={`${basePath}/${d.id}`}>{d.number ?? 'Draft'}</RefLink>
                     {d.supplier_ref && <div className="text-[11.5px] text-ink-faint">{d.supplier_ref}</div>}
                   </Td>
+                  {showCrmNumber && (
+                    <Td>
+                      {/* PLAIN TEXT, NOT A LINK. It links nowhere because the
+                          only place it could go is the CRM list, which is the
+                          screen this row was reached from — a navigation that
+                          lands the reader where they already were. */}
+                      {d.crm_invoice_number
+                        ? <span className="font-semibold">{d.crm_invoice_number}</span>
+                        : <span className="text-ink-faint">—</span>}
+                    </Td>
+                  )}
                   <Td>
                     {/* The name is what the eye goes to first, so it opens the
                         document as well as the number does. */}
@@ -110,7 +134,7 @@ export async function DocumentList({ orgId, docType, basePath, filter, emptyHint
           </tbody>
           <tfoot>
             <tr className="bg-canvas">
-              <Td colSpan={5}><span className="font-bold">{docs.length} document(s)</span></Td>
+              <Td colSpan={showCrmNumber ? 6 : 5}><span className="font-bold">{docs.length} document(s)</span></Td>
               <Td align="right"><Money value={totals.total} bold dash={false} /></Td>
               <Td align="right"><Money value={totals.residual} bold dash={false} /></Td>
               <Td />
@@ -148,7 +172,7 @@ export function DocumentFilters({ action, filter, docType }: {
       {docType && <input type="hidden" name="type" value={docType} />}
       <label className="block min-w-[220px] flex-1">
         <span className="mb-1 block text-[11px] font-bold uppercase tracking-[0.06em] text-ink-faint">Search</span>
-        <input name="q" defaultValue={filter.search} placeholder="Number, customer, supplier reference…"
+        <input name="q" defaultValue={filter.search} placeholder="Number, CRM number, customer, supplier reference…"
           className={inputClass} />
       </label>
       <label className="block">

@@ -27,7 +27,7 @@ export default async function EntryPage({ params, searchParams }: {
   if (!data) return <Banner tone="error">That entry no longer exists.</Banner>;
 
   const { entry, lines } = data;
-  const trail = await auditFor('journal_entry', id);
+  const trail = await auditFor(s.orgId, 'journal_entry', id);
   const debit = lines.reduce((sum, l) => sum + l.debit, 0);
   const credit = lines.reduce((sum, l) => sum + l.credit, 0);
   const today = isoDate();

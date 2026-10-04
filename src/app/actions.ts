@@ -3,14 +3,17 @@
 import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
 import { requireCap, actorOf, ForbiddenError } from '@/server/auth';
+import { signInToCrm, signOutOfCrm } from '@/server/crm/identity';
 import { ctx } from '@/server/bootstrap';
 import { toMinor, qtyToMilli } from '@/lib/money';
 import { isoDate, type DocType } from '@/lib/accounting';
 import {
-  createDocument, updateDocument, postDocument, reverseDocument, createCreditNote, getDocument,
+  createDocument, updateDocument, amendDocument, postDocument, reverseDocument, createCreditNote,
+  getDocument,
 } from '@/server/accounting/documents';
 import {
   createPayment, postPayment, allocate, unallocate, applyCreditNote, applyCreditToSource, reversePayment,
+  cancelAdvance,
 } from '@/server/accounting/payments';
 import { draftEntry, postDraft, postEntry, reverseEntry } from '@/server/accounting/engine';
 import {
@@ -40,7 +43,11 @@ import { resetAndSeed } from '@/server/seed';
 import { journalOfBankAccount } from '@/server/options';
 import { run, id } from '@/server/db';
 import { connect as connectCrm, disconnect as disconnectCrm } from '@/server/crm/connection';
-import { syncFromCrm, forgetSyncLinks } from '@/server/crm/sync';
+import { setPackageTax } from '@/server/crm/packageTax';
+import {
+  syncFromCrm, forgetSyncLinks, refreshPackages, redraftInvoice, redraftAllDrafts,
+  settleCrmReceipts,
+} from '@/server/crm/sync';
 
 /**
  * Every mutation in the product.
@@ -112,6 +119,264 @@ function back(path: string, r: Result): never {
 }
 
 // ---------------------------------------------------------------------------
+// Signing in
+// ---------------------------------------------------------------------------
+
+/**
+ * Where a successful sign-in is allowed to send someone.
+ *
+ * A PATH ON THIS SITE OR NOTHING. A login form that redirects to whatever a
+ * query parameter says is an open redirect, and an open redirect on a login
+ * form is a phishing page hosted under the agency's own domain: the victim
+ * checks the address bar, sees the real site, signs in, and is handed to an
+ * attacker's copy. The two rejected shapes are the ones that matter —
+ * "//evil.example" is protocol-relative and leaves the site, and anything with
+ * a scheme leaves it outright — so only a single leading slash survives.
+ */
+function safeReturn(raw: string): string {
+  const next = raw.trim();
+  if (!next.startsWith('/') || next.startsWith('//')) return '/';
+  return next;
+}
+
+export async function signInAction(formData: FormData) {
+  const next = safeReturn(str(formData, 'next'));
+  const email = str(formData, 'email');
+
+  // NOT `guard`: that helper turns a failure into a redirect back to the same
+  // screen, which is right here, but the PASSWORD must not travel through it on
+  // the way. It is read straight into the call and never lands in a variable
+  // that outlives this line, never in a log, and never in the URL the failure
+  // redirects to.
+  try {
+    await signInToCrm(email, str(formData, 'password'));
+  } catch (e) {
+    const message = e instanceof Error ? e.message : 'Sign-in failed.';
+    back(`/login${next === '/' ? '' : `?next=${encodeURIComponent(next)}`}`, { error: message });
+  }
+  revalidatePath('/', 'layout');
+  redirect(next);
+}
+
+export async function signOutAction() {
+  await signOutOfCrm();
+  revalidatePath('/', 'layout');
+  redirect('/login');
+}
+
+// ---------------------------------------------------------------------------
+// TripzoCRM — fetch, mirror, draft. NOTHING WRITES TO THE CRM.
+// ---------------------------------------------------------------------------
+// This block used to hold `saveCrmInvoiceAction`, `crmPaymentAction` and
+// `crmDeleteInvoiceAction`, which POSTed, PATCHed and DELETEd invoices in
+// TripzoCRM from this app's own forms. All three are gone, and so are the
+// client functions behind them.
+//
+// WHY. This is an accounting system. TripzoCRM is the agency's operational
+// system, and the invoice an agent raised there is what the customer's copy is
+// generated from. A mapping bug, a double-submitted form or a mis-scoped token
+// in a finance app must not be able to alter that record — there is no undo for
+// it in the ledger, and no report here can detect it.
+//
+// So the traffic is one-way and the direction is enforced structurally rather
+// than by convention: `crmFetch` takes no method and no body, so a write cannot
+// be expressed anywhere in this codebase. What replaced the three actions is
+// `importFromCrmAction` below — fetch the CRM, mirror it into this ledger's own
+// Postgres, and draft documents the accountant completes and posts here.
+//
+// An invoice is now saved by `saveDocumentAction`, the same action a vendor bill
+// uses, writing to the same `documents` table. One invoice form, one save path,
+// one database — and the books can be produced from it.
+
+/**
+ * Fetch TripzoCRM and draft whatever is not in the books yet.
+ *
+ * TWO STAGES, AND ONLY ONE OF THEM IS REPEATABLE. The fetch mirrors every
+ * invoice, line, receipt and package into this database and is always safe to
+ * re-run. The import turns mirrored invoices into DRAFT documents and is
+ * idempotent through `crm_invoices.document_id`, claimed in the same
+ * transaction as the document — so pressing this twice cannot double a posting.
+ *
+ * `maxDuration` on the calling pages is what gives this room to finish: a run
+ * is several hundred round trips and well past the ten seconds a serverless
+ * function gets by default.
+ */
+export async function importFromCrmAction(formData: FormData) {
+  const s = await requireCap('invoice.create');
+  // Where to land afterwards. The same work is reachable from the CRM invoices
+  // screen and from Settings, and a redirect that always went to one of them
+  // would throw away the context the person was working in.
+  const to = str(formData, 'return_to') === 'settings' ? '/settings/crm-sync' : '/crm/invoices';
+
+  let summary: string;
+  try {
+    const r = await syncFromCrm(s.orgId, actorOf(s));
+    summary =
+      `Fetched ${r.mirroredInvoices} invoice(s) and ${r.mirroredPayments} receipt(s) from `
+      + `TripzoCRM via ${r.via}. Drafted ${r.invoices} document(s) and ${r.payments} receipt(s) — `
+      + `post them in Accounting → Review & Post. ${r.skipped} already in the books.`
+      // Only when it did something. "0 receipt(s) matched" on every run is a
+      // sentence that teaches people to stop reading the banner.
+      + (r.settled
+        ? ` ${r.settled} posted receipt(s) matched to the invoice TripzoCRM took them against.`
+        : '')
+      + (r.warnings.length
+        ? ` ${r.warnings.length} thing(s) need a look: ${r.warnings.slice(0, 3).join(' ')}`
+        : '');
+  } catch (e) {
+    back(to, { error: e instanceof Error ? e.message : 'The fetch from TripzoCRM failed.' });
+  }
+  revalidatePath('/crm/invoices');
+  revalidatePath('/sales/invoices');
+  revalidatePath('/accounting/review');
+  back(to, { ok: summary });
+}
+
+/**
+ * Re-draft ONE already-imported invoice from what TripzoCRM now says.
+ *
+ * THE SYNC CANNOT DO THIS, and deliberately: it skips every invoice already in
+ * the books, because importing one twice is a doubled sale. That leaves a
+ * document drafted from an earlier reading of the invoice standing in the books
+ * with no way to restate it — after a fix to the mapping, after a revenue
+ * account was added to the chart, or after the agent edited the invoice over
+ * there.
+ *
+ * It OVERWRITES THE DRAFT, including anything done to it here: the GST slab
+ * someone picked, an account a line was moved to, a line split in two. That is
+ * why it is a button on one row rather than part of the fetch — only the person
+ * looking at the screen knows whether the draft or the CRM is the better
+ * statement of the invoice. `redraftInvoice` refuses outright on a POSTED
+ * document, where the correction is Edit, which amends and says so.
+ */
+export async function redraftCrmInvoiceAction(formData: FormData) {
+  const s = await requireCap('invoice.create');
+  const crmId = str(formData, 'crm_id');
+  const r = await guard(async () => await redraftInvoice(s.orgId, crmId, actorOf(s)));
+  revalidatePath('/crm/invoices');
+  revalidatePath('/sales/invoices');
+  revalidatePath('/accounting/review');
+  if (r.error) back('/crm/invoices', r);
+  back('/crm/invoices', {
+    ok: [r.value!.summary, ...r.value!.warnings].join(' '),
+  });
+}
+
+/**
+ * Re-draft every still-draft document from the mirror, in one go.
+ *
+ * The bulk form of `redraftCrmInvoiceAction`, and it carries the same warning:
+ * it REPLACES each draft with what TripzoCRM says, including a GST slab or an
+ * account somebody chose here. Posted documents are left alone entirely.
+ *
+ * Reads the mirror, not the CRM — so it is fast, it works while the CRM is
+ * down, and it restates the books from exactly the bytes the import worked
+ * from. Fetch first if what you want is the CRM’s latest.
+ */
+export async function redraftAllCrmInvoicesAction() {
+  const s = await requireCap('invoice.create');
+  const r = await guard(async () => await redraftAllDrafts(s.orgId, actorOf(s)));
+  revalidatePath('/crm/invoices');
+  revalidatePath('/sales/invoices');
+  revalidatePath('/accounting/review');
+  if (r.error) back('/crm/invoices', r);
+  const v = r.value!;
+  back('/crm/invoices', {
+    ok: `${v.redrafted} draft(s) re-drafted from the mirror; ${v.skipped} posted document(s) left alone.`
+      + (v.warnings.length ? ` ${v.warnings.slice(0, 3).join(' ')}` : ''),
+  });
+}
+
+/**
+ * Match the receipts TripzoCRM already matched.
+ *
+ * Reads no CRM, writes no CRM: every receipt fetched from there carries the
+ * invoice it was taken against, and this allocates each posted one to its
+ * posted document. It exists as its own button because the books that most
+ * need it are the ones where both sides were posted BEFORE the match was
+ * recorded — nothing in the ordinary course of work brings those together,
+ * since nobody posts an invoice twice.
+ *
+ * Safe to press at any time. It allocates only what the receipt still holds and
+ * the invoice still owes, so pressing it on matched books does nothing at all.
+ */
+export async function settleCrmReceiptsAction(formData: FormData) {
+  const s = await requireCap('payment.create');
+  const to = str(formData, 'return_to') || '/sales/payments';
+  const r = await guard(async () => await settleCrmReceipts(s.orgId, actorOf(s)));
+  revalidatePath('/sales/payments');
+  revalidatePath('/sales/invoices');
+  revalidatePath('/crm/invoices');
+  if (r.error) back(to, r);
+  const v = r.value!;
+  back(to, {
+    ok: v.count
+      ? `${v.count} receipt(s) matched to the invoice TripzoCRM took them against, `
+        + `${(v.amount / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })} in all.`
+      : 'Nothing to match: every receipt TripzoCRM matched is already against its invoice here, '
+        + 'or its invoice is not posted yet.',
+  });
+}
+
+/**
+ * Re-read the catalogue from TripzoCRM and refresh the stored snapshot.
+ *
+ * THE SCREEN ALREADY READS THE CRM on every render, so this is not what makes
+ * the list current. It does two things the render cannot:
+ *
+ *   It makes the asking EXPLICIT. A browser back-button, a cached route segment
+ *   or a tab left open since this morning can all show a catalogue that was true
+ *   then. Pressing Fetch is how somebody who has just re-priced a package over
+ *   there confirms this side is looking at the new figure.
+ *
+ *   And it updates `crm_packages`, the snapshot in THIS database. That is what
+ *   the screen falls back to when the CRM does not answer, and what lets a GST
+ *   rate chosen for a package still name that package after it has been removed
+ *   from the catalogue. Nothing is written to the CRM — the snapshot is a copy
+ *   taken here, and the catalogue over there is never told it was read.
+ */
+export async function fetchPackagesAction() {
+  const s = await requireCap('invoice.create');
+  const r = await guard(async () => await refreshPackages(s.orgId));
+  revalidatePath('/crm/packages');
+  if (r.error) back('/crm/packages', r);
+  const count = r.value?.count ?? 0;
+  const warnings = r.value?.warnings ?? [];
+  back('/crm/packages', {
+    ok: warnings.length
+      ? `${count} package(s) read. ${warnings.join(' ')}`
+      : `${count} package(s) re-read from TripzoCRM and snapshotted here.`,
+  });
+}
+
+/**
+ * Put a package on a GST rate.
+ *
+ * THE RATE IS THE AGENCY'S, THE PACKAGE IS THE CRM'S, and this is the one
+ * place the two are joined. It writes to this ledger's own database — the CRM
+ * is not told, and must not be: two agencies reselling the same itinerary can
+ * be on different rates, and the catalogue is not the place to answer for
+ * either of them.
+ *
+ * It changes the NEXT invoice, never the last one. A document line's tax split
+ * is stored on the line when it is saved, so an invoice already raised keeps
+ * the rate it was raised at.
+ */
+export async function setPackageTaxAction(formData: FormData) {
+  const s = await requireCap('invoice.create');
+  const packageId = str(formData, 'package_id');
+  const taxId = str(formData, 'tax_id');
+  const r = await guard(async () => await setPackageTax(
+    s.orgId, packageId, taxId, opt(formData, 'package_name'), actorOf(s),
+  ));
+  // Named explicitly as well as through `back`'s layout-wide revalidation: the
+  // redirect lands back on THIS page, and a row that still shows the old rate
+  // immediately after saving it reads as a save that did not take.
+  revalidatePath('/crm/packages');
+  back('/crm/packages', r.error ? r : { ok: 'GST rate saved for this package.' });
+}
+
+// ---------------------------------------------------------------------------
 // Documents — invoices, bills, credit notes
 // ---------------------------------------------------------------------------
 
@@ -137,6 +402,9 @@ function readLines(f: FormData) {
   // which is the usual case, and the case a sparse encoding would misalign.
   const hsns = f.getAll('line_hsn').map(String);
   const mrps = f.getAll('line_mrp').map(String);
+  // TripzoCRM's own kind for the line. A select posts one entry per row like
+  // every other column here, blank included, so the array stays in step.
+  const itemTypes = f.getAll('line_item_type').map(String);
 
   return names.map((name, i) => ({
     name: name.trim(),
@@ -148,6 +416,7 @@ function readLines(f: FormData) {
     analyticId: analytics[i] || null,
     hsnCode: (hsns[i] ?? '').trim() || null,
     mrp: toMinor(mrps[i] || '0'),
+    itemType: (itemTypes[i] ?? '').trim() || null,
   })).filter((l) => l.name && l.accountId && (l.unitPrice !== 0 || l.qtyMilli !== 0));
 }
 
@@ -195,22 +464,72 @@ export async function saveDocumentAction(formData: FormData) {
       note: opt(formData, 'note'),
       placeOfSupply: opt(formData, 'place_of_supply'),
       partyGstin,
+      /*
+       * SAID, NOT INFERRED. `resolveSupplyType` falls back to "a registration
+       * means B2B" for everything that reaches it without this — a credit note
+       * generated from an invoice, a document synced from the CRM — but a form
+       * that asks the question has to send the answer, because the whole point
+       * of asking is that a BLANK GSTIN on a B2B supply is a defect and on a
+       * B2C one is correct. The server refuses the first.
+       */
+      supplyType: (str(formData, 'supply_type') === 'b2b' ? 'b2b' : 'b2c') as 'b2b' | 'b2c',
       irn: opt(formData, 'irn'),
       irnAckNo: opt(formData, 'irn_ack_no'),
       irnAckDate: opt(formData, 'irn_ack_date'),
       orderRef: opt(formData, 'order_ref'),
       orderDate: opt(formData, 'order_date'),
+      /*
+       * THE FIGURES THE SOURCE INVOICE STATED, which on a CRM-drafted document
+       * arrived with it and on a typed one are whatever the user put in the
+       * three boxes. Sent even when blank — `money()` makes that zero — because
+       * clearing the tax box has to clear the tax, and a field that only ever
+       * sets and never unsets is a figure nobody can remove.
+       */
+      statedDiscount: money(formData, 'stated_discount'),
+      statedTax: money(formData, 'stated_tax'),
+      statedAdvance: money(formData, 'stated_advance'),
       lines,
     };
-    if (existing) { await updateDocument(existing, input, actorOf(s)); return existing; }
+    if (existing) {
+      /*
+       * THE SAME FORM, TWO DIFFERENT ACTS, AND THE DOCUMENT'S STATE DECIDES
+       * WHICH.
+       *
+       * A draft has touched nothing, so it is rewritten in place. A POSTED
+       * document has a journal entry behind it, a number taken, and possibly
+       * money allocated against it — so it is AMENDED: `amendDocument` rewrites
+       * the lines, recomputes the totals, and replaces the posted entry so the
+       * general ledger, the trial balance, the day book and every report built
+       * on them carry the new figures instead of the old ones. There is no
+       * state in which the document says one thing and the ledger behind it
+       * says another.
+       *
+       * It refuses rather than guesses where it cannot be safe: a locked
+       * period, a reconciled bank line, a credit note already raised against
+       * the document, or a settlement larger than the new total. Those are
+       * decisions for the accountant, and `amendDocument` says which one it hit.
+       *
+       * Decided on the SERVER, from the stored state, rather than on a hidden
+       * field the form could be wrong about.
+       */
+      const current = await getDocument(s.orgId, existing);
+      if (!current) throw new Error('That document no longer exists.');
+      if (current.state === 'draft') await updateDocument(existing, input, actorOf(s));
+      else await amendDocument(existing, input, actorOf(s));
+      return existing;
+    }
     return await createDocument(input, actorOf(s));
   });
   if (r.error) back(formPath, r);
 
   const docId = r.value!;
+  // An amendment has already written its entry; only a draft is posted here.
   if (bool(formData, 'post_now')) {
-    const posted = await guard(async () => await postDocument(s.orgId, docId, actorOf(s)));
-    if (posted.error) back(`${listPath}/${docId}`, posted);
+    const doc = await getDocument(s.orgId, docId);
+    if (doc?.state === 'draft') {
+      const posted = await guard(async () => await postDocument(s.orgId, docId, actorOf(s)));
+      if (posted.error) back(`${listPath}/${docId}`, posted);
+    }
   }
   back(`${listPath}/${docId}`, { ok: 'Saved' });
 }
@@ -315,6 +634,23 @@ export async function registerPaymentAction(formData: FormData) {
       method: str(formData, 'method') || 'bank',
       reference: opt(formData, 'reference'),
       isAdvance: bool(formData, 'is_advance'),
+      /*
+       * THE GST ON AN ADVANCE, AND WHY THE FORM ASKS FOR IT.
+       *
+       * Section 13(2) fixes the time of supply of a SERVICE at the earlier of
+       * the invoice or the payment, and Notification 66/2017-CT lifted that for
+       * goods only. A travel agency sells services, so money taken in September
+       * against a December trip is a September liability — the receipt is also
+       * a RECEIPT VOUCHER under section 31(3)(d), and Rule 50 wants the place of
+       * supply on it.
+       *
+       * Sent only when the box is ticked. `createPayment` refuses tax on a
+       * SUPPLIER advance anyway (section 16(2): no invoice, no credit), and
+       * passing a rate on an ordinary receipt would tax money that the invoice
+       * behind it has already taxed.
+       */
+      advanceTaxId: bool(formData, 'is_advance') ? opt(formData, 'advance_tax_id') : null,
+      advancePlaceOfSupply: bool(formData, 'is_advance') ? opt(formData, 'advance_place_of_supply') : null,
       note: opt(formData, 'note'),
       allocations: docId && !bool(formData, 'is_advance') ? [{ documentId: docId, amount }] : [],
     }, actorOf(s));
@@ -337,6 +673,44 @@ export async function postPaymentAction(formData: FormData) {
   const s = await requireCap('payment.approve');
   const r = await guard(async () => await postPayment(s.orgId, str(formData, 'id'), actorOf(s)));
   back(str(formData, 'return_to') || '/accounting/review', r.error ? r : { ok: 'Payment posted to the ledger.' });
+}
+
+/**
+ * Cancel a trip against the advance taken for it.
+ *
+ * ONE FORM, TWO STATUTORY DOCUMENTS, because that is what a cancellation
+ * actually is: a tax invoice for what the agency keeps, and a refund voucher
+ * for what it gives back. See `cancelAdvance`, which holds the reasoning and
+ * the worked example; nothing here does accounting.
+ *
+ * `payment.approve` rather than `payment.create`. This posts an invoice, moves
+ * an advance and sends money out of a bank account — which is an approval, not
+ * data entry, however it is phrased on screen.
+ */
+export async function cancelAdvanceAction(formData: FormData) {
+  const s = await requireCap('payment.approve');
+  const paymentId = str(formData, 'payment_id');
+  const returnTo = str(formData, 'return_to') || '/sales/payments';
+
+  const r = await guard(async () => await cancelAdvance(s.orgId, paymentId, {
+    date: str(formData, 'date') || isoDate(),
+    chargeGross: money(formData, 'charge_amount'),
+    taxId: opt(formData, 'tax_id'),
+    reason: opt(formData, 'reason') ?? undefined,
+    refund: bool(formData, 'refund'),
+    bankAccountId: opt(formData, 'bank_account_id'),
+    method: str(formData, 'method') || undefined,
+    reference: opt(formData, 'reference'),
+  }, actorOf(s)));
+
+  if (r.error) back(returnTo, r);
+  const { charge, refunded } = r.value!;
+  back(returnTo, {
+    ok: `Cancelled. ${(charge / 100).toFixed(2)} retained and invoiced with its GST; `
+      + (refunded > 0
+        ? `${(refunded / 100).toFixed(2)} refunded under a refund voucher, reversing its share of the advance tax.`
+        : 'the balance stays on the customer\u2019s account.'),
+  });
 }
 
 export async function allocateAction(formData: FormData) {
@@ -894,20 +1268,17 @@ export async function crmConnectAction(formData: FormData) {
   back('/settings/crm-sync', { ok: `Connected to TripzoCRM as ${email}.` });
 }
 
+/**
+ * The Settings → CRM Sync button. The same run as `importFromCrmAction`.
+ *
+ * ONE IMPLEMENTATION, TWO DOORS. A second copy of the summary-building and the
+ * error handling is a second place for them to disagree about what a run did,
+ * which on a screen reporting an import is the one thing that must not happen.
+ */
 export async function crmSyncAction() {
-  const s = await requireCap('coa.configure');
-  let summary: string;
-  try {
-    const r = await syncFromCrm(s.orgId, actorOf(s));
-    summary =
-      `Imported ${r.customers} customer(s), ${r.suppliers} supplier(s), ${r.bookings} booking(s), ` +
-      `${r.invoices} invoice(s) and ${r.payments} payment(s) as DRAFTS — post them in ` +
-      `Accounting → Review & Post. ${r.skipped} already present.` +
-      (r.warnings.length ? ` ${r.warnings.length} warning(s) — see below.` : '');
-  } catch (e) {
-    back('/settings/crm-sync', { error: e instanceof Error ? e.message : 'Sync failed.' });
-  }
-  back('/settings/crm-sync', { ok: summary });
+  const f = new FormData();
+  f.set('return_to', 'settings');
+  await importFromCrmAction(f);
 }
 
 export async function crmDisconnectAction() {

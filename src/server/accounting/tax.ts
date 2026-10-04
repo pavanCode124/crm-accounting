@@ -44,12 +44,12 @@ export async function getTax(orgId: string, taxId: string): Promise<TaxRow | nul
   );
 }
 
-export async function taxChildren(taxId: string): Promise<TaxRow[]> {
+export async function taxChildren(orgId: string, taxId: string): Promise<TaxRow[]> {
   return await all<TaxRow>(
     `SELECT t.id, t.name, t.computation, t.rate_bps, t.scope, t.tax_group,
             t.price_included, t.account_id, t.refund_account_id, t.threshold
        FROM tax_children c JOIN taxes t ON t.id = c.child_id
-      WHERE c.parent_id = ?`, taxId,
+      WHERE c.parent_id = ? AND t.org_id = ?`, taxId, orgId,
   );
 }
 
@@ -118,7 +118,7 @@ export async function computeLine(orgId: string, line: LineInput): Promise<LineA
   const tax = line.taxId ? await getTax(orgId, line.taxId) : null;
   if (!tax) return { subtotal: afterDiscount, taxAmount: 0, total: afterDiscount, splits: [] };
 
-  const children = await taxChildren(tax.id);
+  const children = await taxChildren(orgId, tax.id);
   const components = children.length ? children : [tax];
 
   // Tax-included: back the base out of the gross first, so the customer pays

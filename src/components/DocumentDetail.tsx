@@ -7,6 +7,7 @@ import { allocationsFor, listPayments, openInvoicesFor } from '@/server/accounti
 import { auditFor } from '@/server/accounting/audit';
 import { journalEntry } from '@/server/accounting/reports';
 import { bankAccountOptions, journalOptions } from '@/server/options';
+import { mirroredInvoiceOfDocument, mirroredPayments } from '@/server/crm/mirror';
 import {
   postDocumentAction, reverseDocumentAction, creditNoteAction, registerPaymentAction, unallocateAction,
   allocateAction, applyCreditAction,
@@ -31,10 +32,21 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
   if (!doc) return <Banner tone="error">That document no longer exists.</Banner>;
 
   const meta = DOC_TYPES[doc.doc_type];
-  const lines = await documentLines(docId);
-  const lineTaxes = await documentLineTaxes(docId);
-  const allocations = await allocationsFor(docId);
-  const trail = await auditFor('document', docId);
+  const lines = await documentLines(orgId, docId);
+  const lineTaxes = await documentLineTaxes(orgId, docId);
+  const allocations = await allocationsFor(orgId, docId);
+  const trail = await auditFor(orgId, 'document', docId);
+  /*
+   * WHERE THIS DOCUMENT CAME FROM, when it came from TripzoCRM.
+   *
+   * Read out of this database's own mirror, never from the CRM: a document
+   * detail screen that made an HTTP call to another system would go blank when
+   * that system restarted, and the figures it shows are the ones somebody is
+   * about to post. Null for a document typed here, which is the ordinary case
+   * and renders nothing.
+   */
+  const crmSource = await mirroredInvoiceOfDocument(orgId, docId);
+  const crmReceipts = crmSource ? await mirroredPayments(orgId, crmSource.crm_id) : [];
   const entry = doc.entry_id ? await journalEntry(orgId, doc.entry_id) : null;
   const isBill = meta.side === 'supplier';
   const today = isoDate();
@@ -173,6 +185,11 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
                     <Td>
                       <span className="font-semibold">{l.name}</span>
                       {l.variant && <div className="text-[11.5px] text-ink-faint">{l.variant}</div>}
+                      {/* What TripzoCRM called this line. Under the description
+                          rather than in a column of its own: it is provenance,
+                          read once by somebody checking this document against
+                          the invoice it was drafted from. */}
+                      {l.item_type && <div className="text-[11.5px] text-ink-faint">{l.item_type}</div>}
                     </Td>
                     <Td><span className="num !text-left text-ink-muted">{l.hsn_code ?? '—'}</span></Td>
                     <Td><span className="text-ink-muted">{l.account_code} {l.account_name}</span></Td>
@@ -217,6 +234,31 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
                   <Td align="right"><Money value={doc.tax_total} dash={false} /></Td>
                   <Td align="right"><Money value={doc.total} bold dash={false} /></Td>
                 </tr>
+                {/*
+                  WHAT THE SOURCE INVOICE STATED, ON THE DOCUMENT THAT CAME FROM
+                  IT.
+
+                  Neither figure is in the total above, and the row says so
+                  rather than leaving the reader to work out why a discount
+                  appears on the customer's copy and not in the arithmetic here:
+                  the line prices already account for the discount, and an
+                  advance is money, which is in the receipts rather than in the
+                  invoice. The tax IS in the total — carved out of the lines, not
+                  added to them — so it needs no row of its own.
+                */}
+                {(doc.stated_discount > 0 || doc.stated_advance > 0) && (
+                  <tr>
+                    <Td colSpan={9}>
+                      <span className="text-[11.5px] text-ink-faint">
+                        As stated on the source invoice
+                        {doc.stated_discount > 0 && `: discount ${fmt(doc.stated_discount)} — already in the prices above, not deducted again`}
+                        {doc.stated_discount > 0 && doc.stated_advance > 0 && ' ·'}
+                        {doc.stated_advance > 0 && ` already paid ${fmt(doc.stated_advance)} — recorded here, collected as a receipt`}
+                      </span>
+                    </Td>
+                    <Td colSpan={3} />
+                  </tr>
+                )}
               </tfoot>
             </Table>
           </Card>
@@ -242,6 +284,97 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
                   ))}
                 </tbody>
               </Table>
+            </Card>
+          )}
+
+          {/*
+            * THE TWO SYSTEMS' FIGURES, SIDE BY SIDE.
+            *
+            * An imported document is this ledger's answer about a sale whose
+            * commercial record lives in TripzoCRM, and the two are allowed to
+            * differ: a rate that had to be divided out of a rounded tax amount,
+            * a discount the CRM holds as one figure and the ledger spreads
+            * across lines, an agent who re-priced the invoice after it was
+            * posted. What must never happen is the difference being invisible.
+            *
+            * So both totals are printed, and the gap between them is named in
+            * rupees rather than left to be worked out. A rupee of tolerance,
+            * because the CRM rounds its totals to whole rupees while this
+            * ledger works in paise — beyond that it is a mapping difference,
+            * not a representation one, and the banner says which way to look.
+            */}
+          {crmSource && (
+            <Card
+              title="TripzoCRM"
+              subtitle="Where this document came from. Fetched into this database, never written back."
+            >
+              <DefList rows={[
+                ['CRM invoice', crmSource.invoice_number ?? '—'],
+                ['CRM status', <Chip key="cs" state={(crmSource.status ?? 'draft').toLowerCase() === 'paid' ? 'paid' : (crmSource.status ?? 'draft').toLowerCase() === 'cancelled' ? 'cancelled' : (crmSource.status ?? 'draft').toLowerCase() === 'sent' ? 'partial' : 'draft'} label={crmSource.status ?? 'unknown'} />],
+                ['CRM total', <Money key="ct" value={crmSource.total} />],
+                ['This document', <Money key="lt" value={doc.total} />],
+                ['Collected in the CRM', <Money key="cp" value={crmSource.amount_paid} />],
+                ['Fetched', fmtDate(crmSource.fetched_at.slice(0, 10))],
+              ]} />
+
+              {Math.abs(doc.total - crmSource.total) > 100 && (
+                <div className="mt-4">
+                  <Banner tone="warn">
+                    This document states {fmt(doc.total)} and TripzoCRM states{' '}
+                    {fmt(crmSource.total)} — a difference of{' '}
+                    {fmt(doc.total - crmSource.total, { sign: true })}. Compare the lines against the
+                    invoice in the CRM before posting: the books would otherwise state a figure the
+                    customer was never sent. The usual causes are a GST rate this agency has not
+                    configured, a discount the CRM holds for the whole invoice, and a line whose
+                    quantity and amount disagree over there.
+                  </Banner>
+                </div>
+              )}
+
+              {/*
+                * RECEIPTS TAKEN IN THE CRM, INCLUDING THE ONES NOT IN THE BOOKS
+                * YET. An accountant looking at a draft needs to know that two
+                * thirds of it has already been collected over there — and
+                * particularly that one of those receipts is an ADVANCE, taken
+                * before the invoice was raised, which owes GST in the month it
+                * arrived rather than the month of the invoice (section 13(2)).
+                */}
+              {crmReceipts.length > 0 && (
+                <div className="mt-4">
+                  <Table>
+                    <thead>
+                      <tr>
+                        <Th>Received</Th><Th align="right">Amount</Th><Th>Kind</Th><Th>In the books</Th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {crmReceipts.map((r) => (
+                        <tr key={r.crm_id}>
+                          <Td><span className="num !text-left">{r.paid_at ? fmtDate(r.paid_at) : '—'}</span></Td>
+                          <Td align="right"><Money value={r.amount} /></Td>
+                          <Td>
+                            {r.is_advance
+                              ? <Chip state="draft" label="Advance" />
+                              : <Chip state="posted" label="Receipt" />}
+                          </Td>
+                          <Td>
+                            {r.payment_id
+                              ? <RefLink href={`/sales/payments?focus=${r.payment_id}`}>Drafted</RefLink>
+                              : <span className="text-ink-faint">Not yet</span>}
+                          </Td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </Table>
+                  <p className="mt-3 text-[12px] text-ink-faint">
+                    A receipt drafted here still has to be POSTED — nothing clears a residual on
+                    its own, and a debtor that clears itself is a debtor nobody checked. Posting it
+                    then settles it against this document without being asked: TripzoCRM already
+                    recorded which invoice the money was taken against, and re-asking here is how
+                    the same rupees come to be offered against two invoices.
+                  </p>
+                </div>
+              )}
             </Card>
           )}
 
@@ -299,12 +432,28 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
                     <input type="hidden" name="doc_type" value={doc.doc_type} />
                     <button className={`${btn.primary} w-full`}>Post to the ledger</button>
                   </form>
-                  {/* Only here, and only while it is a draft: once posted the
-                      document is immutable and the correction is a reversal. */}
                   <Link href={`${basePath}/${doc.id}/edit`} className={`${btn.ghost} w-full text-center`}>
                     Edit draft
                   </Link>
                 </>
+              )}
+              {/*
+                EDIT STAYS AVAILABLE AFTER POSTING.
+
+                Saving a posted document amends it: the lines, the totals and
+                the tax split are rewritten and the journal entry behind it is
+                REPLACED, so nothing anywhere still carries the old figures.
+                The alternative on offer before was a reversal plus a fresh
+                document — two numbers for one sale, for what was usually a typo.
+
+                `amendDocument` refuses where it cannot be safe (a locked
+                period, a reconciled bank line, a credit note already raised,
+                a settlement bigger than the new total) and names which.
+              */}
+              {doc.state === 'posted' && (
+                <Link href={`${basePath}/${doc.id}/edit`} className={`${btn.ghost} w-full text-center`}>
+                  Edit &amp; re-post
+                </Link>
               )}
               {/* Reversing is refused while anything is allocated (see
                   `reverseDocument`), so say why here rather than offering a
@@ -345,6 +494,29 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
                         <div className="text-[11.5px] text-ink-faint">
                           {fmtDate(p.pay_date)} · {titleise(p.method)} · {fmt(p.unallocated)} unapplied
                         </div>
+                        {/*
+                          WHOSE MONEY THIS IS, WHEN IT IS NOT THIS INVOICE'S.
+
+                          Every unapplied receipt from this customer is offered
+                          here, which is right — an advance on account can settle
+                          any of their invoices. What was missing is that a
+                          receipt fetched from TripzoCRM is NOT on account: it was
+                          taken against one named invoice, and three identical
+                          ₹14,000 rows with nothing to tell them apart is how the
+                          money ends up on the wrong one. Money whose own invoice
+                          is posted never reaches this panel — it is already
+                          settled against it — so what shows here is either
+                          genuinely on account or waiting for its invoice.
+                        */}
+                        {p.target_document_id && p.target_document_id !== doc.id && (
+                          <div className="text-[11.5px] font-semibold text-warn">
+                            Taken against{' '}
+                            {p.target_crm_number
+                              ? `TripzoCRM invoice ${p.target_crm_number}`
+                              : (p.target_number ?? 'another invoice')}
+                            {p.target_state === 'posted' ? '' : ', which is not posted here yet'}
+                          </div>
+                        )}
                       </div>
                       <input name="amount" defaultValue={(applicable / 100).toFixed(2)}
                         inputMode="decimal" className={`${inputClass} w-[110px] text-right`} />

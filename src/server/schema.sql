@@ -416,6 +416,21 @@ CREATE TABLE IF NOT EXISTS document_lines (
 );
 CREATE INDEX IF NOT EXISTS ix_dl_doc ON document_lines(document_id);
 
+-- WHAT KIND OF LINE TRIPZOCRM SAYS THIS IS: its own `item_type`, carried across
+-- and kept. The CRM asks for it on every invoice item and it is the only thing
+-- on a line that says what was sold rather than what it was called -- "Airport
+-- pickup & drop" is a description, `extra` is a classification. It decides the
+-- revenue account the import picks (see REVENUE_ACCOUNT_OF_ITEM) and the SAC it
+-- falls back to, and it is SNAPSHOTTED here so the invoice still says what it
+-- was raised as after the CRM's own list of kinds changes.
+--
+-- A FREE STRING, NOT A CHECK CONSTRAINT, because the list belongs to the other
+-- system: TripzoCRM's web form offers service/package/extra, its mobile app
+-- offers package/hotel/flight/transport/activity/other, and a ledger that
+-- refused a value it had not heard of would refuse to import a sale over a
+-- dropdown somebody added over there.
+ALTER TABLE document_lines ADD COLUMN IF NOT EXISTS item_type TEXT;
+
 -- ----------------------------------------------------------------- payments
 CREATE TABLE IF NOT EXISTS payments (
   id            TEXT PRIMARY KEY,
@@ -450,6 +465,24 @@ CREATE TABLE IF NOT EXISTS payments (
   posted_by  TEXT, posted_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_pay_partner ON payments(org_id, partner_id);
+
+-- THE DOCUMENT THIS MONEY WAS RECEIVED AGAINST, as the system it came from
+-- stated it.
+--
+-- NOT an allocation. An allocation is a fact in the books -- it moves a
+-- document's residual and it only exists once both sides are posted. This is
+-- the INTENT that arrived with the money: TripzoCRM records a receipt against
+-- one invoice, and losing that on the way in is what left ₹14,000 that the CRM
+-- had already matched sitting in "Unallocated money", offered for allocation
+-- against any open invoice of that customer -- the same rupees apparently
+-- available twice.
+--
+-- Kept as a column rather than inferred from the CRM mirror because the rule it
+-- drives is an accounting one: `settleTargeted` allocates a posted payment to
+-- its posted target, whoever recorded the intent. A receipt typed in this app
+-- against a specific invoice can carry it too.
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS target_document_id TEXT;
+CREATE INDEX IF NOT EXISTS ix_pay_target ON payments(org_id, target_document_id);
 
 -- One payment can settle many documents (section 16), and one document can be
 -- settled by many payments. Hence a join table rather than a column on either.
@@ -713,6 +746,34 @@ ALTER TABLE payment_terms ADD COLUMN IF NOT EXISTS active BIGINT NOT NULL DEFAUL
 -- Without it, reopening a draft bill cannot show the deduction back to the
 -- user, and saving the edit would quietly drop it.
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS withholding_tax_id TEXT;
+
+-- ---------------------------------------------------------------------------
+-- WHAT THE SOURCE DOCUMENT STATED, AS IT STATED IT
+-- ---------------------------------------------------------------------------
+-- A TripzoCRM invoice carries ONE discount, ONE tax figure and ONE amount
+-- already paid, for the whole invoice, typed by the agent who raised it. None
+-- of the three can be recovered from the lines, and all three are part of what
+-- the customer was actually sent.
+--
+-- They are RECORDED, NOT RECOMPUTED, and that is the whole point of these
+-- columns. The importer used to turn the discount into a per-line percentage
+-- and the tax into a rate divided back out of an amount; both are inferences,
+-- both move the figures, and an invoice whose total does not equal the one the
+-- customer holds is wrong however defensible the arithmetic was.
+--
+--   stated_discount  what the CRM's Discount field said. Shown on the document
+--                    and NOT deducted from the total: the item prices already
+--                    account for it.
+--   stated_tax       what the CRM's Tax field said. The GST the books post is
+--                    this figure exactly; choosing a slab on a line decides
+--                    WHICH tax rows it is split across (CGST+SGST or IGST), and
+--                    never how much it is. See `replaceLines`.
+--   stated_advance   what had already been collected when the invoice was
+--                    raised. Shown for the reader; the money itself reaches the
+--                    books as receipts, which is where a payment belongs.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS stated_discount BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS stated_tax      BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS stated_advance  BIGINT NOT NULL DEFAULT 0;
 
 -- ---------------------------------------------------------------------------
 -- Statutory invoice detail (a GST tax invoice, and the statement that pays it)
@@ -982,3 +1043,394 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS party_gstin TEXT;
 -- issued last year, which is the same rule the price and the tax already follow.
 ALTER TABLE accounts      ADD COLUMN IF NOT EXISTS default_hsn_code TEXT;
 ALTER TABLE organizations ADD COLUMN IF NOT EXISTS default_hsn_code TEXT;
+
+-- ---------------------------------------------------------------------------
+-- B2B or B2C, stated on the document
+-- ---------------------------------------------------------------------------
+-- The GSTIN column above is optional, and it has to be: an unregistered
+-- traveller has none, and that is most of a travel agency's book. But "blank"
+-- then means two different things — "this is a retail supply and there is no
+-- registration to state" and "this is a supply to a registered business and
+-- somebody forgot" — and only the second is a defect. Nothing on the document
+-- could tell them apart, so neither could any check.
+--
+-- Saying which it is turns the optional field into a conditional one: B2B
+-- requires the registration (and GSTR-1 reports the supply invoice-wise in
+-- Table 4A/B2B), B2C does not (Table 5/7, reported in aggregate). It is
+-- SNAPSHOTTED onto the document for the same reason the GSTIN and the place of
+-- supply are: a traveller who registers next year does not retrospectively
+-- turn last year's retail invoices into B2B supplies.
+--
+-- Nullable rather than defaulted, and backfilled from what each document
+-- already says, so documents raised before this column existed keep their
+-- meaning instead of all becoming retail at once.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS supply_type TEXT;
+UPDATE documents SET supply_type = CASE WHEN COALESCE(party_gstin,'') <> '' THEN 'b2b' ELSE 'b2c' END
+ WHERE supply_type IS NULL;
+
+-- ---------------------------------------------------------------------------
+-- GST on advances received
+-- ---------------------------------------------------------------------------
+-- WHY AN ADVANCE CARRIES TAX AT ALL, when an invoice has not been raised.
+--
+-- Section 13(2) of the CGST Act fixes the time of supply of SERVICES at the
+-- EARLIER of the invoice or the receipt of payment. Notification 66/2017-CT
+-- lifted that for goods; it never applied to services, so a travel agency that
+-- takes ₹47,200 against a trip in September owes the GST inside it in
+-- September's GSTR-3B — months before the trip runs and the invoice is raised.
+-- Section 31(3)(d) is the other half: the receipt itself is a document, a
+-- RECEIPT VOUCHER, and the receipt number here is that voucher's number.
+--
+-- THE AMOUNT RECEIVED IS INCLUSIVE, ALWAYS. What the bank shows is what the
+-- customer sent; the tax is backed out of it (Rule 50 and the valuation rules
+-- read the advance as inclusive of tax). So ₹47,200 at 18% is ₹40,000 of
+-- advance and ₹7,200 of output tax, and the liability the agency carries to
+-- the customer is ₹40,000 — the ₹7,200 is owed to the government, not to him.
+--
+--   Bank                Dr 47,200
+--     Customer Advances   Cr 40,000      <- what is owed to the traveller
+--     Output CGST         Cr  3,600      <- what is owed in this month's 3B
+--     Output SGST         Cr  3,600
+--
+-- `advance_tax_id` is the tax ROW, so the split, the rate and the accounts all
+-- come from configuration exactly as they do on an invoice line. The base and
+-- the amount are stored rather than recomputed, for the same reason a document
+-- line's tax split is stored: a rate changed in October must not restate a
+-- receipt voucher issued in September, and the figures already filed.
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS advance_tax_id      TEXT;
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS advance_tax_base    BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS advance_tax_amount  BIGINT NOT NULL DEFAULT 0;
+-- The place of supply AT THE TIME OF THE ADVANCE. Rule 50 requires it on the
+-- receipt voucher, and it decides CGST+SGST against IGST on the advance just
+-- as it does on the invoice — the two can legitimately differ if the trip is
+-- later invoiced to a different state, which is itself an adjustment someone
+-- has to be able to see.
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS advance_place_of_supply TEXT;
+-- Set on a REFUND VOUCHER (section 31(3)(e)): the advance it is giving back.
+-- The refund has to reverse the advance's own tax split, not today's rate, so
+-- it points at the receipt it came from.
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_of TEXT;
+-- Set on the receipt once a cancellation has been processed against it, so the
+-- screen can show the outcome and a second cancellation is refused.
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS cancelled_by_doc_id TEXT;
+CREATE INDEX IF NOT EXISTS ix_payments_refund_of ON payments(refund_of);
+
+-- THE ADVANCE'S TAX SPLIT, WRITTEN DOWN RATHER THAN RECOMPUTED.
+--
+-- The same rule as `document_line_taxes`, for the same reason. "GST 18%" is one
+-- choice on the form and two postings in the ledger, and what the return is
+-- filed on is the two: CGST 3,600 and SGST 3,600, not "18% of something". If
+-- the split were derived again when the advance is applied or refunded, it
+-- would be derived from TODAY's tax rows — so a rate changed in October would
+-- silently restate a receipt voucher issued in September, and the restated
+-- figures would not match the GSTR-1 already filed.
+--
+-- It matters more here than on an invoice, because an advance is deliberately
+-- LONG-LIVED: the whole point of it is that money arrived months before the
+-- trip, and the adjustment that reverses this tax happens at the other end of
+-- that gap.
+--
+-- `tax_group` is denormalised for the same reason it is there: a column headed
+-- CGST on a statement has to stay CGST after that tax row is retired.
+CREATE TABLE IF NOT EXISTS payment_taxes (
+  id          TEXT PRIMARY KEY,
+  org_id      TEXT NOT NULL,
+  payment_id  TEXT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+  tax_id      TEXT,
+  tax_name    TEXT NOT NULL,
+  tax_group   TEXT NOT NULL,          -- cgst | sgst | igst | cess | gst | other
+  rate_bps    BIGINT NOT NULL DEFAULT 0,
+  base        BIGINT NOT NULL DEFAULT 0,
+  amount      BIGINT NOT NULL DEFAULT 0,
+  account_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_payment_taxes ON payment_taxes(payment_id);
+
+-- ---------------------------------------------------------------------------
+-- The CRM identity seam
+-- ---------------------------------------------------------------------------
+-- WHO IS ASKING is not a question this database answers any more. TripzoCRM
+-- owns the accounts: an agent signs in against the self-hosted Supabase the
+-- mobile app and the web CRM both use, and the node backend resolves which
+-- organization that token belongs to. This app is the FINANCE BRANCH of that
+-- product, not a second product with its own staff list, so it has no business
+-- inventing a second set of users and no business asking anyone to keep two
+-- passwords in step.
+--
+-- What it still needs is a local handle for each of them, because every row it
+-- writes is signed: an audit entry names a user id, a posted entry names who
+-- posted it, and both have to survive the CRM being unreachable. So the CRM's
+-- ids are MIRRORED here rather than replacing the local ones.
+--
+--   organizations.crm_org_id   which CRM agency these books belong to
+--   users.crm_user_id          the Supabase auth id of a person who has signed in
+--
+-- Nullable, both of them. `crm_org_id` is what makes the ledger multi-tenant:
+-- ONE SET OF BOOKS PER CRM AGENCY, matched on this column, provisioned the
+-- first time somebody from that agency signs in (see `resolveBooks` in
+-- server/auth.ts and `provisionOrg` in server/provision.ts). The unique index
+-- is the enforcement — two rows claiming the same agency would mean two trial
+-- balances for one business, and nothing downstream could say which was the
+-- books.
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS crm_org_id TEXT;
+ALTER TABLE users         ADD COLUMN IF NOT EXISTS crm_user_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_org_crm  ON organizations(crm_org_id) WHERE crm_org_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS        ix_user_crm ON users(crm_user_id);
+
+-- ---------------------------------------------------------------------------
+-- Which books are a DEMONSTRATION
+-- ---------------------------------------------------------------------------
+-- The demo seed posts a season of sample trading — Wander Travels' invoices,
+-- receipts, vendor bills and a cancellation — so that a fresh install opens on
+-- reports with something in them. Those postings are the product's shop window
+-- and they are POISON in a real agency's ledger: they would appear in its
+-- trial balance, its receivables, its P&L and its GST summary, and every one
+-- of those figures would be wrong.
+--
+-- The hazard is specific. Before multi-tenancy, the first CRM agency to sign in
+-- ADOPTED whatever unclaimed books the deployment already had — which, on a
+-- deployment that had ever run the seed, were the demo's. This flag is what
+-- lets `resolveBooks` tell "an existing real ledger, from before the CRM was
+-- connected, which should be adopted" apart from "the sample books, which must
+-- never be". Adoption checks it; provisioning sets it.
+ALTER TABLE organizations ADD COLUMN IF NOT EXISTS demo_data BIGINT NOT NULL DEFAULT 0;
+
+-- Back-fill, for a deployment that was seeded before the flag existed.
+--
+-- `org_wander` is the demo seed's own fixed id and nothing else writes it —
+-- `provisionOrg` generates an id per agency — so it identifies sample books
+-- exactly. The `crm_org_id IS NULL` condition is what makes this safe rather
+-- than merely convenient: an agency that has ALREADY claimed this ledger has
+-- been trading on it, those postings are its real books whatever the row was
+-- originally seeded as, and flagging them would be a statement about somebody's
+-- live accounts. Claimed books are matched by `crm_org_id` and never go through
+-- adoption anyway, so there is nothing to protect them from.
+UPDATE organizations SET demo_data = 1 WHERE id = 'org_wander' AND crm_org_id IS NULL;
+
+-- ---------------------------------------------------------------------------
+-- The GST rate a TripzoCRM package is sold at
+-- ---------------------------------------------------------------------------
+-- WHY THE MAPPING LIVES HERE AND NOT IN THE CRM.
+--
+-- A package in TripzoCRM knows what it is called, where it goes and what it
+-- costs. It does not know a tax rate, and it should not: the rate is the
+-- AGENCY's classification of its own supply, answerable to its own GSTIN, and
+-- two agencies reselling the same itinerary can legitimately be on different
+-- rates. So the catalogue stays the CRM's and the rate stays the ledger's, and
+-- this table is the one seam between them.
+--
+-- `crm_package_id` is the CRM's own id, carried as text and NOT a foreign key —
+-- there is nothing in this database to point at. A package deleted in the CRM
+-- leaves a row here that simply never matches again, which is the right
+-- outcome: an invoice already raised under it keeps the rate it was raised at,
+-- because a document line's tax is snapshotted onto the line (see
+-- document_line_taxes) and never read back off this table.
+--
+-- `package_name` is a SNAPSHOT for the screen, so a row whose package has gone
+-- can still say what it used to be instead of showing a bare id.
+--
+-- NO ROW MEANS THE DEFAULT, which is resolved at read time (18%, or the nearest
+-- thing the agency has configured). A table pre-filled with a row per package
+-- would have to be kept in step with a catalogue this database does not own.
+CREATE TABLE IF NOT EXISTS crm_package_tax (
+  org_id         TEXT NOT NULL,
+  crm_package_id TEXT NOT NULL,
+  tax_id         TEXT NOT NULL REFERENCES taxes(id),
+  package_name   TEXT,
+  updated_by     TEXT,
+  updated_at     TEXT NOT NULL,
+  PRIMARY KEY (org_id, crm_package_id)
+);
+CREATE INDEX IF NOT EXISTS ix_package_tax_tax ON crm_package_tax(tax_id);
+
+-- ---------------------------------------------------------------------------
+-- THE TRIPZOCRM MIRROR
+-- ---------------------------------------------------------------------------
+-- WHAT THESE TABLES ARE. A faithful copy, in THIS ledger's own database, of
+-- every TripzoCRM record the accounting app has read: the invoices agents
+-- raised, their lines, the receipts and advances taken against them, and the
+-- package catalogue they were priced from.
+--
+-- WHY THEY EXIST AT ALL, given that the CRM is one HTTP call away.
+--
+--   1. THE CRM IS NEVER WRITTEN TO. That is the rule the whole integration is
+--      built around: this is an accounting system, and it has no business
+--      altering the agency's operational data. Every edit therefore has to land
+--      somewhere else, and "somewhere else" has to hold the thing being edited
+--      -- so the invoice is copied here first and edited here afterwards.
+--
+--   2. A LEDGER CANNOT DEPEND ON A NETWORK CALL. The screens used to read
+--      /api/invoices on every render: a backend cold start, an expired token or
+--      a deploy in progress emptied the invoice list, and with it the figures
+--      on every tile above it. A trial balance that goes blank because another
+--      system is restarting is not a trial balance.
+--
+--   3. A FIGURE ALREADY FILED MUST NOT MOVE. An invoice imported in September
+--      and reported in September's GSTR-1 says what it said. If the books read
+--      the CRM live, somebody editing that invoice in October would silently
+--      restate a filed return. The mirror is the snapshot the ledger answers
+--      for; `fetched_at` says when it was true.
+--
+-- HOW THEY RELATE TO `crm_links`. `crm_links` is the general identity map --
+-- CRM id to local id, for partners, bookings, documents and payments alike.
+-- `document_id` and `payment_id` below are the SAME fact denormalised onto the
+-- mirror row, because the import screen's one question is "has this invoice
+-- become a document yet", and answering it per row through a join of a generic
+-- map is a query nobody can read. The importer writes both, in one transaction.
+--
+-- UNITS: PAISE, like every other money column in this schema. The CRM answers
+-- in whole rupees; the conversion happens once, in `mirror.ts`, on the way in.
+-- A figure that crosses that boundary twice is out by a factor of a hundred,
+-- which on an invoice is 550 against 55,000.
+--
+-- `raw` IS THE WHOLE PAYLOAD, as JSON text, exactly as the backend sent it.
+-- Every column above it is a field this app understands TODAY. The CRM carries
+-- more than that and will carry more again, and a column this schema has not
+-- got yet is a fact silently dropped at the moment of import -- unrecoverable,
+-- because the next fetch sees an invoice that has already been mirrored.
+-- Keeping the payload costs a few kilobytes per invoice and means a field
+-- discovered later can be backfilled from what was already read, rather than
+-- re-read from a CRM whose row may have changed in the meantime.
+
+CREATE TABLE IF NOT EXISTS crm_invoices (
+  org_id          TEXT NOT NULL,
+  crm_id          TEXT NOT NULL,
+  invoice_number  TEXT,
+  -- The CRM's own status: draft | sent | paid | cancelled. Mirrored as-is and
+  -- NOT mapped onto `documents.state` -- a CRM "paid" says the customer settled
+  -- it, a ledger "posted" says the entry is in the books, and conflating the
+  -- two is how an unposted invoice comes to look accounted for.
+  status          TEXT,
+  -- 'invoice' or 'refund'. A refund is a credit note (out_refund), not a bill
+  -- owed on, and it decides which document type the import creates.
+  doc_type        TEXT,
+  refund_of_crm_id TEXT,
+  lead_id         TEXT,
+  issue_date      TEXT,
+  due_date        TEXT,
+  customer_name   TEXT,
+  customer_email  TEXT,
+  customer_phone  TEXT,
+  customer_address TEXT,
+  business_address TEXT,
+  ship_to_address TEXT,
+  -- The GST identity of the supply, which is what decides CGST+SGST vs IGST.
+  customer_gstin  TEXT,
+  seller_gstin    TEXT,
+  place_of_supply TEXT,
+  payment_terms   TEXT,
+  currency        TEXT NOT NULL DEFAULT 'INR',
+  notes           TEXT,
+  terms           TEXT,
+  -- Paise. `amount_withheld` is TDS the CUSTOMER deducted -- the agency's own
+  -- asset, set off at assessment, never an expense.
+  subtotal        BIGINT NOT NULL DEFAULT 0,
+  discount_amount BIGINT NOT NULL DEFAULT 0,
+  tax_amount      BIGINT NOT NULL DEFAULT 0,
+  total           BIGINT NOT NULL DEFAULT 0,
+  amount_paid     BIGINT NOT NULL DEFAULT 0,
+  balance_due     BIGINT NOT NULL DEFAULT 0,
+  amount_withheld BIGINT NOT NULL DEFAULT 0,
+  crm_created_at  TEXT,
+  crm_updated_at  TEXT,
+  fetched_at      TEXT NOT NULL,
+  -- The ledger document this invoice became, once it has been imported. NULL
+  -- means "read from the CRM, not yet in the books", which is exactly the queue
+  -- the import screen shows.
+  document_id     TEXT REFERENCES documents(id),
+  imported_at     TEXT,
+  raw             TEXT,
+  PRIMARY KEY (org_id, crm_id)
+);
+CREATE INDEX IF NOT EXISTS ix_crm_inv_doc    ON crm_invoices(org_id, document_id);
+CREATE INDEX IF NOT EXISTS ix_crm_inv_status ON crm_invoices(org_id, status, issue_date);
+
+-- One row per invoice line. `qty_milli` matches `document_lines.qty_milli` so a
+-- quantity of 2.5 nights survives the trip in both directions exactly.
+--
+-- REPLACED WHOLESALE on every fetch of its invoice, never patched: the CRM's
+-- own update endpoint deletes an invoice's lines and rewrites them, so line ids
+-- are not stable and a line removed over there has to disappear here too.
+CREATE TABLE IF NOT EXISTS crm_invoice_items (
+  org_id        TEXT NOT NULL,
+  crm_id        TEXT NOT NULL,
+  crm_invoice_id TEXT NOT NULL,
+  sort_order    BIGINT NOT NULL DEFAULT 0,
+  item_type     TEXT,
+  title         TEXT,
+  description   TEXT,
+  qty_milli     BIGINT NOT NULL DEFAULT 1000,
+  rate          BIGINT NOT NULL DEFAULT 0,
+  amount        BIGINT NOT NULL DEFAULT 0,
+  hsn_sac       TEXT,
+  fetched_at    TEXT NOT NULL,
+  PRIMARY KEY (org_id, crm_id)
+);
+CREATE INDEX IF NOT EXISTS ix_crm_item_inv ON crm_invoice_items(org_id, crm_invoice_id, sort_order);
+
+-- Receipts and advances taken in the CRM.
+--
+-- WHY `is_advance` IS DERIVED HERE AND NOT GUESSED LATER. A payment dated
+-- before the invoice was issued is money taken against a trip that had not been
+-- billed yet, and section 13(2) of the CGST Act makes it a liability in the
+-- month it arrived -- it lands on Customer Advances with output GST backed out
+-- of it, not on receivables. One dated on or after the invoice settles the
+-- receivable. The CRM records both as "a payment on an invoice" and does not
+-- distinguish them, so the comparison is made once, at import, and written
+-- down. Deriving it again at posting time would read whatever the invoice's
+-- date had become by then.
+CREATE TABLE IF NOT EXISTS crm_invoice_payments (
+  org_id        TEXT NOT NULL,
+  crm_id        TEXT NOT NULL,
+  crm_invoice_id TEXT NOT NULL,
+  amount        BIGINT NOT NULL DEFAULT 0,
+  paid_at       TEXT,
+  method        TEXT,
+  reference_no  TEXT,
+  note          TEXT,
+  is_advance    BIGINT NOT NULL DEFAULT 0,
+  crm_created_at TEXT,
+  fetched_at    TEXT NOT NULL,
+  payment_id    TEXT REFERENCES payments(id),
+  imported_at   TEXT,
+  raw           TEXT,
+  PRIMARY KEY (org_id, crm_id)
+);
+CREATE INDEX IF NOT EXISTS ix_crm_pay_inv ON crm_invoice_payments(org_id, crm_invoice_id);
+CREATE INDEX IF NOT EXISTS ix_crm_pay_loc ON crm_invoice_payments(org_id, payment_id);
+
+-- The package catalogue, snapshotted.
+--
+-- `crm_package_tax` above holds the GST rate the AGENCY sells each package at,
+-- keyed on the same `crm_package_id`, and it is deliberately separate: a rate
+-- is this ledger's own classification of its own supply and is not a property
+-- of the catalogue. This table is the other half -- the catalogue itself --
+-- kept so an invoice can be raised, and a rate chosen, when the CRM is
+-- unreachable.
+--
+-- THE LIVE CATALOGUE STILL WINS WHEN IT ANSWERS. A package re-priced this
+-- morning has to reach this afternoon's invoice, so the screens read the CRM
+-- first and fall back to this snapshot; `fetched_at` is what lets them say
+-- which they are showing.
+CREATE TABLE IF NOT EXISTS crm_packages (
+  org_id         TEXT NOT NULL,
+  crm_id         TEXT NOT NULL,
+  package_name   TEXT,
+  package_number TEXT,
+  package_code   TEXT,
+  slug           TEXT,
+  -- Paise, INCLUSIVE of the GST the agency sells it at -- a traveller is quoted
+  -- one figure and pays it. Every consumer backs the tax out with
+  -- `splitInclusive` rather than adding it on top.
+  price          BIGINT NOT NULL DEFAULT 0,
+  currency       TEXT NOT NULL DEFAULT 'INR',
+  days           BIGINT NOT NULL DEFAULT 0,
+  nights         BIGINT NOT NULL DEFAULT 0,
+  destinations   TEXT,
+  is_visible     BIGINT NOT NULL DEFAULT 1,
+  crm_updated_at TEXT,
+  fetched_at     TEXT NOT NULL,
+  raw            TEXT,
+  PRIMARY KEY (org_id, crm_id)
+);
+CREATE INDEX IF NOT EXISTS ix_crm_pkg_name ON crm_packages(org_id, package_name);

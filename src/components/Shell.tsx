@@ -5,6 +5,7 @@ import { usePathname } from 'next/navigation';
 import { useEffect, useRef, useState } from 'react';
 import { NAV, SETTINGS_ITEM, type NavSection } from '@/lib/nav';
 import { can, type FinanceCap } from '@/lib/accounting';
+import { signOutAction } from '@/app/actions';
 
 /**
  * The frame every screen sits in: a two-row masthead across the top, and
@@ -35,7 +36,7 @@ export function Shell({ user, demo, children }: { user: ShellUser; demo?: boolea
 
   return (
     <div className="flex min-h-screen flex-col">
-      <Masthead user={user} sections={visible} pathname={pathname} />
+      <Masthead user={user} sections={visible} pathname={pathname} demo={demo} />
       {/*
         * Demo mode is the absence of a database, not a deliberate flag, so a
         * deployment can end up here by losing a variable. This strip is what
@@ -56,8 +57,8 @@ export function Shell({ user, demo, children }: { user: ShellUser; demo?: boolea
 // The masthead
 // ---------------------------------------------------------------------------
 
-function Masthead({ user, sections, pathname }: {
-  user: ShellUser; sections: NavSection[]; pathname: string;
+function Masthead({ user, sections, pathname, demo }: {
+  user: ShellUser; sections: NavSection[]; pathname: string; demo?: boolean;
 }) {
   // One `open` for the whole bar rather than one per section: only ever a
   // single dropdown is down, and a shared key makes "click another section,
@@ -110,6 +111,26 @@ function Masthead({ user, sections, pathname }: {
             style={{ background: 'var(--sidebar-active)' }}>
             {user.name.slice(0, 1)}
           </span>
+          {/*
+            A FORM, NOT A LINK. Signing out clears an httpOnly cookie, which
+            only the server can do, and a GET that logs you out is a GET any
+            page on the internet can trigger with an <img> tag. The server
+            action posts, so the framework's own CSRF protection covers it.
+
+            Hidden in demo mode, where there is no CRM session to end and the
+            button would only produce a redirect loop back to a sign-in screen
+            that says no sign-in is needed.
+          */}
+          {!demo && (
+            <form action={signOutAction}>
+              <button
+                className="rounded-[9px] px-2.5 py-1.5 text-[11.5px] font-bold text-white/70 hover:text-white"
+                style={{ background: 'var(--nav-input)' }}
+                title={`Signed in as ${user.name}`}>
+                Sign out
+              </button>
+            </form>
+          )}
           <button
             onClick={() => setSheet((v) => !v)}
             aria-label="Menu"

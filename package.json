@@ -8,7 +8,8 @@
     "build": "next build",
     "start": "next start -p 3100",
     "typecheck": "tsc --noEmit",
-    "reset": "node scripts/reset.mjs"
+    "reset": "node scripts/reset.mjs",
+    "dev:demo": "node scripts/dev-demo.mjs"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.8",

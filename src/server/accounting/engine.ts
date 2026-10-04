@@ -334,6 +334,105 @@ async function writeLine(input: PostingInput, entryId: string, l: PostingLine, s
 }
 
 /**
+ * REWRITE A POSTED ENTRY IN PLACE, so an amended source document leaves one
+ * entry behind rather than three.
+ *
+ * THIS IS A DELIBERATE EXCEPTION TO "POSTED ENTRIES ARE NEVER MUTATED", and it
+ * is the only one. Everywhere else a correction is `reverseEntry` plus a fresh
+ * post, which is the right answer when the original was a FACT that later
+ * changed — a trip cancelled, a payment returned. It is the wrong answer when
+ * the original was simply WRONG: an invoice typed at 95,000 that should have
+ * said 59,000 leaves the ledger carrying +95,000, −95,000 and +59,000 against
+ * one customer, the general ledger and the day book each show the same trip
+ * three times, and every statement has to be read with the two dead rows
+ * mentally cancelled. What the accountant means by "fix the invoice" is that
+ * the books should say what the invoice now says, once.
+ *
+ * WHAT PROTECTS IT, since the entry itself no longer carries its own history:
+ *
+ *   - the amendment is REFUSED into a locked or closed period, in both
+ *     directions — the period the entry currently sits in AND the one it would
+ *     move to, so a filed month cannot be restated from an open one
+ *   - it is REFUSED once any line has been reconciled or matched against a
+ *     bank statement, because that match is evidence about THESE figures
+ *   - it is REFUSED on an entry that has been reversed, or that is itself a
+ *     reversal, because the pair would no longer net
+ *   - the journal cannot change, since `entry_no` belongs to that journal's
+ *     own series and moving it would leave a hole in one series and a
+ *     duplicate in another
+ *   - the AUDIT TRAIL keeps what the entry no longer does: `detail` carries the
+ *     complete set of lines as they stood before, so what the ledger used to
+ *     say is recoverable from Audit even though the ledger no longer says it
+ *
+ * The entry id and the entry number are kept, which is the point: every
+ * reference to this entry — the document, the booking, the bank match, a link
+ * somebody bookmarked — still resolves, and resolves to the current truth.
+ */
+export async function replacePostedEntry(entryId: string, input: PostingInput, actor: Actor = {}): Promise<string> {
+  const lines = input.lines.filter((l) => (l.debit ?? 0) !== 0 || (l.credit ?? 0) !== 0);
+  assertBalanced(lines);
+
+  return await tx(async () => {
+    const entry = await one<{
+      id: string; journal_id: string; entry_no: string | null; entry_date: string;
+      state: string; reversal_of: string | null;
+    }>(`SELECT id, journal_id, entry_no, entry_date, state, reversal_of
+          FROM journal_entries WHERE id = ? AND org_id = ?`, entryId, input.orgId);
+    if (!entry) throw new PostingError('Unknown entry.');
+    if (entry.state !== 'posted') throw new PostingError('Only a posted entry can be amended.');
+    if (entry.reversal_of) {
+      throw new PostingError('This entry is a reversal of another one and cannot be amended on its own.');
+    }
+    if (await scalar('SELECT COUNT(*) FROM journal_entries WHERE org_id=? AND reversal_of=?', input.orgId, entryId)) {
+      throw new PostingError('This entry has already been reversed, so amending it would leave the pair unbalanced.');
+    }
+    if (entry.journal_id !== input.journalId) {
+      throw new PostingError(
+        'The journal of a posted entry cannot be changed — its number belongs to that journal\u2019s series. ' +
+        'Reverse it and raise it again in the other journal.',
+      );
+    }
+
+    // Both periods, and in that order: the message a person needs first is the
+    // one about the month they are moving the entry OUT of.
+    await assertPeriodOpen(input.orgId, entry.entry_date);
+    await assertPeriodOpen(input.orgId, input.date);
+    await assertAccounts(input.orgId, lines);
+
+    const before = await all<{
+      account_id: string; label: string | null; debit: number; credit: number;
+      tax_id: string | null; tax_base: number; reconciled: number; match_id: string | null;
+    }>(`SELECT account_id, label, debit, credit, tax_id, tax_base, reconciled, match_id
+          FROM journal_entry_lines WHERE entry_id = ? ORDER BY id`, entryId);
+
+    if (before.some((l) => l.reconciled || l.match_id)) {
+      throw new PostingError(
+        'A line of this entry has been reconciled against the bank statement. Undo the reconciliation ' +
+        'first, or reverse the entry — the match is evidence about the figures being replaced.',
+      );
+    }
+
+    await run(
+      'DELETE FROM analytic_distributions WHERE line_id IN (SELECT id FROM journal_entry_lines WHERE entry_id = ?)',
+      entryId,
+    );
+    await run('DELETE FROM journal_entry_lines WHERE entry_id = ?', entryId);
+    await run(
+      `UPDATE journal_entries SET entry_date=?, reference=?, narration=?, currency=?
+         WHERE id=? AND org_id=?`,
+      input.date, input.reference ?? null, input.narration ?? null,
+      input.currency ?? 'INR', entryId, input.orgId,
+    );
+    for (const l of lines) await writeLine(input, entryId, l, 'posted');
+
+    await audit(input.orgId, actor, 'amended', 'journal_entry', entryId,
+      `${entry.entry_no ?? entryId} rewritten in place`,
+      { was: { date: entry.entry_date, lines: before }, now: { date: input.date, lines } });
+    return entryId;
+  });
+}
+
+/**
  * Reverse a posted entry.
  *
  * Posted accounting records are never deleted (plan section 44). A reversal is

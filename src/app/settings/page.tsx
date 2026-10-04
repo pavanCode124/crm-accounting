@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import { ctx } from '@/server/bootstrap';
+import { AUTH_REQUIRED } from '@/server/auth';
 import { msg, type SearchParams } from '@/lib/range';
 import { allSettings, type SettingKey } from '@/server/accounting/settings';
 import { getOrganisation, stateName } from '@/server/accounting/organisation';
@@ -271,10 +272,51 @@ export default async function SettingsPage({ searchParams }: { searchParams: Pro
               ['Fiscal year starts', new Date(2000, s.fyStartMonth - 1, 1)
                 .toLocaleDateString('en-IN', { month: 'long' })],
               ['Signed in as', `${s.userName} · ${titleise(s.role)}`],
+              /*
+                WHICH TRIPZOCRM AGENCY THESE BOOKS BELONG TO, stated on screen.
+                One deployment now holds one ledger per agency, so "whose books
+                am I looking at" is a real question with a wrong answer
+                available — and the only honest way to answer it is from the
+                session, which is the same value every query on every screen is
+                filtered by. Without it, an accountant who signs in to the
+                wrong account sees a plausible set of books and no way to tell.
+
+                The CRM's organisation id is shown alongside the name because
+                two agencies can share a name and ids are what the join is
+                actually made on; it is also the first thing to compare against
+                `organizations.crm_org_id` when something looks wrong.
+              */
+              ...(s.crm ? [
+                ['TripzoCRM agency', s.crm.orgName ?? s.crm.orgId ?? '—'] as [string, string],
+                ['CRM organisation id', s.crm.orgId ?? '—'] as [string, string],
+                ['CRM account', s.crm.email ?? '—'] as [string, string],
+              ] : []),
             ]} />
           </Card>
 
-          {mayConfigure && (
+          {/*
+            RESET IS A DEMO FACILITY, AND ON A CONNECTED DEPLOYMENT IT IS NOT
+            OFFERED AT ALL.
+
+            It truncates the whole accounting schema, which now holds one set of
+            books per TripzoCRM agency — so on a real deployment it would wipe
+            every OTHER agency's ledger as well as this one's, from a button
+            that reads as though it belongs to the agency pressing it. The
+            server action refuses it too (`resetAndSeed`), because hiding a
+            button is a courtesy and refusing the request is the control; this
+            branch is here so nobody is invited to press it and then told no.
+          */}
+          {mayConfigure && (AUTH_REQUIRED ? (
+            <Card title="Reset the books"
+              subtitle="Not available on a deployment connected to TripzoCRM.">
+              <p className="text-[13px] text-ink-muted">
+                This ledger holds real agencies&rsquo; books, one set per TripzoCRM organisation, in
+                a single database. A reset would destroy all of them — including other
+                agencies&rsquo; — so it is offered only on a demo deployment. Remove the individual
+                records you meant to, or reverse the entries that posted them.
+              </p>
+            </Card>
+          ) : (
             <Card title="Reset the books"
               subtitle="Wipes every transaction and re-seeds the demo agency. There is no undo.">
               <form action={resetAction} className="space-y-3">
@@ -284,7 +326,7 @@ export default async function SettingsPage({ searchParams }: { searchParams: Pro
                 <button className={btn.danger}>Reset and re-seed</button>
               </form>
             </Card>
-          )}
+          ))}
         </div>
       </div>
     </>

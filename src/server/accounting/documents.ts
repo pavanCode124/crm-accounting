@@ -1,11 +1,12 @@
 import 'server-only';
 import { all, one, run, scalar, tx, id, nowIso } from '../db';
 import { DOC_TYPES, type DocType, addDays, formatDocNumber } from '@/lib/accounting';
-import { computeLine, computeWithholding } from './tax';
-import { postEntry, reverseEntry, PostingError, type Actor, type PostingLine } from './engine';
+import { computeLine, computeWithholding, getTax, taxChildren, type LineAmounts, type TaxSplit } from './tax';
+import { postEntry, reverseEntry, replacePostedEntry, PostingError, type Actor, type PostingLine } from './engine';
 import { receivableAccount, payableAccount, requireSetting } from './settings';
 import { audit } from './audit';
 import { searchTokens } from '@/lib/search';
+import { pct, roundHalfUp } from '@/lib/money';
 import { parseGstin, parseHsn, getOrganisation } from './organisation';
 
 /**
@@ -48,6 +49,16 @@ export interface DocLineInput {
    * said it was selling.
    */
   hsnCode?: string | null;
+  /**
+   * What KIND of line this is, in TripzoCRM's own vocabulary — `package`,
+   * `service`, `extra`, and the others its mobile app offers.
+   *
+   * A snapshot, like the HSN beside it: it decided which revenue account the
+   * import chose, so an invoice has to keep saying what it was raised as even
+   * after the CRM's list of kinds changes. Null on a line typed here that
+   * nobody classified, which is an ordinary state and not a defect.
+   */
+  itemType?: string | null;
   /**
    * The list price the discount comes off, for the MRP column. It is
    * PRESENTATION ONLY — the tax and the total are computed from `unitPrice`,
@@ -95,6 +106,21 @@ export interface DocInput {
    * has none, so it is typed once rather than once per invoice.
    */
   partyGstin?: string | null;
+  /**
+   * Whether this is a supply to a registered business or to a consumer.
+   *
+   * IT IS WHAT MAKES THE GSTIN CONDITIONAL rather than merely optional. Blank
+   * on its own says nothing: an unregistered traveller has no registration to
+   * state, and a corporate booking whose registration nobody typed looks
+   * identical. Said explicitly, 'b2b' REQUIRES the GSTIN (see
+   * `resolveSupplyType`) and 'b2c' does not — which is also the split GSTR-1
+   * reports on, invoice-wise in Table 4A against aggregate in Tables 5 and 7.
+   *
+   * Defaults from the registration if it is not stated, so nothing that
+   * reaches `createDocument` without it — the CRM importer, a credit note
+   * generated from an invoice — changes meaning.
+   */
+  supplyType?: 'b2b' | 'b2c' | null;
   /** Recorded from the Invoice Registration Portal, never generated here. */
   irn?: string | null;
   irnAckNo?: string | null;
@@ -102,6 +128,28 @@ export interface DocInput {
   /** The customer's or channel's own order reference, and when it was placed. */
   orderRef?: string | null;
   orderDate?: string | null;
+  /**
+   * WHAT THE SOURCE DOCUMENT STATED, CARRIED ACROSS RATHER THAN DERIVED.
+   *
+   * A TripzoCRM invoice holds one discount, one tax figure and one amount
+   * already collected, for the whole invoice. The importer used to turn the
+   * first into a per-line percentage and the second into a rate divided back
+   * out of an amount — two inferences, both of which MOVE THE TOTAL, so the
+   * ledger stated a figure the customer was never sent.
+   *
+   * `statedDiscount` and `statedAdvance` are RECORDED AND NOT POSTED: the item
+   * prices already account for the discount, and an advance is money, which
+   * reaches the books as a receipt rather than as part of an invoice.
+   *
+   * `statedTax` IS posted, and it is the one figure that changes how the lines
+   * are computed: it is carved OUT of the line amounts rather than added on top
+   * of them, so the document total stays exactly the sum of what was sold.
+   * Choosing a GST slab on a line then decides which tax rows that figure is
+   * split across, never how large it is. See `replaceLines`.
+   */
+  statedDiscount?: number;
+  statedTax?: number;
+  statedAdvance?: number;
   lines: DocLineInput[];
 }
 
@@ -115,14 +163,22 @@ export interface DocRow {
   withheld_tax: number; withholding_tax_id: string | null;
   payment_terms_id: string | null; entry_id: string | null; reversal_of: string | null;
   reversed_by: string | null; note: string | null;
-  place_of_supply: string | null; party_gstin: string | null; irn: string | null;
+  place_of_supply: string | null; party_gstin: string | null; supply_type: string | null; irn: string | null;
   irn_ack_no: string | null; irn_ack_date: string | null;
   order_ref: string | null; order_date: string | null;
+  /** What the source document stated — see `DocInput`. Paise, never negative. */
+  stated_discount: number; stated_tax: number; stated_advance: number;
   created_by: string | null; created_at: string; posted_by: string | null; posted_at: string | null;
   /** Joined from the partner, for the printed header and the export. */
   partner_gstin?: string | null; partner_gst_name?: string | null;
   partner_city?: string | null; partner_state_code?: string | null;
   partner_address?: string | null;
+  /**
+   * The TripzoCRM invoice number this document was drafted from, when it came
+   * from the CRM rather than being typed here. Null for a document raised in
+   * this app, which is a fact worth showing rather than hiding.
+   */
+  crm_invoice_number?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -133,25 +189,32 @@ export async function createDocument(input: DocInput, actor: Actor = {}): Promis
   return await tx(async () => {
     const docId = id('doc');
     const due = input.dueDate ?? await deriveDueDate(input);
+    // Resolved together, because the two answers constrain each other: a
+    // B2B supply is not allowed to reach the ledger without a registration.
+    const gstin = await derivePartyGstin(input);
+    const supplyType = resolveSupplyType(input, gstin);
     await run(
       `INSERT INTO documents
          (id, org_id, doc_type, partner_id, journal_id, booking_id, analytic_id,
           doc_date, due_date, payment_terms_id, supplier_ref, currency, rate_e6,
           state, payment_state, withholding_tax_id, note,
-          place_of_supply, party_gstin, irn, irn_ack_no, irn_ack_date, order_ref, order_date,
+          place_of_supply, party_gstin, supply_type, irn, irn_ack_no, irn_ack_date, order_ref, order_date,
+          stated_discount, stated_tax, stated_advance,
           created_by, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'draft','not_paid',?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'draft','not_paid',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       docId, input.orgId, input.docType, input.partnerId, input.journalId,
       input.bookingId ?? null, input.analyticId ?? null, input.docDate, due,
       input.paymentTermsId ?? null, input.supplierRef ?? null,
       input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
       input.withholdingTaxId ?? null, input.note ?? null,
-      await derivePlaceOfSupply(input), await derivePartyGstin(input),
+      await derivePlaceOfSupply(input), gstin, supplyType,
       input.irn ?? null, input.irnAckNo ?? null,
       input.irnAckDate ?? null, input.orderRef ?? null, input.orderDate ?? null,
+      nonNegative(input.statedDiscount), nonNegative(input.statedTax), nonNegative(input.statedAdvance),
       actor.id ?? null, nowIso(),
     );
-    await replaceLines(input.orgId, docId, input.lines, input.analyticId ?? null);
+    await replaceLines(input.orgId, docId, input.lines, input.analyticId ?? null,
+      nonNegative(input.statedTax));
     await recomputeTotals(input.orgId, docId, input.withholdingTaxId ?? null);
     await audit(input.orgId, actor, 'created', 'document', docId,
       `${DOC_TYPES[input.docType].label} drafted`);
@@ -166,23 +229,28 @@ export async function updateDocument(docId: string, input: DocInput, actor: Acto
     // A posted document is immutable. Correcting one means a credit note or a
     // reversal, which leaves both the original and the correction on record
     // (plan section 44).
-    if (doc.state !== 'draft') throw new PostingError('A posted document cannot be edited. Reverse it or raise a credit note.');
+    if (doc.state !== 'draft') throw new PostingError('A posted document cannot be edited here. Use "Amend" on the document, which rewrites its ledger entry in place.');
+    const gstin = await derivePartyGstin(input);
+    const supplyType = resolveSupplyType(input, gstin);
     await run(
       `UPDATE documents SET partner_id=?, journal_id=?, booking_id=?, analytic_id=?,
               doc_date=?, due_date=?, payment_terms_id=?, supplier_ref=?, currency=?, rate_e6=?,
-              withholding_tax_id=?, note=?, place_of_supply=?, party_gstin=?, irn=?, irn_ack_no=?,
-              irn_ack_date=?, order_ref=?, order_date=?
+              withholding_tax_id=?, note=?, place_of_supply=?, party_gstin=?, supply_type=?,
+              irn=?, irn_ack_no=?, irn_ack_date=?, order_ref=?, order_date=?,
+              stated_discount=?, stated_tax=?, stated_advance=?
          WHERE id=? AND org_id=?`,
       input.partnerId, input.journalId, input.bookingId ?? null, input.analyticId ?? null,
       input.docDate, input.dueDate ?? await deriveDueDate(input), input.paymentTermsId ?? null,
       input.supplierRef ?? null, input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
       input.withholdingTaxId ?? null, input.note ?? null,
-      await derivePlaceOfSupply(input), await derivePartyGstin(input),
+      await derivePlaceOfSupply(input), gstin, supplyType,
       input.irn ?? null, input.irnAckNo ?? null,
       input.irnAckDate ?? null, input.orderRef ?? null, input.orderDate ?? null,
+      nonNegative(input.statedDiscount), nonNegative(input.statedTax), nonNegative(input.statedAdvance),
       docId, input.orgId,
     );
-    await replaceLines(input.orgId, docId, input.lines, input.analyticId ?? null);
+    await replaceLines(input.orgId, docId, input.lines, input.analyticId ?? null,
+      nonNegative(input.statedTax));
     // '' rather than null: null means "leave the withheld amount alone", and an
     // edit that clears the TDS dropdown has to clear the deduction with it.
     await recomputeTotals(input.orgId, docId, input.withholdingTaxId ?? '');
@@ -247,6 +315,39 @@ async function derivePartyGstin(input: DocInput): Promise<string | null> {
   return p?.gstin ?? null;
 }
 
+/**
+ * B2B or B2C, and the one rule that follows from saying so.
+ *
+ * A B2B SUPPLY WITHOUT A GSTIN IS REFUSED, HERE, at the service rather than in
+ * the form. The form marks the box required and that is a courtesy; a server
+ * action is a public endpoint, the CRM importer does not fill forms at all, and
+ * the cost of the omission is not the agency's — it is the customer's input
+ * credit, discovered a quarter later when their GSTR-2B is short and no longer
+ * correctable by editing anything.
+ *
+ * NOT STATED, SO INFERRED. Everything that reached this file before the field
+ * existed still reaches it: a credit note generated from an invoice, a document
+ * synced from the CRM, a draft saved by an older form. A registration is the
+ * thing that distinguishes a business from a traveller, so its presence decides
+ * — which is the same rule `resolvePartnerByName` already applies when it
+ * stamps `partner_type` on a partner minted by typing a name.
+ */
+function resolveSupplyType(input: DocInput, gstin: string | null): 'b2b' | 'b2c' {
+  const stated = (input.supplyType ?? '').trim().toLowerCase();
+  if (stated === 'b2b') {
+    if (!gstin) {
+      throw new PostingError(
+        'A B2B supply has to carry the counterparty\u2019s GSTIN — it is what the invoice is reported ' +
+        'against in GSTR-1 Table 4A and the only way their input credit can reach them. ' +
+        'Type the registration, or mark this a B2C supply.',
+      );
+    }
+    return 'b2b';
+  }
+  if (stated === 'b2c') return 'b2c';
+  return gstin ? 'b2b' : 'b2c';
+}
+
 async function deriveDueDate(input: DocInput): Promise<string> {
   if (input.dueDate) return input.dueDate;
   if (input.paymentTermsId) {
@@ -307,7 +408,122 @@ async function resolveLineHsns(orgId: string, lines: DocLineInput[]): Promise<Ma
   return out;
 }
 
-async function replaceLines(orgId: string, docId: string, lines: DocLineInput[], docAnalytic: string | null) {
+/** Negative money is never a stated figure; a missing one is zero. */
+function nonNegative(v: number | null | undefined): number {
+  return Math.max(0, Math.round(Number(v ?? 0)) || 0);
+}
+
+/**
+ * The amount a line is worth before any tax is taken out of it or added to it.
+ *
+ * The same arithmetic `computeLine` opens with, lifted out so the pinned path
+ * below can work from it without asking the tax engine a question whose answer
+ * it is about to discard.
+ */
+function lineGross(l: DocLineInput): number {
+  const gross = roundHalfUp((l.qtyMilli * l.unitPrice) / 1000);
+  return gross - pct(gross, l.discountBps ?? 0);
+}
+
+/**
+ * ===========================================================================
+ * THE TAX THE SOURCE DOCUMENT STATED, SPLIT THE WAY THE SLAB SAYS — AND NOT
+ * RECOMPUTED.
+ * ===========================================================================
+ * An ordinary line computes its tax FROM its rate: ₹35,998 at 18% adds
+ * ₹6,479.64 and the customer owes ₹42,477.64. That is right when the ledger is
+ * where the invoice was raised, and wrong when it is not — a TripzoCRM invoice
+ * arrives with the tax already decided, as ONE figure for the whole invoice,
+ * and the customer has already been sent a total computed from it.
+ *
+ * So when a document carries a stated tax, the arithmetic is inverted:
+ *
+ *   THE LINE TOTALS ARE FIXED. Each line is worth exactly what was sold for,
+ *   and the document total is their sum. Choosing a slab moves nothing on
+ *   screen, which is the whole requirement — an accountant classifying an
+ *   invoice must not restate it.
+ *
+ *   THE STATED FIGURE IS THE TAX. It is apportioned across the lines that
+ *   carry a slab, pro rata to their value, and carved OUT of them: a line of
+ *   ₹35,998 bearing ₹1,919.89 of it posts ₹34,078.11 of revenue. The last
+ *   bearer takes the remainder, so the parts add back to the stated figure
+ *   EXACTLY — a rounding difference here would be a penny of GST that no
+ *   account holds and the entry would not balance.
+ *
+ *   THE SLAB DECIDES THE COMPONENTS. CGST+SGST at 9% each splits the line's
+ *   share in half; a single IGST row takes all of it. That is what GSTR-1, the
+ *   general ledger and the journal entry need from the choice — which
+ *   government is owed, and on which document — and it is all the choice is
+ *   allowed to decide.
+ *
+ * A LINE WITH NO SLAB BEARS NO TAX, and if NO line carries one the stated tax
+ * is recorded on the document and posted nowhere: the books then say the sale
+ * is untaxed, which is visible, correctable and honest. Inventing an account to
+ * put it in would not be.
+ */
+async function pinStatedTax(
+  orgId: string, lines: DocLineInput[], statedTax: number,
+): Promise<LineAmounts[]> {
+  const gross = lines.map(lineGross);
+  const bearers = lines
+    .map((l, i) => i)
+    .filter((i) => lines[i].taxId && gross[i] > 0);
+
+  const plain = (i: number): LineAmounts =>
+    ({ subtotal: gross[i], taxAmount: 0, total: gross[i], splits: [] });
+  if (!bearers.length) return lines.map((_, i) => plain(i));
+
+  const bearerTotal = bearers.reduce((t, i) => t + gross[i], 0);
+  const out = lines.map((_, i) => plain(i));
+  let left = Math.min(statedTax, bearerTotal);
+
+  for (const [k, i] of bearers.entries()) {
+    const last = k === bearers.length - 1;
+    const share = Math.min(
+      left,
+      last ? left : Math.round((Math.min(statedTax, bearerTotal) * gross[i]) / bearerTotal),
+    );
+    left -= share;
+
+    const tax = await getTax(orgId, lines[i].taxId!);
+    if (!tax) continue;
+    const children = await taxChildren(orgId, tax.id);
+    const components = children.length ? children : [tax];
+    const subtotal = gross[i] - share;
+
+    /*
+     * BY RATE, NOT BY COUNT. CGST 9 + SGST 9 is half each either way, but a
+     * cess riding beside an 18% GST is not a third of the tax, and splitting
+     * evenly would credit the cess account with money that is the state's.
+     */
+    const weight = components.reduce((t, c) => t + (c.computation === 'fixed' ? 0 : c.rate_bps), 0);
+    let componentLeft = share;
+    const splits: TaxSplit[] = components.map((c, j) => {
+      const isLast = j === components.length - 1;
+      const amount = isLast || weight <= 0
+        ? componentLeft
+        : Math.min(componentLeft, Math.round((share * c.rate_bps) / weight));
+      componentLeft -= amount;
+      return {
+        taxId: c.id,
+        name: c.name,
+        accountId: c.account_id,
+        base: subtotal,
+        amount,
+        rateBps: c.computation === 'fixed' ? 0 : c.rate_bps,
+        group: c.tax_group,
+      };
+    });
+
+    out[i] = { subtotal, taxAmount: share, total: gross[i], splits };
+  }
+  return out;
+}
+
+async function replaceLines(
+  orgId: string, docId: string, lines: DocLineInput[], docAnalytic: string | null,
+  statedTax = 0,
+) {
   // The split table hangs off the lines, so it goes first: deleting the lines
   // cascades it away anyway, but the order makes that independent of the
   // cascade being configured, which is the sort of thing a schema edit breaks
@@ -315,21 +531,30 @@ async function replaceLines(orgId: string, docId: string, lines: DocLineInput[],
   await run('DELETE FROM document_line_taxes WHERE document_id = ?', docId);
   await run('DELETE FROM document_lines WHERE document_id = ?', docId);
   const hsns = await resolveLineHsns(orgId, lines);
+  /*
+   * ONE OF TWO ARITHMETICS, AND THE DOCUMENT DECIDES WHICH.
+   *
+   * No stated tax — an invoice typed here — and every line computes its own tax
+   * from its own rate, as it always has. A stated tax, and the figure the
+   * source document gave is split across the lines instead of being derived
+   * from them; see `pinStatedTax`.
+   */
+  const pinned = statedTax > 0 ? await pinStatedTax(orgId, lines, statedTax) : null;
   // Sequential, not Promise.all: these inserts share the posting transaction's
   // one connection, and `seq` must land in the order the accountant typed.
   for (const [i, l] of lines.entries()) {
-    const amounts = await computeLine(orgId, l);
+    const amounts = pinned ? pinned[i] : await computeLine(orgId, l);
     const lineId = l.id ?? id('dl');
     await run(
       `INSERT INTO document_lines
          (id, org_id, document_id, seq, product_id, name, qty_milli, unit_price,
           discount_bps, tax_id, account_id, analytic_id, subtotal, tax_amount, total,
-          hsn_code, mrp)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          hsn_code, mrp, item_type)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       lineId, orgId, docId, i, l.productId ?? null, l.name,
       l.qtyMilli, l.unitPrice, l.discountBps ?? 0, l.taxId ?? null, l.accountId,
       l.analyticId ?? docAnalytic, amounts.subtotal, amounts.taxAmount, amounts.total,
-      hsns.get(i) ?? null, l.mrp ?? 0,
+      hsns.get(i) ?? null, l.mrp ?? 0, (l.itemType ?? '').trim().toLowerCase() || null,
     );
 
     /*
@@ -421,6 +646,137 @@ export async function recomputeTotals(orgId: string, docId: string, withholdingT
 // Posting
 // ---------------------------------------------------------------------------
 
+/**
+ * The journal lines a document produces, built once and used twice.
+ *
+ * `postDocument` writes them for the first time; `amendDocument` writes them
+ * over the top of what the document used to say. ONE builder, because two
+ * copies of the debit/credit rules would be two copies that drift, and the
+ * drift would show up as an amended invoice whose ledger entry no longer has
+ * the same shape as an unamended one.
+ *
+ * The number is passed in rather than taken here: posting ASSIGNS one, amending
+ * keeps the one already assigned, and the receivable line is labelled with it
+ * either way.
+ */
+async function documentPostings(orgId: string, doc: DocRow, number: string): Promise<PostingLine[]> {
+  const lines = await all<{
+    id: string; name: string; account_id: string; analytic_id: string | null;
+    subtotal: number; tax_amount: number; tax_id: string | null;
+    // Scoped by org for the same reason `documentLines` is, even though `doc`
+    // was already read org-scoped by every caller: the invariant belongs to the
+    // query, not to the path that reached it.
+  }>(`SELECT id, name, account_id, analytic_id, subtotal, tax_amount, tax_id
+        FROM document_lines WHERE org_id = ? AND document_id = ? ORDER BY seq`, orgId, doc.id);
+  if (!lines.length) throw new PostingError('A document with no lines cannot be posted.');
+
+  const meta = DOC_TYPES[doc.doc_type];
+  const isSale = meta.side === 'customer';
+  // A credit note is the same entry with the sides swapped. One flag, not a
+  // second code path.
+  const flip = meta.sign === -1;
+
+  const postings: PostingLine[] = [];
+
+  /*
+   * THE SPLIT IS READ, NOT RECOMPUTED.
+   *
+   * It used to be derived again here, by running the tax engine over each
+   * line's stored subtotal. That was two bugs waiting in one line of code: a
+   * tax-INCLUSIVE rate backed the base out of a figure the base had already
+   * been backed out of, and a document whose tax was STATED rather than
+   * computed — every invoice imported from TripzoCRM — would have posted the
+   * slab's percentage instead of the amount the customer was actually charged.
+   *
+   * `replaceLines` already wrote what each component comes to, deliberately
+   * ("KEEP THE SPLIT, DO NOT RECOMPUTE IT LATER"), for the same reason the
+   * reports read it rather than today's tax table. The ledger now reads the
+   * same row the GST return does, so the entry and the return cannot disagree.
+   */
+  const splitRows = await all<{
+    line_id: string; tax_id: string; tax_name: string;
+    base: number; amount: number; account_id: string | null;
+  }>(`SELECT line_id, tax_id, tax_name, base, amount, account_id
+        FROM document_line_taxes WHERE org_id = ? AND document_id = ?`, orgId, doc.id);
+  const splitsOfLine = new Map<string, typeof splitRows>();
+  for (const r of splitRows) {
+    const list = splitsOfLine.get(r.line_id) ?? [];
+    list.push(r);
+    splitsOfLine.set(r.line_id, list);
+  }
+
+  // --- the income or expense side, one line per document line -------------
+  for (const l of lines) {
+    const base: PostingLine = {
+      accountId: l.account_id,
+      label: l.name,
+      partnerId: doc.partner_id,
+      bookingId: doc.booking_id,
+      analyticId: l.analytic_id ?? doc.analytic_id ?? null,
+    };
+    // Sale: revenue is credited. Purchase: cost is debited. Reverse for notes.
+    if (isSale !== flip) postings.push({ ...base, credit: l.subtotal });
+    else postings.push({ ...base, debit: l.subtotal });
+
+    for (const split of splitsOfLine.get(l.id) ?? []) {
+      if (!split.amount) continue;
+      if (!split.account_id) throw new PostingError(`Tax "${split.tax_name}" has no account configured.`);
+      const taxLine: PostingLine = {
+        accountId: split.account_id,
+        label: split.tax_name,
+        partnerId: doc.partner_id,
+        // Tagged to the trip like every other line of this entry, so a
+        // booking-filtered ledger still balances. No analytic tag, though:
+        // GST is collected for the government, and putting it through the
+        // analytic account would inflate the trip's margin.
+        bookingId: doc.booking_id,
+        taxId: split.tax_id,
+        taxBase: split.base,
+      };
+      // Output tax is a liability (credit); input tax is an asset (debit).
+      if (isSale !== flip) postings.push({ ...taxLine, credit: split.amount });
+      else postings.push({ ...taxLine, debit: split.amount });
+    }
+  }
+
+  // --- the partner side ---------------------------------------------------
+  const partnerAccount = isSale
+    ? await receivableAccount(orgId, doc.partner_id)
+    : await payableAccount(orgId, doc.partner_id);
+  const payable = doc.total - doc.withheld_tax;
+
+  postings.push({
+    accountId: partnerAccount,
+    partnerId: doc.partner_id,
+    label: number,
+    bookingId: doc.booking_id,
+    ...(isSale !== flip ? { debit: payable } : { credit: payable }),
+  });
+
+  // --- TDS withheld on a vendor bill -------------------------------------
+  // The agency owes this to the government rather than to the supplier, so it
+  // splits off the payable rather than reducing the expense.
+  //
+  // Tagged with `taxId`/`taxBase` exactly like a GST split. Without the tag
+  // the line is invisible to the tax report — the money sat correctly in TDS
+  // Payable, but nothing told the agency what to deposit by the 7th, and a
+  // 26Q return had to be assembled by reading the ledger by hand. The base is
+  // the UNTAXED value, which is what `computeWithholding` deducted on: the
+  // government does not withhold tax on its own GST.
+  if (doc.withheld_tax > 0 && !isSale) {
+    postings.push({
+      accountId: await requireSetting(orgId, 'account.tds_payable'),
+      partnerId: doc.partner_id,
+      bookingId: doc.booking_id,
+      label: 'TDS withheld',
+      taxId: doc.withholding_tax_id,
+      taxBase: doc.untaxed,
+      ...(flip ? { debit: doc.withheld_tax } : { credit: doc.withheld_tax }),
+    });
+  }
+  return postings;
+}
+
 export async function postDocument(orgId: string, docId: string, actor: Actor = {}): Promise<string> {
   return await tx(async () => {
     const doc = await getDocument(orgId, docId);
@@ -428,97 +784,12 @@ export async function postDocument(orgId: string, docId: string, actor: Actor = 
     if (doc.state === 'posted') throw new PostingError('This document is already posted.');
     if (doc.state === 'cancelled') throw new PostingError('A cancelled document cannot be posted.');
 
-    const lines = await all<{
-      id: string; name: string; account_id: string; analytic_id: string | null;
-      subtotal: number; tax_amount: number; tax_id: string | null;
-    }>(`SELECT id, name, account_id, analytic_id, subtotal, tax_amount, tax_id
-          FROM document_lines WHERE document_id = ? ORDER BY seq`, docId);
-    if (!lines.length) throw new PostingError('A document with no lines cannot be posted.');
-
     const meta = DOC_TYPES[doc.doc_type];
     // Take the number BEFORE the lines are built: the partner line is labelled
     // with it, and assigning it afterwards left every posted invoice's
     // receivable line reading "Customer Invoice" instead of "INV-0006".
     const number = doc.number ?? await takeDocumentNumber(orgId, doc);
-    const isSale = meta.side === 'customer';
-    // A credit note is the same entry with the sides swapped. One flag, not a
-    // second code path.
-    const flip = meta.sign === -1;
-
-    const postings: PostingLine[] = [];
-
-    // --- the income or expense side, one line per document line -------------
-    for (const l of lines) {
-      const amounts = await computeLine(orgId, {
-        qtyMilli: 1000, unitPrice: l.subtotal, discountBps: 0, taxId: l.tax_id,
-      });
-      const base: PostingLine = {
-        accountId: l.account_id,
-        label: l.name,
-        partnerId: doc.partner_id,
-        bookingId: doc.booking_id,
-        analyticId: l.analytic_id ?? doc.analytic_id ?? null,
-      };
-      // Sale: revenue is credited. Purchase: cost is debited. Reverse for notes.
-      if (isSale !== flip) postings.push({ ...base, credit: l.subtotal });
-      else postings.push({ ...base, debit: l.subtotal });
-
-      for (const split of amounts.splits) {
-        if (!split.amount) continue;
-        if (!split.accountId) throw new PostingError(`Tax "${split.name}" has no account configured.`);
-        const taxLine: PostingLine = {
-          accountId: split.accountId,
-          label: split.name,
-          partnerId: doc.partner_id,
-          // Tagged to the trip like every other line of this entry, so a
-          // booking-filtered ledger still balances. No analytic tag, though:
-          // GST is collected for the government, and putting it through the
-          // analytic account would inflate the trip's margin.
-          bookingId: doc.booking_id,
-          taxId: split.taxId,
-          taxBase: split.base,
-        };
-        // Output tax is a liability (credit); input tax is an asset (debit).
-        if (isSale !== flip) postings.push({ ...taxLine, credit: split.amount });
-        else postings.push({ ...taxLine, debit: split.amount });
-      }
-    }
-
-    // --- the partner side ---------------------------------------------------
-    const partnerAccount = isSale
-      ? await receivableAccount(orgId, doc.partner_id)
-      : await payableAccount(orgId, doc.partner_id);
-    const payable = doc.total - doc.withheld_tax;
-
-    postings.push({
-      accountId: partnerAccount,
-      partnerId: doc.partner_id,
-      label: number,
-      bookingId: doc.booking_id,
-      ...(isSale !== flip ? { debit: payable } : { credit: payable }),
-    });
-
-    // --- TDS withheld on a vendor bill -------------------------------------
-    // The agency owes this to the government rather than to the supplier, so it
-    // splits off the payable rather than reducing the expense.
-    //
-    // Tagged with `taxId`/`taxBase` exactly like a GST split. Without the tag
-    // the line is invisible to the tax report — the money sat correctly in TDS
-    // Payable, but nothing told the agency what to deposit by the 7th, and a
-    // 26Q return had to be assembled by reading the ledger by hand. The base is
-    // the UNTAXED value, which is what `computeWithholding` deducted on: the
-    // government does not withhold tax on its own GST.
-    if (doc.withheld_tax > 0 && !isSale) {
-      postings.push({
-        accountId: await requireSetting(orgId, 'account.tds_payable'),
-        partnerId: doc.partner_id,
-        bookingId: doc.booking_id,
-        label: 'TDS withheld',
-        taxId: doc.withholding_tax_id,
-        taxBase: doc.untaxed,
-        ...(flip ? { debit: doc.withheld_tax } : { credit: doc.withheld_tax }),
-      });
-    }
+    const postings = await documentPostings(orgId, doc, number);
 
     const entryId = await postEntry({
       orgId,
@@ -539,7 +810,167 @@ export async function postDocument(orgId: string, docId: string, actor: Actor = 
     );
     await refreshResidual(orgId, docId);
     await audit(orgId, actor, 'posted', 'document', docId, `${meta.label} ${number} posted`);
+
+    /*
+     * MONEY ALREADY RECEIVED AGAINST THIS DOCUMENT IS PUT AGAINST IT NOW.
+     *
+     * A receipt fetched from TripzoCRM carries the invoice it was taken for,
+     * and it may well have been posted weeks before the invoice it belongs to
+     * reached the books. `settleTargetedForDocument` is the other half of the
+     * hook in `postPayment`: whichever side posts last performs the match, so
+     * the invoice never stands at its full residual with its own receipt
+     * sitting beside it in "Unallocated money".
+     *
+     * IMPORTED WHERE IT IS USED, not at the top of the file. `payments.ts`
+     * imports this module for `getDocument`, so a static import here would
+     * close a cycle between the two; deferring it to the call keeps the module
+     * graph acyclic and costs one resolved promise per posting.
+     */
+    const { settleTargetedForDocument } = await import('./payments');
+    await settleTargetedForDocument(orgId, docId, actor);
     return entryId;
+  });
+}
+
+/**
+ * AMEND A POSTED DOCUMENT: change what it says, and make the ledger say the
+ * same thing — in place, with nothing left over.
+ *
+ * WHY THIS EXISTS BESIDE THE CREDIT NOTE, which is not going away. The two
+ * answer different questions, and using one for the other's job is what makes a
+ * ledger unreadable:
+ *
+ *   The facts changed     — the trip was cancelled, the customer is getting
+ *                           part of it back. That is a CREDIT NOTE. Both the
+ *                           original supply and the cancellation are real
+ *                           events, both belong in GSTR-1, and erasing the
+ *                           first would be erasing a supply that happened.
+ *
+ *   The document was wrong — the rate was keyed as 95,000 instead of 59,000,
+ *                           the GSTIN had a typo, a line went to the wrong
+ *                           account. Nothing happened in the world. A credit
+ *                           note here invents a cancellation that never took
+ *                           place, and the customer's GSTR-2B then shows a
+ *                           supply and a credit against it that neither party
+ *                           can explain. This is an AMENDMENT.
+ *
+ * WHAT IT DOES. The document is rewritten exactly as a draft is — same header
+ * update, same `replaceLines`, same `recomputeTotals`, so there is no second
+ * copy of those rules — and then its journal entry is REWRITTEN IN PLACE by
+ * `replacePostedEntry`. Everything downstream reads the ledger rather than
+ * caching it (Rule 2), so the general ledger, the day book, the trial balance,
+ * the P&L, the balance sheet, the ageing, the tax report and trip profitability
+ * all show the new figures the moment this returns. The document number does
+ * not change, the entry number does not change, and nothing is left pointing at
+ * a row that is no longer there.
+ *
+ * WHAT IT REFUSES, and each of these is a case where "replace it" is the wrong
+ * answer rather than a hard one:
+ *
+ *   - a cancelled document, or one a credit note has already been raised
+ *     against: the note was computed as a percentage of THESE figures, and
+ *     moving them underneath it leaves two documents that no longer tie
+ *   - a locked or closed period, in either direction (`replacePostedEntry`)
+ *   - a reconciled bank line (`replacePostedEntry`)
+ *   - a new total below what has already been settled against it — the
+ *     allocations would exceed the document, and which of them to unwind is
+ *     the accountant's decision, not this function's
+ *
+ * STATUTORILY, AN AMENDMENT IS NOT INVISIBLE. A tax invoice already issued and
+ * reported is amended in GSTR-1 through Table 9A, in the return period the
+ * correction is made, and only up to the deadline in section 39(9) — the
+ * earlier of 30 November following the end of that financial year, or the date
+ * the annual return is filed. That is a filing act outside this product; what
+ * this gives it is one set of books saying what the corrected invoice says,
+ * plus the audit record of what it used to say.
+ */
+export async function amendDocument(docId: string, input: DocInput, actor: Actor = {}) {
+  return await tx(async () => {
+    const doc = await getDocument(input.orgId, docId);
+    if (!doc) throw new PostingError('Unknown document.');
+    if (doc.state === 'draft') throw new PostingError('This document is still a draft — edit it directly.');
+    if (doc.state === 'cancelled') {
+      throw new PostingError('A reversed document cannot be amended. Raise a fresh one.');
+    }
+    if (!doc.entry_id) throw new PostingError('This document has no ledger entry to amend.');
+    if (doc.reversed_by) {
+      const note = await one<{ number: string | null }>('SELECT number FROM documents WHERE id = ?', doc.reversed_by);
+      throw new PostingError(
+        `${note?.number ?? 'A credit note'} has been raised against this document for a percentage of ` +
+        'its figures, so changing them would leave the two disagreeing. Reverse the note first, or ' +
+        'correct the note instead.',
+      );
+    }
+
+    const settled = await scalar(
+      'SELECT COALESCE(SUM(amount),0) FROM payment_allocations WHERE document_id = ?', docId,
+    );
+
+    const gstin = await derivePartyGstin(input);
+    const supplyType = resolveSupplyType(input, gstin);
+
+    await run(
+      `UPDATE documents SET partner_id=?, journal_id=?, booking_id=?, analytic_id=?,
+              doc_date=?, due_date=?, payment_terms_id=?, supplier_ref=?, currency=?, rate_e6=?,
+              withholding_tax_id=?, note=?, place_of_supply=?, party_gstin=?, supply_type=?,
+              irn=?, irn_ack_no=?, irn_ack_date=?, order_ref=?, order_date=?,
+              stated_discount=?, stated_tax=?, stated_advance=?
+         WHERE id=? AND org_id=?`,
+      input.partnerId, input.journalId, input.bookingId ?? null, input.analyticId ?? null,
+      input.docDate, input.dueDate ?? await deriveDueDate(input), input.paymentTermsId ?? null,
+      input.supplierRef ?? null, input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
+      input.withholdingTaxId ?? null, input.note ?? null,
+      await derivePlaceOfSupply(input), gstin, supplyType,
+      input.irn ?? null, input.irnAckNo ?? null,
+      input.irnAckDate ?? null, input.orderRef ?? null, input.orderDate ?? null,
+      nonNegative(input.statedDiscount), nonNegative(input.statedTax), nonNegative(input.statedAdvance),
+      docId, input.orgId,
+    );
+    await replaceLines(input.orgId, docId, input.lines, input.analyticId ?? null,
+      nonNegative(input.statedTax));
+    await recomputeTotals(input.orgId, docId, input.withholdingTaxId ?? '');
+
+    const after = (await getDocument(input.orgId, docId))!;
+    const payable = after.total - (after.doc_type.startsWith('in_') ? after.withheld_tax : 0);
+    /*
+     * CHECKED AFTER THE REWRITE AND BEFORE THE LEDGER, inside the transaction.
+     *
+     * The new total is only known once the lines have been recomputed, and the
+     * transaction is what makes testing it here safe rather than reckless: the
+     * document rows roll back with everything else when this throws, so a
+     * refused amendment leaves the invoice exactly as it was instead of reduced
+     * with its old journal entry still sitting behind it.
+     */
+    if (settled > payable) {
+      throw new PostingError(
+        `${(settled / 100).toFixed(2)} has already been settled against this document, which the new ` +
+        `total of ${(payable / 100).toFixed(2)} no longer covers. Undo the settlement first — the ` +
+        'money may be a refund, or may belong against another document, and only you know which.',
+      );
+    }
+
+    const meta = DOC_TYPES[after.doc_type];
+    const number = after.number ?? await takeDocumentNumber(input.orgId, after);
+    const postings = await documentPostings(input.orgId, after, number);
+    await replacePostedEntry(doc.entry_id, {
+      orgId: input.orgId,
+      journalId: after.journal_id,
+      date: after.doc_date,
+      reference: number,
+      narration: `${meta.label} ${number}`,
+      sourceModel: 'document',
+      sourceId: docId,
+      currency: after.currency,
+      lines: postings,
+    }, actor);
+
+    await refreshResidual(input.orgId, docId);
+    await audit(input.orgId, actor, 'amended', 'document', docId,
+      `${meta.label} ${number} amended — ${(doc.total / 100).toFixed(2)} to ${(after.total / 100).toFixed(2)}`,
+      {
+        was: { date: doc.doc_date, untaxed: doc.untaxed, tax: doc.tax_total, total: doc.total },
+        now: { date: after.doc_date, untaxed: after.untaxed, tax: after.tax_total, total: after.total },
+      });
   });
 }
 
@@ -647,10 +1078,27 @@ export async function createCreditNote(
 
     const lines = await all<{
       name: string; account_id: string; analytic_id: string | null;
-      subtotal: number; tax_id: string | null; product_id: string | null;
-      hsn_code: string | null; mrp: number;
-    }>(`SELECT name, account_id, analytic_id, subtotal, tax_id, product_id, hsn_code, mrp
-          FROM document_lines WHERE document_id = ? ORDER BY seq`, sourceDocId);
+      subtotal: number; total: number; tax_id: string | null; product_id: string | null;
+      hsn_code: string | null; mrp: number; item_type: string | null;
+    }>(`SELECT name, account_id, analytic_id, subtotal, total, tax_id, product_id, hsn_code, mrp,
+               item_type
+          FROM document_lines WHERE org_id = ? AND document_id = ? ORDER BY seq`,
+        orgId, sourceDocId);
+
+    /*
+     * WHICH FIGURE A CREDIT LINE IS PRICED FROM, AND WHY IT DEPENDS ON THE
+     * INVOICE IT REVERSES.
+     *
+     * On an ordinary invoice the line's `subtotal` is its taxable value and the
+     * tax is computed ON it, so the note is priced from the subtotal and
+     * recomputes the same tax. On an invoice whose tax was STATED, the tax was
+     * carved OUT of the line instead — `subtotal` is already net of it — so
+     * pricing from the subtotal would raise a note for less than the invoice it
+     * cancels, by exactly the tax. The line's own total is the figure that
+     * survives both, and the note carries a proportional share of the stated
+     * tax so the same tax is reversed as was charged.
+     */
+    const stated = doc.stated_tax > 0;
 
     const creditType: DocType = doc.doc_type === 'out_invoice' ? 'out_refund' : 'in_refund';
     const noteId = await createDocument({
@@ -682,16 +1130,27 @@ export async function createCreditNote(
       partyGstin: doc.party_gstin,
       orderRef: doc.order_ref,
       orderDate: doc.order_date,
+      // A proportional share of what the invoice stated, so the note reverses
+      // the tax that was actually charged rather than the slab's percentage of
+      // a value the invoice never had. The advance is not inherited: money
+      // already collected is not cancelled by crediting the invoice.
+      statedTax: Math.round((doc.stated_tax * bps) / 10000),
+      statedDiscount: Math.round((doc.stated_discount * bps) / 10000),
       note: `${opts.reason ?? 'Credit note'} — against ${doc.number}`,
       lines: lines.map((l) => ({
         name: l.name,
         productId: l.product_id,
         qtyMilli: 1000,
-        unitPrice: Math.round((l.subtotal * bps) / 10000),
+        unitPrice: Math.round(((stated ? l.total : l.subtotal) * bps) / 10000),
         taxId: l.tax_id,
         accountId: l.account_id,
         analyticId: l.analytic_id,
         hsnCode: l.hsn_code,
+        // The kind travels with the line, for the same reason the HSN does: a
+        // credit note is netted against its invoice line for line, and a note
+        // that reversed a `package` as nothing at all would leave the two
+        // disagreeing about what was cancelled.
+        itemType: l.item_type,
         mrp: Math.round((l.mrp * bps) / 10000),
       })),
     }, actor);
@@ -762,10 +1221,27 @@ export async function getDocument(orgId: string, docId: string): Promise<DocRow 
     `SELECT d.*, p.name AS partner_name, b.ref AS booking_ref,
             COALESCE(d.party_gstin, p.gstin) AS partner_gstin, p.gst_name AS partner_gst_name,
             p.city AS partner_city, p.state_code AS partner_state_code,
-            p.address AS partner_address
+            p.address AS partner_address,
+            c.invoice_number AS crm_invoice_number
        FROM documents d
        LEFT JOIN partners p ON p.id = d.partner_id
        LEFT JOIN bookings b ON b.id = d.booking_id
+       /*
+        * The CRM invoice this document was drafted from, if any.
+        *
+        * A LATERAL rather than a plain LEFT JOIN because crm_invoices is not
+        * guaranteed one row per document -- a refund mirrored against the same
+        * document would silently DUPLICATE the row here, and a list that shows
+        * one invoice twice is worse than one that omits the number. The limit
+        * makes the cardinality structural rather than a hope about the data.
+        */
+       LEFT JOIN LATERAL (
+         SELECT ci.invoice_number
+           FROM crm_invoices ci
+          WHERE ci.org_id = d.org_id AND ci.document_id = d.id
+          ORDER BY ci.fetched_at DESC
+          LIMIT 1
+       ) c ON TRUE
       WHERE d.id = ? AND d.org_id = ?`, docId, orgId,
   );
 }
@@ -777,12 +1253,37 @@ export interface DocLineRow {
   account_code: string; account_name: string; analytic_id: string | null;
   analytic_name: string | null; subtotal: number; tax_amount: number; total: number;
   hsn_code: string | null; mrp: number;
+  /** TripzoCRM's own kind for this line: package, service, extra, hotel... */
+  item_type: string | null;
   /** The product's variant description, for the line as it prints. */
   variant: string | null;
   product_category: string | null;
 }
 
-export async function documentLines(docId: string): Promise<DocLineRow[]> {
+/**
+ * A document's lines.
+ *
+ * -------------------------------------------------------------------------
+ * WHY `orgId` IS A PARAMETER WHEN THE DOCUMENT ID IS ALREADY UNIQUE
+ * -------------------------------------------------------------------------
+ * It is not needed to FIND the rows — a document id identifies them on its own.
+ * It is there so that asking for a document belonging to another agency returns
+ * nothing instead of returning its lines.
+ *
+ * Every caller today proves ownership first: the detail screen, the edit screen
+ * and both exports call `getDocument(orgId, docId)` and give up when it answers
+ * null. That makes the call sites safe and leaves the FUNCTION unsafe, and the
+ * difference matters now that one database holds several agencies' books. A
+ * document id arrives from a URL — `/sales/invoices/<id>` — so the next caller
+ * who reads the lines before the header, or who adds a screen that only needs
+ * the lines, would be one forgotten check away from printing one agency's
+ * invoice to another's. The filter costs nothing (`document_lines.org_id` is
+ * indexed and on every row) and turns a convention into an invariant.
+ *
+ * The same reasoning applies to `documentLineTaxes`, `allocationsFor`,
+ * `allocationsOfPayment`, `paymentTaxes` and `taxChildren`.
+ */
+export async function documentLines(orgId: string, docId: string): Promise<DocLineRow[]> {
   return await all<DocLineRow>(
     `SELECT dl.*, t.name AS tax_name, a.code AS account_code, a.name AS account_name,
             an.name AS analytic_name, pr.variant, pr.category AS product_category
@@ -791,7 +1292,7 @@ export async function documentLines(docId: string): Promise<DocLineRow[]> {
        LEFT JOIN accounts a ON a.id = dl.account_id
        LEFT JOIN analytic_accounts an ON an.id = dl.analytic_id
        LEFT JOIN products pr ON pr.id = dl.product_id
-      WHERE dl.document_id = ? ORDER BY dl.seq`, docId,
+      WHERE dl.org_id = ? AND dl.document_id = ? ORDER BY dl.seq`, orgId, docId,
   );
 }
 
@@ -807,10 +1308,11 @@ export interface LineTaxRow {
  * printed invoice, the GST column of a settlement statement and the tax report
  * all walk the lines and ask "what tax did THIS one carry".
  */
-export async function documentLineTaxes(docId: string): Promise<Map<string, LineTaxRow[]>> {
+export async function documentLineTaxes(orgId: string, docId: string): Promise<Map<string, LineTaxRow[]>> {
   const rows = await all<LineTaxRow>(
     `SELECT id, line_id, tax_id, tax_name, tax_group, rate_bps, base, amount
-       FROM document_line_taxes WHERE document_id = ? ORDER BY line_id, tax_group`, docId,
+       FROM document_line_taxes WHERE org_id = ? AND document_id = ? ORDER BY line_id, tax_group`,
+    orgId, docId,
   );
   const byLine = new Map<string, LineTaxRow[]>();
   for (const r of rows) {
@@ -893,10 +1395,15 @@ export async function listDocuments(orgId: string, f: DocFilter = {}): Promise<D
     for (const token of searchTokens(f.search)) {
       clauses.push(
         '(d.number ILIKE ? OR p.name ILIKE ? OR d.supplier_ref ILIKE ? OR d.order_ref ILIKE ?'
-        + ' OR d.irn ILIKE ? OR d.party_gstin ILIKE ? OR p.gstin ILIKE ?)',
+        + ' OR d.irn ILIKE ? OR d.party_gstin ILIKE ? OR p.gstin ILIKE ?'
+        // The CRM's own number is the one an agent quotes -- they raised
+        // INV-000015 on their phone and have never seen the ledger number this
+        // app assigned on posting. Searchable here for the same reason the
+        // order reference is: it is the number the person asking has in hand.
+        + ' OR c.invoice_number ILIKE ?)',
       );
       const like = `%${token}%`;
-      params.push(like, like, like, like, like, like, like);
+      params.push(like, like, like, like, like, like, like, like);
     }
   }
 
@@ -905,10 +1412,27 @@ export async function listDocuments(orgId: string, f: DocFilter = {}): Promise<D
     `SELECT d.*, p.name AS partner_name, b.ref AS booking_ref,
             COALESCE(d.party_gstin, p.gstin) AS partner_gstin, p.gst_name AS partner_gst_name,
             p.city AS partner_city, p.state_code AS partner_state_code,
-            p.address AS partner_address
+            p.address AS partner_address,
+            c.invoice_number AS crm_invoice_number
        FROM documents d
        LEFT JOIN partners p ON p.id = d.partner_id
        LEFT JOIN bookings b ON b.id = d.booking_id
+       /*
+        * The CRM invoice this document was drafted from, if any.
+        *
+        * A LATERAL rather than a plain LEFT JOIN because crm_invoices is not
+        * guaranteed one row per document -- a refund mirrored against the same
+        * document would silently DUPLICATE the row here, and a list that shows
+        * one invoice twice is worse than one that omits the number. The limit
+        * makes the cardinality structural rather than a hope about the data.
+        */
+       LEFT JOIN LATERAL (
+         SELECT ci.invoice_number
+           FROM crm_invoices ci
+          WHERE ci.org_id = d.org_id AND ci.document_id = d.id
+          ORDER BY ci.fetched_at DESC
+          LIMIT 1
+       ) c ON TRUE
       WHERE ${clauses.join(' AND ')}
       ORDER BY d.doc_date DESC, d.created_at DESC
       LIMIT ${limit}`,

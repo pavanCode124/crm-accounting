@@ -32,11 +32,35 @@ export interface AuditRow {
   model: string; record_id: string; summary: string | null; detail: string | null;
 }
 
-export async function auditFor(model: string, recordId: string): Promise<AuditRow[]> {
+/**
+ * Everything that has happened to one record.
+ *
+ * -------------------------------------------------------------------------
+ * WHY `orgId` IS A PARAMETER WHEN THE RECORD ID IS ALREADY UNIQUE
+ * -------------------------------------------------------------------------
+ * It is not needed to find the rows. It is there so that asking for a record
+ * belonging to another agency returns nothing instead of returning its history
+ * — and a history is the worst of the child readers to leak, because the trail
+ * is not a list of ids. It names the people who acted, and `detail` carries the
+ * before-and-after of every amendment: the figures, the dates and the partner
+ * on each one. A document's lines leak one invoice; its audit trail leaks how
+ * that invoice came to say what it says, and who changed it.
+ *
+ * Every caller today proves ownership first — the entry screen calls
+ * `journalEntry(orgId, id)`, the settlement screen `getSettlement(orgId, id)`
+ * and `DocumentDetail` `getDocument(orgId, docId)`, and all three give up when
+ * the answer is null. That makes the call sites safe and left this FUNCTION
+ * unsafe, which is the distinction that matters now that one database holds
+ * several agencies' books and every one of those ids arrives from a URL. The
+ * filter costs nothing (`audit_log.org_id` is on every row) and turns the
+ * convention into an invariant, as it already is for `documentLines`,
+ * `allocationsFor`, `paymentTaxes`, `taxChildren` and `settlementCharges`.
+ */
+export async function auditFor(orgId: string, model: string, recordId: string): Promise<AuditRow[]> {
   return await all<AuditRow>(
     `SELECT id, at, user_name, action, model, record_id, summary, detail
-       FROM audit_log WHERE model = ? AND record_id = ? ORDER BY id`,
-    model, recordId,
+       FROM audit_log WHERE org_id = ? AND model = ? AND record_id = ? ORDER BY id`,
+    orgId, model, recordId,
   );
 }
 

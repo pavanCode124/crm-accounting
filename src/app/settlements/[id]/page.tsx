@@ -42,8 +42,8 @@ export default async function SettlementPage({ params, searchParams }: {
   if (!settlement) return <Banner tone="error">That settlement no longer exists.</Banner>;
 
   const docs = await settlementDocuments(s.orgId, id);
-  const charges = await settlementCharges(id);
-  const trail = await auditFor('settlement', id);
+  const charges = await settlementCharges(s.orgId, id);
+  const trail = await auditFor(s.orgId, 'settlement', id);
   const entry = settlement.entry_id ? await journalEntry(s.orgId, settlement.entry_id) : null;
   const banks = await bankAccountOptions(s.orgId);
 

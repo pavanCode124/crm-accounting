@@ -55,6 +55,37 @@ export const NAV: NavSection[] = [
       { label: 'Bookings', href: '/bookings', match: '/bookings', keywords: ['trips', 'tours', 'reservations'] },
     ],
   },
+  /*
+   * ITS OWN SECTION, NOT FOLDED INTO SALES.
+   *
+   * Everything under Sales is a book of account: documents with journal entries
+   * behind them, which a trial balance reconciles to. Everything here is LIVE
+   * from TripzoCRM and has no double entry at all — the catalogue the agents
+   * sell from and the invoices they have raised, as the CRM holds them this
+   * second.
+   *
+   * Putting "Invoices" and "CRM Invoices" next to each other in one menu would
+   * invite exactly the confusion the two screens exist to prevent, because the
+   * numbers legitimately differ and the difference is the work. A section of
+   * their own says which side of the line a screen is on before it is opened.
+   */
+  {
+    key: 'crm',
+    label: 'TripzoCRM',
+    items: [
+      { label: 'Packages', href: '/crm/packages', match: '/crm/packages', keywords: ['catalogue', 'tours', 'products', 'tripzo'] },
+      /*
+       * NOT the same screen as Sales → Invoices, and the distinction is the
+       * reason this section exists. Sales → Invoices is the BOOK OF ACCOUNT:
+       * documents with journal entries behind them that a trial balance
+       * reconciles to. This one is the SEAM — what TripzoCRM has billed, what
+       * has been fetched into this database, and which of those have reached
+       * the books. The two lists legitimately differ, and the difference is
+       * the work.
+       */
+      { label: 'Invoices', href: '/crm/invoices', match: '/crm/invoices', cap: 'invoice.create', keywords: ['import', 'fetch', 'crm invoices', 'tripzo', 'sync', 'pending'] },
+    ],
+  },
   {
     key: 'sales',
     label: 'Sales',

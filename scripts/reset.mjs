@@ -1,6 +1,14 @@
 /**
- * Drop the accounting schema so the app rebuilds and re-seeds on its next
- * request.
+ * Drop the accounting schema so the app rebuilds it on its next request.
+ *
+ * WHAT COMES BACK DEPENDS ON WHETHER A CRM IS CONFIGURED, and this used to say
+ * "re-seeds" unconditionally, which is no longer true and was the misleading
+ * half. On a deployment with no Supabase anon key there is no CRM to
+ * authenticate against, so the demo books are seeded as before. On a CONNECTED
+ * deployment nothing is seeded at all: `ensureDemoBooks` is a no-op there, and
+ * each agency gets its own empty, fully configured set of books provisioned on
+ * its next sign-in. Running this against a connected deployment therefore
+ * erases the books and hands back a clean ledger, not the demo.
  *
  * Deliberately NOT a re-implementation of the seed: the seed lives in
  * src/server/seed.ts and runs through the same posting engine the screens use,
@@ -56,7 +64,11 @@ const client = new pg.Client({
 await client.connect();
 try {
   await client.query(`DROP SCHEMA IF EXISTS "${schema.replace(/"/g, '""')}" CASCADE`);
-  console.log(`Dropped schema "${schema}". The next request rebuilds and re-seeds the books.`);
+  console.log(
+    `Dropped schema "${schema}". The next request rebuilds it; a CRM-connected `
+    + 'deployment then provisions fresh books per agency on sign-in, and only an '
+    + 'unconnected one re-seeds the demo.',
+  );
 } finally {
   await client.end();
 }

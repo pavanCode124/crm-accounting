@@ -500,7 +500,7 @@ export async function postSettlement(orgId: string, settlementId: string, actor:
     if (!payDate) throw new PostingError('Give the settlement the date the money arrived before posting it.');
 
     const docs = await settlementDocuments(orgId, settlementId);
-    const charges = await settlementCharges(settlementId);
+    const charges = await settlementCharges(orgId, settlementId);
     if (!docs.length && !charges.length) {
       throw new PostingError('There is nothing in this cycle to post.');
     }
@@ -769,9 +769,22 @@ export async function settlementDocuments(orgId: string, settlementId: string): 
   );
 }
 
-export async function settlementCharges(settlementId: string): Promise<SettlementChargeRow[]> {
+/**
+ * A settlement's manual charges.
+ *
+ * `orgId` is not needed to FIND the rows — a settlement id identifies them on
+ * its own. It is there so that asking for another agency's settlement returns
+ * nothing instead of returning what the channel deducted from it, which is the
+ * same reasoning as `settlementDocuments` above and as `documentLines` in
+ * accounting/documents.ts. Every caller today proves ownership first by way of
+ * `getSettlement(orgId, ...)`; the filter is what makes that a property of the
+ * function rather than a habit of its callers, now that one database holds
+ * several agencies' books and the id arrives from `/settlements/<id>`.
+ */
+export async function settlementCharges(orgId: string, settlementId: string): Promise<SettlementChargeRow[]> {
   return await all<SettlementChargeRow>(
-    'SELECT * FROM settlement_charges WHERE settlement_id=? ORDER BY seq, label', settlementId,
+    'SELECT * FROM settlement_charges WHERE org_id=? AND settlement_id=? ORDER BY seq, label',
+    orgId, settlementId,
   );
 }
 

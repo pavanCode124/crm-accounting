@@ -46,6 +46,16 @@ export type SettingKey =
   | 'account.channel_recovery'
   | 'account.tcs_receivable'
   | 'account.tds_receivable'
+  /*
+   * WHAT A CANCELLED BOOKING LEAVES BEHIND. Its own revenue account rather than
+   * the package revenue it was going to be, because the two answer different
+   * questions: what the agency sold, and what it kept from trips that never
+   * ran. It is REVENUE, and taxable revenue at that — Circular 178/10/2022-GST
+   * paragraph 11.3 reads a cancellation fee as part of the tour operator
+   * service itself, assessed at the same rate — so netting it off an advance or
+   * burying it in other income would both understate turnover and lose the tax.
+   */
+  | 'account.cancellation_charges'
   | 'account.employee_advance'
   | 'account.rounding'
   | 'account.opening_balance'

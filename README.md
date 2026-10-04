@@ -54,10 +54,11 @@ that is what it is for.
 
 | Command | What it does |
 |---|---|
-| `npm run dev` | Dev server on port 3100 |
+| `npm run dev` | Dev server on port 3100, against whatever `.env.local` points at |
+| `npm run dev:demo` | Dev server on port 3101, forced into demo mode — embedded Postgres, sample books, no sign-in, no route to a live agency |
 | `npm run build` / `npm start` | Production build and serve |
 | `npm run typecheck` | `tsc --noEmit` |
-| `npm run reset` | Drop the `accounting` schema so the books re-seed |
+| `npm run reset` | Drop the `accounting` schema so the books are provisioned afresh |
 
 Environment:
 
@@ -145,10 +146,13 @@ src/
   server/
     schema.sql            every table
     db.ts                 pool, schema bootstrap, transactions, sequences
-    auth.ts               session and capability enforcement
-    seed.ts               chart of accounts + a season of demo trading
+    auth.ts               session, tenancy, capability enforcement
+    provision.ts          one agency's opening set of books
+    seed.ts               the demo agency and a season of its trading
     accounting/           the engine and every service
+    crm/                  the TripzoCRM seam — see docs/crm-ledger-map.md
 docs/accounting/          domain model, journal-entry rules, 30 scenarios
+docs/crm-ledger-map.md    what every CRM field becomes in the ledger, and why
 ```
 
 Read `docs/accounting/` before changing anything under
@@ -188,8 +192,12 @@ discovers them by surprise:
 - **A test suite.** The seed is the integration exercise: it posts sixteen of
   the thirty scenarios through the real engine on every fresh install, and the
   Trial Balance and Balance Sheet are the assertions.
-- **The CRM session.** `src/server/auth.ts` is the seam, and it currently
-  resolves the seeded organisation rather than a Supabase session.
+- **A per-agency reset.** Deleting one tenant's trading and re-provisioning it,
+  leaving every other tenant untouched. `resetAndSeed()` is not that — it
+  truncates the schema — so it refuses to run on a connected deployment.
+- **Pushing the ledger's own documents back to the CRM.** The flow is one-way:
+  the CRM owns invoices, this app reads and writes them there, and a document
+  typed here stays here.
 
 ---
 
@@ -229,11 +237,25 @@ Then **redeploy**. Variables are read at build time and bundled into the
 deployment, so saving them in the dashboard changes nothing until a new
 deployment is made.
 
-`TRIPZO_SEED_DEMO=0` is not optional on a real deployment. Without it the first
-request against the agency's own database seeds a season of invented trading
-alongside the chart of accounts, and separating the two afterwards is tedious.
-With it you get the configuration — chart of accounts, journals, GST and TDS,
-analytic plans — and an empty ledger.
+`TRIPZO_SEED_DEMO=0` is now belt and braces rather than the belt. A deployment
+that has a Supabase anon key set is a deployment that authenticates against
+TripzoCRM, and `ensureDemoBooks()` refuses to seed on one at all — see the guard
+in `src/server/seed.ts`. Leave the variable set anyway: it costs nothing and it
+is the second of two reasons the demo cannot reach a real agency's database.
+
+It used to be the only reason, and that was not enough. Without it the first
+request seeded Wander Travels — a fictional agency with a season of invented
+invoices, receipts and a cancellation — into the agency's own Postgres, and the
+first real agency to sign in then **adopted those books**, so the demo's figures
+turned up in its trial balance, its receivables and its GST summary. One
+forgotten environment variable, and the ledger was wrong in a way that looked
+like data.
+
+What a connected deployment starts with instead is nothing: an empty schema. One
+set of books per TripzoCRM agency is then provisioned on that agency's first
+sign-in — chart of accounts, journals, GST and TDS, analytic plans, the default
+account for every posting routine, and the current fiscal year open — with no
+trading in it. See *One ledger per agency* below.
 
 A blank field in the dashboard sets an empty string, not an unset variable.
 `connectionString()` trims and checks for emptiness precisely because of this:
@@ -360,20 +382,74 @@ psql "$TRIPZO_DATABASE_URL" -c "SELECT id, name FROM public.organizations ORDER 
 4. Press **Sync**. It imports suppliers, leads as customers, leads with a
    package as bookings, and non-draft invoices with their receipts. Everything
    lands as a **draft** in Review & Post — nothing posts itself.
-5. Confirm the org name on the masthead changed from the seeded name to the
-   CRM's. That is `syncOrg()` in `src/server/crm/sync.ts` doing its job.
-6. Post a document from Review & Post, then open
+5. Confirm the org name on the masthead is the CRM's. Two things keep it so:
+   `resolveBooks()` adopts the name on every sign-in, and `syncFromCrm()`
+   re-reads it — but only *after* checking the connection belongs to these
+   books, which is why connecting with another agency's credentials can no
+   longer rename this ledger after their business.
+6. Check the sync report's warnings. An import that could not place a figure
+   says so there by name — a GST rate that did not divide out, an `item_type`
+   with no revenue account, a document whose total does not match the invoice
+   the customer was sent. None of those block the import; all of them mean a
+   draft to look at before posting. See `src/server/crm/invoiceMapping.ts`.
+7. Post a document from Review & Post, then open
    `/reports/trial-balance?range=all` — debits must equal credits.
 
-To start over, Settings -> **Reset the books**, or `npm run reset`. Both drop
-only the `accounting` schema; the CRM's tables are untouched.
+To start over: `npm run reset` drops the `accounting` schema, so the books are
+re-provisioned on the next sign-in. The CRM's tables are untouched either way.
+Settings -> **Reset the books** is the same operation from the UI and is offered
+**only on a demo deployment**, because the schema now holds every agency's
+ledger and truncating it would destroy all of them.
+
+To see the demo without disturbing any of this: `npm run dev:demo`, which runs
+on port 3101 against the embedded in-memory Postgres with the connection string
+and the anon key emptied, so nothing in that process can reach a live agency.
+
+### One ledger per agency
+
+The ledger is multi-tenant, and `organizations.crm_org_id` is the whole of the
+rule: **one set of books per TripzoCRM organisation**, matched on that column,
+with a unique index enforcing it. `session.orgId` is the id it resolves to, and
+every query in the product is filtered by it — so when Wander Travels signs in,
+every account, journal, invoice, receipt, journal entry, GST figure and report
+they see belongs to Wander Travels' books, and there is no path through the app
+that reads a row belonging to another agency.
+
+What happens on a first sign-in, in `resolveBooks` (`src/server/auth.ts`):
+
+| The agency | What it gets |
+|---|---|
+| has books already | them, renamed to whatever the CRM now calls it |
+| has none, and the deployment holds exactly one unclaimed, non-demo ledger | that one, adopted — the upgrade path for a ledger configured before the CRM was connected |
+| has none, and there is nothing to adopt | a fresh set, provisioned by `provisionOrg` (`src/server/provision.ts`) |
+| is not attached to any agency in the CRM | the sign-in screen, saying so — a CRM account with no organisation is a state the CRM creates on sign-up by design |
+
+Adoption is narrow on purpose. It never takes books flagged `demo_data`, and it
+never guesses between two unclaimed ledgers; both would hand one business's
+history to another. A second agency signing into the same deployment used to be
+refused outright (`WrongAgencyError`); it now gets its own books, which is the
+difference between a multi-tenant schema and a multi-tenant product.
+
+Two things follow from several agencies sharing one database, and both are
+enforced server-side rather than in the UI:
+
+- **Reset is demo-only.** It truncates the whole schema, so on a connected
+  deployment one agency's administrator would destroy every other agency's
+  ledger. `resetAndSeed()` refuses, and the Settings card says why.
+- **A saved sync connection must belong to these books.** A correct password
+  proves who someone is, not which agency's ledger they may import into.
+  `connect()` checks before storing the token and `syncFromCrm()` aborts before
+  reading a single record, because the alternative is an unattended 3am import
+  of somebody else's customers and invoices into this ledger.
 
 ### The seams
 
-- **`src/server/auth.ts`** is where the CRM session arrives. Today it resolves
-  the first organisation in the ledger and a user chosen by `TRIPZO_USER`; in
-  production it reads the Supabase session and the org membership from the Node
-  backend. Everything downstream is already written against the real shape.
+- **`src/server/auth.ts`** is where the CRM session arrives: the visitor signs
+  in with their own TripzoCRM credentials, the backend says who they are and
+  which agency they belong to, and `resolveBooks` turns that agency into a set
+  of books. `mirrorUser` gives each person a local row so that every audit entry
+  and every posted entry names somebody who exists — including when the CRM is
+  unreachable, and including after they leave it.
 - **`bookings` and `partners`** mirror the CRM's own records and carry
   `crm_lead_id` back to them. `createBooking()` creates a booking *and* its trip
   analytic account together — a booking without one is a trip whose costs cannot

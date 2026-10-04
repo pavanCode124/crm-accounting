@@ -1,6 +1,6 @@
 import 'server-only';
 import { one, run, nowIso } from '../db';
-import { signIn, refresh, type CrmSession } from './client';
+import { signIn, refresh, crmGet, type CrmSession } from './client';
 
 /**
  * The stored CRM connection, and keeping its token alive.
@@ -31,9 +31,49 @@ export async function isConnected(orgId: string): Promise<boolean> {
   return await getConnection(orgId) !== null;
 }
 
-/** Sign in and remember the session. Replaces any previous connection. */
+/**
+ * Sign in and remember the session. Replaces any previous connection.
+ *
+ * -------------------------------------------------------------------------
+ * THE AGENCY IS CHECKED BEFORE THE TOKEN IS STORED
+ * -------------------------------------------------------------------------
+ * A correct password proves who somebody is, not which agency's books they are
+ * entitled to import into. An administrator with accounts at two agencies, or
+ * one who pasted the wrong credentials, connects successfully — and from then
+ * on this ledger's unattended 3am sync pulls the OTHER agency's customers,
+ * suppliers, invoices and receipts, each one correctly scoped to this `orgId`
+ * and belonging to someone else.
+ *
+ * `syncFromCrm` also refuses a mismatched connection, and that is the control
+ * that actually matters because it guards the writes. This check exists so the
+ * accountant finds out WHILE TYPING THE PASSWORD rather than from a failed
+ * sync a week later: the wrong credentials are never stored, so there is no
+ * broken connection sitting in the database looking configured.
+ *
+ * It is only a check, never a correction. A connection that resolves to no
+ * organisation at all, or to books that have not been claimed by a CRM agency
+ * yet, is allowed through — `resolveBooks` owns that question, and refusing
+ * here would block the legitimate first connection on a freshly adopted
+ * ledger.
+ */
 export async function connect(orgId: string, email: string, password: string): Promise<CrmSession> {
   const s = await signIn(email, password);
+
+  const books = await one<{ crm_org_id: string | null; name: string }>(
+    'SELECT crm_org_id, name FROM organizations WHERE id = ?', orgId,
+  );
+  if (books?.crm_org_id) {
+    const who = await crmGet<CrmUserLike | { user?: CrmUserLike }>(s, '/api/users/current');
+    const user = (who as { user?: CrmUserLike })?.user ?? (who as CrmUserLike);
+    if (user?.organization_id && user.organization_id !== books.crm_org_id) {
+      throw new Error(
+        `That account belongs to ${user.organization_name || 'another agency'}, and these books `
+        + `belong to ${books.name}. The connection has NOT been saved — syncing on it would import `
+        + 'another agency’s records into this ledger. Use an account in this agency.',
+      );
+    }
+  }
+
   await run(
     `INSERT INTO crm_connection (org_id, email, access_token, refresh_token, expires_at)
      VALUES (?,?,?,?,?)
@@ -43,6 +83,12 @@ export async function connect(orgId: string, email: string, password: string): P
     orgId, email, s.accessToken, s.refreshToken, s.expiresAt,
   );
   return s;
+}
+
+/** The two fields of `GET /api/users/current` this module needs. */
+interface CrmUserLike {
+  organization_id?: string | null;
+  organization_name?: string | null;
 }
 
 export async function disconnect(orgId: string) {

@@ -45,6 +45,7 @@ export default async function DefaultAccountsPage({ searchParams }: { searchPara
     ['account.current_year', 'Current year earnings', 'The running result, before the year is closed.'],
     ['account.commission_expense', 'Commission expense', ''],
     ['account.commission_payable', 'Commission payable', ''],
+    ['account.cancellation_charges', 'Cancellation charges', 'What the agency keeps when a trip is called off — revenue, taxed at the package’s own rate.'],
     ['account.employee_advance', 'Employee advances', 'Runs as a balance per employee.'],
     ['account.bank_charges', 'Bank charges', ''],
     ['account.fx_gain', 'Foreign exchange gain', ''],

@@ -122,8 +122,8 @@ interface ItemRow {
 async function loadOrder(orgId: string, documentId: string, sd: SettlementDocRow | null): Promise<OrderContext | null> {
   const doc = await getDocument(orgId, documentId);
   if (!doc) return null;
-  const lines = await documentLines(documentId);
-  const taxes = await documentLineTaxes(documentId);
+  const lines = await documentLines(orgId, documentId);
+  const taxes = await documentLineTaxes(orgId, documentId);
 
   const booking = doc.booking_id
     ? await one<{ destination: string | null; package_name: string | null; status: string }>(
@@ -788,7 +788,7 @@ export async function payoutWorkbook(orgId: string, settlementId: string): Promi
   if (!settlement) return null;
 
   const docs = await settlementDocuments(orgId, settlementId);
-  const charges = await settlementCharges(settlementId);
+  const charges = await settlementCharges(orgId, settlementId);
 
   const forward: ItemRow[] = [];
   const returned: ItemRow[] = [];
@@ -852,8 +852,8 @@ export async function documentListWorkbook(
 export async function documentWorkbook(orgId: string, docId: string): Promise<{ buffer: Buffer; doc: DocRow } | null> {
   const doc = await getDocument(orgId, docId);
   if (!doc) return null;
-  const lines = await documentLines(docId);
-  const taxes = await documentLineTaxes(docId);
+  const lines = await documentLines(orgId, docId);
+  const taxes = await documentLineTaxes(orgId, docId);
   const org = await seller(orgId);
   const meta = DOC_TYPES[doc.doc_type as DocType];
   const isBill = meta.side === 'supplier';

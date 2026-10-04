@@ -1,6 +1,7 @@
 import { ctx } from '@/server/bootstrap';
 import { msg, type SearchParams } from '@/lib/range';
 import { getConnection } from '@/server/crm/connection';
+import { mirrorCounts } from '@/server/crm/mirror';
 import { CRM_BACKEND_URL, CRM_CONFIGURED } from '@/server/crm/client';
 import { scalar, isDemoMode } from '@/server/db';
 import { crmConnectAction, crmSyncAction, crmDisconnectAction, crmForgetLinksAction } from '@/app/actions';
@@ -20,12 +21,21 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
 /**
- * Settings → CRM Sync.
+ * Settings → CRM Sync. The UNATTENDED half of the connection.
  *
- * The screen that stops this app inventing its own agency. Everything the
- * books are about — who the customers are, what was invoiced, what has been
- * paid — belongs to TripzoCRM; this is where an accountant points the ledger at
- * it and presses the button.
+ * -------------------------------------------------------------------------
+ * WHAT THIS SCREEN IS FOR, NOW THAT FETCHING DOES NOT NEED IT
+ * -------------------------------------------------------------------------
+ * An accountant who is signed in can already fetch from TripzoCRM → Invoices
+ * on their own token — they are authenticated as the same person, and asking
+ * them to configure a second credential for the same account would be a setup
+ * step with no purpose behind it.
+ *
+ * What a stored connection buys is the case where nobody is watching: a
+ * SERVICE identity, one per set of books, that still works at 3am and survives
+ * the person who configured it logging out. Where both exist the stored one is
+ * preferred, so a scheduled run and a manual one behave identically rather
+ * than differing by who happened to press the button.
  *
  * WHY THERE IS A PASSWORD BOX HERE AT ALL. The CRM backend authenticates a
  * PERSON, not an application: it resolves the caller's organisation from their
@@ -33,6 +43,14 @@ export const maxDuration = 60;
  * accountant signs in as themselves. The password is posted once, exchanged
  * for a token, and never stored — see src/server/crm/client.ts. What is kept
  * is the token and its refresh token, both revocable from the CRM.
+ *
+ * -------------------------------------------------------------------------
+ * AND THE DIRECTION IS ONE-WAY
+ * -------------------------------------------------------------------------
+ * Connecting grants this app READ access to the agency's CRM and nothing else.
+ * `crmFetch` has no method and no body parameter, so no screen, action or job
+ * in this product can alter a TripzoCRM record — the guarantee is structural
+ * rather than a promise on a settings page.
  */
 export default async function CrmSyncPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
   const s = await ctx();
@@ -43,15 +61,23 @@ export default async function CrmSyncPage({ searchParams }: { searchParams: Prom
   const imported = {
     partners: await scalar("SELECT COUNT(*) FROM crm_links WHERE org_id=? AND kind='partner'", s.orgId),
     bookings: await scalar("SELECT COUNT(*) FROM crm_links WHERE org_id=? AND kind='booking'", s.orgId),
-    documents: await scalar("SELECT COUNT(*) FROM crm_links WHERE org_id=? AND kind='document'", s.orgId),
-    payments: await scalar("SELECT COUNT(*) FROM crm_links WHERE org_id=? AND kind='payment'", s.orgId),
   };
+  /*
+   * FETCHED AND DRAFTED ARE TWO DIFFERENT NUMBERS, and showing only one of them
+   * is how an invoice goes missing quietly. "Fetched" counts what this database
+   * holds a copy of; "in the books" counts what became a document. The gap
+   * between them is sales that are in no balance, no report and no return — so
+   * it is the figure this card leads with rather than one somebody has to
+   * subtract.
+   */
+  const crm = await mirrorCounts(s.orgId);
+  const waiting = crm.invoices - crm.imported;
 
   return (
     <>
       <PageHeader
         title="CRM Sync"
-        subtitle="Pull this agency's real customers, suppliers, trips, invoices and receipts from TripzoCRM as DRAFTS. A sync types; an accountant posts."
+        subtitle="A stored, unattended connection to TripzoCRM. Read-only over there; drafts over here. A fetch types, an accountant posts."
         accent="var(--color-sec-settings)"
         actions={<LinkButton href="/settings">Back to settings</LinkButton>}
       />
@@ -95,7 +121,7 @@ export default async function CrmSyncPage({ searchParams }: { searchParams: Prom
 
               <div className="mt-5 flex flex-wrap items-center gap-2">
                 <form action={crmSyncAction}>
-                  <button className={btn.primary}>Sync now</button>
+                  <button className={btn.primary}>Fetch &amp; import now</button>
                 </form>
                 <form action={crmDisconnectAction}>
                   <button className={btn.ghost}>Disconnect</button>
@@ -103,17 +129,26 @@ export default async function CrmSyncPage({ searchParams }: { searchParams: Prom
               </div>
 
               <p className="mt-3 text-[12px] text-ink-faint">
-                A sync imports what is not already here and leaves what is. Re-running it is safe —
-                every CRM record is matched to what it became last time, so nothing arrives twice.
+                A fetch copies every CRM invoice, line and receipt into this database and drafts a
+                document for whatever is not in the books yet. Re-running it is safe: a record
+                already imported is matched to what it became and skipped, so nothing arrives twice
+                — and a doubled posting is the one mistake that leaves a ledger balanced and wrong.
               </p>
-              <div className="mt-4">
+              <div className="mt-4 space-y-3">
                 <Banner tone="info">
-                  <strong>A sync posts nothing.</strong> Invoices and receipts land as drafts in{' '}
+                  <strong>A fetch posts nothing.</strong> Invoices and receipts land as drafts in{' '}
                   <a href="/accounting/review" className="font-bold text-brand hover:underline">
                     Accounting → Review &amp; Post
                   </a>
-                  , where you check the accounts, the tax and the trip each one is tagged to, and post
-                  it yourself. Until you do, none of it is in a balance, a report or a return.
+                  , where you check the accounts, the tax and the trip each one is tagged to, and
+                  post it yourself. Until you do, none of it is in a balance, a report or a return.
+                </Banner>
+                <Banner tone="ok">
+                  <strong>Nothing is ever written to TripzoCRM.</strong> This connection is
+                  read-only by construction — the CRM client has no method or body parameter, so no
+                  screen, action or scheduled job in this product can change an invoice, a receipt or
+                  a status over there. Every edit happens on the ledger document in this app&rsquo;s own
+                  database.
                 </Banner>
               </div>
             </Card>
@@ -134,50 +169,78 @@ export default async function CrmSyncPage({ searchParams }: { searchParams: Prom
             </Card>
           )}
 
-          <Card title="What a sync brings across">
+          <Card title="What a fetch brings across">
             <ol className="space-y-3 text-[13.5px]">
               <Step n={1} title="The agency">
                 Its name replaces whatever this app was seeded with — that is the string on the
-                masthead and every report header.
+                masthead and every report header. Checked first against the agency these books
+                belong to: a token resolving to a different agency aborts the run before a single
+                record is read.
               </Step>
               <Step n={2} title="Suppliers and leads">
                 Suppliers become payable partners; leads become customers. A lead that has reached a
-                trip also becomes a booking, with the analytic account that lets costs be tagged to it.
+                trip also becomes a booking, with the analytic account that lets costs be tagged to
+                it.
               </Step>
-              <Step n={3} title="Invoices, as drafts">
-                Posted and sent CRM invoices only. A CRM draft is a proposal and a cancelled invoice
-                never happened; neither belongs in a ledger, and both are counted as skipped rather
-                than quietly dropped. What does come across arrives with the customer, the trip, the
-                dates, the lines and the amounts already filled in — and sits in Review &amp; Post
-                until you read it.
+              <Step n={3} title="Every invoice, copied into this database">
+                Header, lines, receipts and the whole raw payload, in paise, with the moment it was
+                read. This is the copy the books are drafted from and the copy they keep answering
+                for — a figure already in a filed return must not move because somebody edited a row
+                in the CRM afterwards.
               </Step>
-              <Step n={4} title="Receipts, as drafts">
-                Each payment arrives unposted, with the invoice it was taken on written into its
-                note. Post the invoice, post the receipt, then allocate the one to the other — three
-                deliberate acts, because a debtor that clears itself is a debtor nobody checked.
+              <Step n={4} title="Documents, as drafts">
+                Everything except a cancelled invoice. A CRM draft is imported too, flagged as one:
+                an agent raises the invoice over there with no books fields on it at all, and
+                completing it here is the work. Each one arrives with the customer, the trip, the
+                dates, the lines, the amounts, the place of supply and the GSTIN already filled in,
+                and the revenue account and GST rate inferred per line where they could be.
               </Step>
-              <Step n={5} title="Nothing else, ever">
-                No journal entry, no tax posting and no balance moves because of a sync. The only
-                thing that writes to these books is somebody pressing Post.
+              <Step n={5} title="Receipts and advances, as drafts">
+                A payment dated before its invoice is an <strong>advance</strong>: section 13(2)
+                makes the GST on it due in the month the money arrived, so it is drafted on Customer
+                Advances with the tax backed out of it. One dated on or after the invoice is an
+                ordinary receipt. The CRM draws no distinction, so this does — once, at fetch time,
+                written down rather than re-derived later.
+              </Step>
+              <Step n={6} title="Nothing else, ever">
+                No journal entry, no tax posting and no balance moves because of a fetch. The only
+                thing that writes to these books is somebody pressing Post. And nothing at all is
+                written to TripzoCRM.
               </Step>
             </ol>
           </Card>
         </div>
 
         <div className="space-y-5">
-          <Card title="Imported so far" subtitle="Records this app has linked to a CRM record.">
+          <Card title="Fetched and drafted" subtitle="What this database holds, and how much of it has reached the books.">
             <div className="grid grid-cols-2 gap-3">
+              <StatTile label="Invoices fetched" value={String(crm.invoices)} />
+              <StatTile label="In the books" value={String(crm.imported)}
+                tone={waiting > 0 ? 'warn' : 'positive'}
+                hint={waiting > 0 ? `${waiting} still waiting` : undefined} />
+              <StatTile label="Receipts fetched" value={String(crm.payments)} />
+              <StatTile label="Receipts drafted" value={String(crm.paid_imported)} />
               <StatTile label="Partners" value={String(imported.partners)} />
               <StatTile label="Bookings" value={String(imported.bookings)} />
-              <StatTile label="Invoices" value={String(imported.documents)} />
-              <StatTile label="Payments" value={String(imported.payments)} />
             </div>
+            {waiting > 0 && (
+              <p className="mt-3 text-[12px] text-ink-faint">
+                {waiting} fetched invoice(s) have no document behind them, so those sales are in no
+                balance and no return.{' '}
+                <a href="/crm/invoices" className="font-bold text-brand hover:underline">
+                  See which, and why
+                </a>
+                .
+              </p>
+            )}
           </Card>
 
           <Card title="Clear import history">
             <p className="mb-3 text-[13px] text-ink-muted">
-              Forgets which CRM record became which local record, so the next sync imports everything
-              again.
+              Forgets which CRM record became which local record, so the next fetch imports
+              everything again. The copies of the CRM&rsquo;s own invoices are kept — what the CRM said
+              is a reading of history and is worth having whatever happens to the books drafted from
+              it.
             </p>
             {/*
               Said plainly, because the obvious assumption about a button like

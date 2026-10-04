@@ -4,8 +4,20 @@
     {
       "name": "tripzo-finance",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
       "port": 3100
+    },
+    {
+      "name": "tripzo-finance-demo",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev:demo"
+      ],
+      "port": 3101
     }
   ]
 }

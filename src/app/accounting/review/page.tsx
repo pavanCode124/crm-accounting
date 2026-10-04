@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { ctx } from '@/server/bootstrap';
-import { msg, type SearchParams } from '@/lib/range';
+import { msg, one, type SearchParams } from '@/lib/range';
 import { all } from '@/server/db';
 import { fmtDate } from '@/lib/accounting';
 import { listDocuments } from '@/server/accounting/documents';
@@ -11,7 +11,7 @@ import {
 } from '@/app/actions';
 import {
   PageHeader, Card, Banner, Table, Th, Td, Money, Chip, EmptyState,
-  RefLink, LinkButton, StatTile, btn,
+  RefLink, LinkButton, StatTile, btn, inputClass,
 } from '@/components/ui';
 
 export const dynamic = 'force-dynamic';
@@ -36,14 +36,54 @@ export const dynamic = 'force-dynamic';
  * documents nobody read, which is the exact thing this screen was built to
  * prevent.
  */
+/**
+ * THE FILTER IS APPLIED IN MEMORY, AND THAT IS THE RIGHT PLACE FOR IT HERE.
+ *
+ * Everywhere else in this product a list filters in SQL, because a list can be
+ * a year of postings and no screen should read a year to show thirty rows.
+ * This queue is the opposite shape: it is bounded by its own meaning. A draft
+ * is work somebody has not finished, so a healthy ledger holds a handful and an
+ * unhealthy one holds a few hundred — the page already caps each section at 300
+ * and the four queries run regardless, because the tiles count all of it.
+ *
+ * Filtering those few hundred rows in memory therefore costs nothing and buys
+ * two things SQL could not give without four more parameterised queries: one
+ * search box that spans FOUR UNRELATED TABLES whose "name" column is called
+ * something different in each (`partner_name`, `employee_name`, `narration`),
+ * and a `source` filter that exists only as a substring of a note.
+ */
+function matcher(q: string) {
+  const needle = q.trim().toLowerCase();
+  return (...fields: Array<string | null | undefined>) =>
+    !needle || fields.some((f) => (f ?? '').toLowerCase().includes(needle));
+}
+
+/** Within the window, when one is given. An open end means no bound on that side. */
+function inWindow(date: string, from?: string, to?: string): boolean {
+  if (from && date < from) return false;
+  if (to && date > to) return false;
+  return true;
+}
+
 export default async function ReviewPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
   const s = await ctx();
-  const m = await msg(await searchParams);
+  const params = await searchParams;
+  const m = await msg(params);
 
-  const docs = await listDocuments(s.orgId, { state: 'draft', limit: 300 });
-  const payments = await listPayments(s.orgId, { state: 'draft', limit: 300 });
-  const expenses = await listExpenses(s.orgId, { state: 'submitted', limit: 300 });
-  const entries = await all<{
+  const q = (await one(params, 'q') ?? '').trim();
+  const kind = await one(params, 'kind') ?? '';
+  const source = await one(params, 'source') ?? '';
+  const from = await one(params, 'from') ?? '';
+  const to = await one(params, 'to') ?? '';
+  const filtered = Boolean(q || kind || source || from || to);
+  const hit = matcher(q);
+  /* A section is shown unless the Kind filter names a different one. */
+  const wants = (k: string) => !kind || kind === k;
+
+  const allDocs = await listDocuments(s.orgId, { state: 'draft', limit: 300 });
+  const allPayments = await listPayments(s.orgId, { state: 'draft', limit: 300 });
+  const allExpenses = await listExpenses(s.orgId, { state: 'submitted', limit: 300 });
+  const allEntries = await all<{
     id: string; entry_date: string; reference: string | null; narration: string | null;
     journal_code: string; debit: number; credit: number;
   }>(
@@ -59,7 +99,36 @@ export default async function ReviewPage({ searchParams }: { searchParams: Promi
     s.orgId,
   );
 
+  /*
+   * `source` is asked of DOCUMENTS ONLY, because it is only a document that can
+   * have come from the CRM — the importer writes drafts and nothing else. Asked
+   * of the other three it would be a filter that silently empties them, so
+   * instead it narrows them to nothing only when "CRM import" is chosen, which
+   * is the honest answer: there are no imported receipts or expense claims.
+   */
+  const docs = allDocs.filter((d) =>
+    wants('documents')
+    && inWindow(d.doc_date, from, to)
+    && hit(d.partner_name, d.number, d.booking_ref, d.note, d.doc_type)
+    && (!source || (source === 'crm') === Boolean(d.note?.includes('Imported from TripzoCRM'))));
+
+  const payments = allPayments.filter((p) =>
+    wants('payments') && source !== 'crm'
+    && inWindow(p.pay_date, from, to)
+    && hit(p.partner_name, p.number, p.note, p.reference));
+
+  const expenses = allExpenses.filter((e) =>
+    wants('expenses') && source !== 'crm'
+    && inWindow(e.expense_date, from, to)
+    && hit(e.employee_name, e.number, e.description));
+
+  const entries = allEntries.filter((e) =>
+    wants('entries') && source !== 'crm'
+    && inWindow(e.entry_date, from, to)
+    && hit(e.narration, e.reference, e.journal_code));
+
   const total = docs.length + payments.length + expenses.length + entries.length;
+  const grandTotal = allDocs.length + allPayments.length + allExpenses.length + allEntries.length;
 
   return (
     <>
@@ -72,21 +141,93 @@ export default async function ReviewPage({ searchParams }: { searchParams: Promi
       {m.error && <Banner tone="error">{m.error}</Banner>}
       {m.ok && <Banner tone="ok">{m.ok}</Banner>}
 
+      <form action="/accounting/review" method="get"
+        className="no-print mb-5 flex flex-wrap items-end gap-2 rounded-card border border-line bg-surface px-4 py-3">
+        <label className="block min-w-[220px] flex-1">
+          <span className="mb-1 block text-[11px] font-bold uppercase tracking-[0.06em] text-ink-faint">Search</span>
+          <input name="q" defaultValue={q} placeholder="Partner, number, narration, employee, trip…"
+            className={inputClass} />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-[11px] font-bold uppercase tracking-[0.06em] text-ink-faint">Kind</span>
+          <select name="kind" defaultValue={kind} className={`${inputClass} w-[190px]`}>
+            <option value="">Everything waiting</option>
+            <option value="documents">Invoices &amp; bills</option>
+            <option value="payments">Receipts &amp; payments</option>
+            <option value="expenses">Expense claims</option>
+            <option value="entries">Journal entries</option>
+          </select>
+        </label>
+        {/*
+          * WHOSE WORK IS THIS, which is the division the page's own note
+          * describes: an accountant on this queue is doing two different jobs,
+          * checking their own half-finished work and checking what another
+          * system claimed. The two want different attention, and until now the
+          * only way to separate them was to read the column.
+          */}
+        <label className="block">
+          <span className="mb-1 block text-[11px] font-bold uppercase tracking-[0.06em] text-ink-faint">Source</span>
+          <select name="source" defaultValue={source} className={`${inputClass} w-[160px]`}>
+            <option value="">Any source</option>
+            <option value="crm">CRM import</option>
+            <option value="local">Entered here</option>
+          </select>
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-[11px] font-bold uppercase tracking-[0.06em] text-ink-faint">From</span>
+          <input type="date" name="from" defaultValue={from} className={`${inputClass} w-[160px]`} />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-[11px] font-bold uppercase tracking-[0.06em] text-ink-faint">To</span>
+          <input type="date" name="to" defaultValue={to} className={`${inputClass} w-[160px]`} />
+        </label>
+        <button className={btn.ghost}>Filter</button>
+        {filtered && <Link href="/accounting/review" className={btn.ghost}>Clear</Link>}
+      </form>
+
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
-        <StatTile label="Waiting in total" value={String(total)} tone={total ? 'warn' : 'positive'} />
+        {/*
+          * THE TILES COUNT THE FILTERED VIEW, and say so when that is not the
+          * whole queue. A tile that kept showing the grand total beside a
+          * filtered table would be the one number on this page an accountant
+          * uses to decide they are finished — "waiting in total" reading 40
+          * above four rows is how a month end gets called clean while thirty-six
+          * drafts sit behind a filter nobody cleared.
+          */}
+        <StatTile
+          label={filtered ? `Matching (of ${grandTotal})` : 'Waiting in total'}
+          value={String(total)}
+          tone={total ? 'warn' : 'positive'}
+        />
         <StatTile label="Invoices & bills" value={String(docs.length)} />
         <StatTile label="Receipts & payments" value={String(payments.length)} />
         <StatTile label="Expense claims" value={String(expenses.length)} />
         <StatTile label="Journal entries" value={String(entries.length)} />
       </div>
 
+      {/*
+        * TWO DIFFERENT EMPTIES, because they mean opposite things. An empty
+        * queue is the goal and reads as congratulation; an empty FILTER is a
+        * dead end, and offering "Raise an invoice" there would answer a
+        * question nobody asked while hiding the thirty drafts one click away.
+        */}
       {total === 0 && (
         <Card>
-          <EmptyState
-            title="Nothing is waiting."
-            hint="Every document, receipt, claim and entry raised so far has been posted or set aside. This is what a clean month end looks like."
-            action={<LinkButton href="/sales/invoices/new" variant="primary">Raise an invoice</LinkButton>}
-          />
+          {filtered ? (
+            <EmptyState
+              title="Nothing matches that filter."
+              hint={grandTotal
+                ? `${grandTotal} item(s) are still waiting under a different search.`
+                : 'Nothing is waiting at all, filtered or not.'}
+              action={<LinkButton href="/accounting/review" variant="primary">Clear the filter</LinkButton>}
+            />
+          ) : (
+            <EmptyState
+              title="Nothing is waiting."
+              hint="Every document, receipt, claim and entry raised so far has been posted or set aside. This is what a clean month end looks like."
+              action={<LinkButton href="/sales/invoices/new" variant="primary">Raise an invoice</LinkButton>}
+            />
+          )}
         </Card>
       )}
 
