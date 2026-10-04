@@ -2,9 +2,8 @@ import Link from 'next/link';
 import { DOC_TYPES, fmtDate, titleise, isoDate, daysBetween } from '@/lib/accounting';
 import { stateName } from '@/server/accounting/organisation';
 import { fmt, qtyFromMilli, bpsToPct } from '@/lib/money';
-import {
-  getDocument, documentLines, documentLineTaxes, costsAgainstInvoice, costOfLinked,
-} from '@/server/accounting/documents';
+import { getDocument, documentLines, documentLineTaxes } from '@/server/accounting/documents';
+import { saleMargin, saleCosts } from '@/server/accounting/analytics';
 import {
   allocationsFor, listPayments, openInvoicesFor, pendingReceiptsFor,
 } from '@/server/accounting/payments';
@@ -117,9 +116,8 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
    * and the comparison is net of tax on both sides: output GST is the
    * government's and input GST is reclaimed, so neither belongs in a margin.
    */
-  const linkedCosts = doc.doc_type === 'out_invoice' ? await costsAgainstInvoice(orgId, docId) : [];
-  const linkedCost = costOfLinked(linkedCosts);
-  const grossMargin = doc.untaxed - linkedCost;
+  const margin = doc.doc_type === 'out_invoice' ? await saleMargin(orgId, docId) : null;
+  const linkedCosts = margin ? await saleCosts(orgId, docId) : [];
   const openInvoices = isCreditNote && doc.state === 'posted' && doc.residual > 0 && doc.partner_id
     ? await openInvoicesFor(orgId, doc.partner_id, isBill ? 'in_invoice' : 'out_invoice')
     : [];
@@ -337,84 +335,122 @@ export async function DocumentDetail({ orgId, docId, basePath, role, message }: 
           {/*
             THE MARGIN ON THIS SALE, BUILT FROM DOCUMENTS RATHER THAN ASSERTED.
 
-            Every row is a vendor bill somebody recorded against this invoice,
-            so the figure at the bottom is not an estimate and not a second set
-            of books — it is the same documents the ledger holds, selected by
-            the link the purchase clerk made when they recorded the cost.
+            Every row is a cost somebody recorded against this invoice — a
+            supplier's bill, a guide an employee paid out of pocket, the
+            commission owed to whoever closed it. The figure at the bottom is
+            not an estimate and not a second set of books: it is the same
+            records the ledger holds, selected by the link made when each cost
+            was entered.
+
+            ALL THREE KINDS, NOT JUST BILLS. A margin built from a third of the
+            costs is worse than no margin — it is confidently wrong, and always
+            in the flattering direction.
 
             NET OF TAX ON BOTH SIDES. Output GST is collected for the
             government and input GST is reclaimed from it; a margin that
             counted either would move with the tax rate rather than with the
-            trading. So the sale's taxable value is compared against the bills'
-            taxable values, and the tax column is shown beside them for the
-            reader rather than inside the arithmetic.
+            trading. So the sale's taxable value is compared against the costs'
+            taxable values, and the tax column sits beside them for the reader
+            rather than inside the arithmetic.
 
-            A DRAFTED BILL IS LISTED BUT NOT COUNTED, and the row says so: it
+            A DRAFTED COST IS LISTED BUT NOT COUNTED, and the note says so: it
             is a cost somebody knows about and the ledger does not, which is
-            worth seeing on this card precisely because it is the figure that
-            is about to change the margin.
+            worth seeing here precisely because it is what the margin is about
+            to become.
           */}
-          {doc.doc_type === 'out_invoice' && linkedCosts.length > 0 && (
+          {margin && (
             <Card title="Spent against this sale"
-              subtitle="Vendor bills recorded against this invoice. Net of tax on both sides — input GST is reclaimed, so it is not a cost."
+              subtitle="Every vendor bill, staff claim and agent commission recorded against this invoice. Net of tax on both sides — input GST is reclaimed, so it is not a cost."
               padded={false}>
-              <Table>
-                <thead>
-                  <tr>
-                    <Th>Date</Th><Th>Bill</Th><Th>Supplier</Th>
-                    <Th align="right">Cost</Th><Th align="right">Input GST</Th><Th>State</Th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {linkedCosts.map((c) => (
-                    <tr key={c.id} className="hover:bg-canvas">
-                      <Td><span className="num !text-left">{fmtDate(c.doc_date)}</span></Td>
-                      <Td>
-                        <Link href={`/purchases/bills/${c.id}`} className="font-semibold text-brand hover:underline">
-                          {c.number ?? '(draft)'}
-                        </Link>
-                        {c.doc_type === 'in_refund' && (
-                          <span className="text-ink-faint"> · debit note</span>
-                        )}
-                      </Td>
-                      <Td><span className="text-ink-muted">{c.partner_name}</span></Td>
-                      <Td align="right">
-                        <Money value={c.doc_type === 'in_refund' ? -c.untaxed : c.untaxed} />
-                      </Td>
-                      <Td align="right"><Money value={c.tax_total} /></Td>
-                      <Td><Chip state={c.state} /></Td>
+              {linkedCosts.length === 0 ? (
+                <div className="px-5 py-6 text-[13px] text-ink-muted">
+                  Nothing has been recorded against this sale yet, so its margin is its whole
+                  value. A cost reaches this card by naming this invoice on the vendor bill, the
+                  expense claim or the commission — the field is on all three forms.
+                </div>
+              ) : (
+                <Table>
+                  <thead>
+                    <tr>
+                      <Th>Date</Th><Th>Kind</Th><Th>Reference</Th><Th>Paid to</Th>
+                      <Th align="right">Cost</Th><Th align="right">Input GST</Th><Th>State</Th>
                     </tr>
-                  ))}
-                </tbody>
-                <tfoot>
-                  <tr>
-                    <Td colSpan={3}><span className="text-ink-muted">Sale, net of GST</span></Td>
-                    <Td align="right"><Money value={doc.untaxed} /></Td>
-                    <Td colSpan={2} />
-                  </tr>
-                  <tr>
-                    <Td colSpan={3}><span className="text-ink-muted">Cost of sale (posted bills)</span></Td>
-                    <Td align="right"><Money value={linkedCost} /></Td>
-                    <Td colSpan={2} />
-                  </tr>
-                  <tr className="bg-brand-soft">
-                    <Td colSpan={3}><span className="font-extrabold">Gross margin</span></Td>
-                    <Td align="right"><Money value={grossMargin} bold dash={false} /></Td>
-                    <Td colSpan={2}>
-                      <span className="font-semibold">
-                        {doc.untaxed > 0
-                          ? `${((grossMargin / doc.untaxed) * 100).toFixed(1)}%`
-                          : '—'}
-                      </span>
-                    </Td>
-                  </tr>
-                </tfoot>
-              </Table>
-              {linkedCosts.some((c) => c.state !== 'posted') && (
+                  </thead>
+                  <tbody>
+                    {linkedCosts.map((c) => (
+                      <tr key={`${c.kind}-${c.id}`} className="hover:bg-canvas">
+                        <Td><span className="num !text-left">{fmtDate(c.on_date.slice(0, 10))}</span></Td>
+                        <Td>
+                          <span className="text-ink-muted">
+                            {c.kind === 'bill' ? 'Vendor bill'
+                              : c.kind === 'expense' ? 'Staff claim' : 'Commission'}
+                          </span>
+                        </Td>
+                        <Td>
+                          {/*
+                            Only a bill has a screen of its own worth linking
+                            to per row; a claim and a commission live on their
+                            list pages, so those read as plain references
+                            rather than as links that go somewhere unhelpful.
+                          */}
+                          {c.kind === 'bill' ? (
+                            <Link href={`/purchases/bills/${c.id}`}
+                              className="font-semibold text-brand hover:underline">
+                              {c.number ?? '(draft)'}
+                            </Link>
+                          ) : (
+                            <span className="font-semibold">
+                              {c.number ?? (c.description ?? '—')}
+                            </span>
+                          )}
+                          {c.amount < 0 && <span className="text-ink-faint"> · credit</span>}
+                        </Td>
+                        <Td><span className="text-ink-muted">{c.party ?? '—'}</span></Td>
+                        <Td align="right"><Money value={c.amount} /></Td>
+                        <Td align="right"><Money value={c.tax_amount} /></Td>
+                        <Td><Chip state={c.state} /></Td>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot>
+                    <tr>
+                      <Td colSpan={4}><span className="text-ink-muted">Sale, net of GST</span></Td>
+                      <Td align="right"><Money value={margin.revenue} /></Td>
+                      <Td colSpan={2} />
+                    </tr>
+                    {margin.credited > 0 && (
+                      <tr>
+                        <Td colSpan={4}>
+                          <span className="text-[11.5px] text-ink-faint">
+                            after {fmt(margin.credited)} credited back on this sale
+                          </span>
+                        </Td>
+                        <Td colSpan={3} />
+                      </tr>
+                    )}
+                    <tr>
+                      <Td colSpan={4}><span className="text-ink-muted">Cost of sale (posted only)</span></Td>
+                      <Td align="right"><Money value={margin.cost} /></Td>
+                      <Td colSpan={2} />
+                    </tr>
+                    <tr className="bg-brand-soft">
+                      <Td colSpan={4}><span className="font-extrabold">Gross margin</span></Td>
+                      <Td align="right"><Money value={margin.profit} bold dash={false} /></Td>
+                      <Td colSpan={2}>
+                        <span className="font-semibold">
+                          {margin.revenue > 0 ? `${margin.margin.toFixed(1)}%` : '—'}
+                        </span>
+                      </Td>
+                    </tr>
+                  </tfoot>
+                </Table>
+              )}
+              {margin.draft_cost > 0 && (
                 <p className="px-5 py-3 text-[12px] text-ink-faint">
-                  A bill still in draft is listed above and is NOT in the cost figure — it has not
-                  reached the ledger, so counting it would make this margin disagree with the P&amp;L.
-                  Post it and the margin moves with it.
+                  {fmt(margin.draft_cost)} of the above is still in draft and is NOT in the cost
+                  figure — it has not reached the ledger, so counting it would make this margin
+                  disagree with the P&amp;L. Post it and the margin moves with it, to{' '}
+                  {fmt(margin.profit - margin.draft_cost)}.
                 </p>
               )}
             </Card>

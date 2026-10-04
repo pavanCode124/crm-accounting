@@ -1,6 +1,6 @@
 import { ctx } from '@/server/bootstrap';
 import { msg, one, type SearchParams } from '@/lib/range';
-import { accountOptions, journalOptions, analyticOptions, bookingOptions } from '@/server/options';
+import { accountOptions, journalOptions, analyticOptions, bookingOptions, saleOptions } from '@/server/options';
 import { listTaxes } from '@/server/accounting/tax';
 import { isoDate } from '@/lib/accounting';
 import { saveExpenseAction, employeeAdvanceAction } from '@/app/actions';
@@ -28,6 +28,7 @@ export default async function NewExpensePage({ searchParams }: { searchParams: P
   const cashJournals = await journalOptions(s.orgId, ['bank', 'cash']);
   const analytics = await analyticOptions(s.orgId);
   const bookings = await bookingOptions(s.orgId);
+  const sales = await saleOptions(s.orgId);
   const taxes = await listTaxes(s.orgId, 'purchase');
   const today = isoDate();
 
@@ -86,16 +87,39 @@ export default async function NewExpensePage({ searchParams }: { searchParams: P
                 </select>
               </Field>
 
+              {/*
+                THE SALE COMES FIRST, AND IT IS THE FIELD THAT MATTERS.
+
+                A guide paid in cash on day three is a cost of the package that
+                was sold, and it reaches that package's margin only if somebody
+                says which package. The Trip field below used to be the only
+                way to say it — and a trip is a CRM booking, which exists only
+                for a lead carrying a package number, so for an agency without
+                those it could not be filled and the cost reached nothing.
+
+                Naming the invoice fills the trip in too, on the server, where
+                the invoice has one. The two fields under it are kept for the
+                agencies that work in bookings and for a cost that belongs to a
+                trip but to no single invoice on it.
+              */}
+              <Field label="Against customer invoice"
+                hint="The sale this was spent on. It is what puts the cost into that sale's margin — and into its trip's, where there is one.">
+                <select name="linked_invoice_id" className={inputClass} defaultValue="">
+                  <option value="">— not against a particular sale</option>
+                  {sales.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}
+                </select>
+              </Field>
+
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="Trip" hint="Tagging it here is what puts the cost into the trip's margin.">
+                <Field label="Trip" hint="Only needed when the sale above does not already say which trip, or there is no invoice.">
                   <select name="booking_id" className={inputClass} defaultValue="">
-                    <option value="">—</option>
+                    <option value="">— from the invoice</option>
                     {bookings.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}
                   </select>
                 </Field>
                 <Field label="Analytic">
                   <select name="analytic_id" className={inputClass} defaultValue="">
-                    <option value="">—</option>
+                    <option value="">— from the invoice</option>
                     {analytics.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
                   </select>
                 </Field>

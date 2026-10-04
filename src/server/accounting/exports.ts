@@ -950,6 +950,8 @@ interface LedgerBreakup {
   supplierCost: number;
   supplierTax: number;
   returnSupplierCost: number;
+  /** Expense claims recorded against these sales — staff spend is a cost too. */
+  staffCost: number;
   commission: number;
   commissionGst: number;
   tcs: number;
@@ -964,7 +966,7 @@ async function ledgerBreakup(
 ): Promise<LedgerBreakup> {
   const out: LedgerBreakup = {
     forwardGross: 0, returnGross: 0, forwardTax: 0, returnTax: 0,
-    supplierCost: 0, supplierTax: 0, returnSupplierCost: 0,
+    supplierCost: 0, supplierTax: 0, returnSupplierCost: 0, staffCost: 0,
     commission: 0, commissionGst: 0, tcs: 0, tds: 0, received: 0, outstanding: 0,
   };
   const every = [...docIds, ...returnIds];
@@ -1011,26 +1013,37 @@ async function ledgerBreakup(
     }
 
     /*
-     * AGENT COMMISSION ON THE TRIPS THESE SALES BELONG TO.
+     * WHAT STAFF SPENT ON THESE SALES, out of pocket or on the company card.
      *
-     * Reached through the booking, because that is what a commission is
-     * recorded against: an agent earns on the trip, not on the piece of paper
-     * it was invoiced on. A sale with no booking behind it contributes no
-     * commission, which is exact rather than approximate — there is no
-     * commission row to find.
+     * A claim is as real a cost of a package as the hotel's invoice, and
+     * leaving it out of a payout statement overstates what the agency kept by
+     * exactly the amount its own people spent delivering the trip. Posted and
+     * paid only; a claim awaiting approval is not yet a cost.
+     */
+    const expenses = await one<{ amount: number }>(
+      `SELECT COALESCE(SUM(e.amount),0) AS amount FROM expenses e
+        WHERE e.org_id = ? AND e.state IN ('posted','paid')
+          AND e.linked_invoice_id IN (${marks(docIds)})`,
+      orgId, ...docIds,
+    );
+    out.staffCost = expenses?.amount ?? 0;
+
+    /*
+     * AGENT COMMISSION ON THESE SALES.
      *
-     * DISTINCT ON THE BOOKING, not on the invoice. Two invoices raised against
-     * one trip must not count the agent's commission twice, which is precisely
-     * what a plain join through `documents` does.
+     * Read off `linked_invoice_id`, which is what a commission now names. It
+     * used to be reached through the BOOKING — an agent earns on the trip, ran
+     * the reasoning — and that returned nothing at all for an agency with no
+     * bookings, which is the same blind spot that left Trip Profitability
+     * empty. A commission recorded against a trip rather than a sale is picked
+     * up by the trip reports and is deliberately not spread across that trip's
+     * invoices here: splitting one agent's commission over three invoices by
+     * some rule nobody chose would be arithmetic the statement cannot defend.
      */
     const commission = await one<{ amount: number }>(
-      `SELECT COALESCE(SUM(c.amount),0) AS amount
-         FROM commissions c
+      `SELECT COALESCE(SUM(c.amount),0) AS amount FROM commissions c
         WHERE c.org_id = ? AND c.state IN ('posted','paid')
-          AND c.booking_id IN (
-            SELECT DISTINCT booking_id FROM documents
-             WHERE id IN (${marks(docIds)}) AND booking_id IS NOT NULL
-          )`,
+          AND c.linked_invoice_id IN (${marks(docIds)})`,
       orgId, ...docIds,
     );
     out.commission = commission?.amount ?? 0;
@@ -1109,16 +1122,21 @@ function ledgerBreakupSheet(b: LedgerBreakup, label: string, period: string | nu
       label: '  Input GST on supplier bills (reclaimed, not a cost) (Rs)',
       forward: b.supplierTax, returned: 0,
     },
-    { sNo: 4, label: '  Agent Commission (Rs)', forward: b.commission, returned: 0, section: 'deduction' },
+    {
+      sNo: 4, section: 'deduction',
+      label: '  Staff Claims on these sales (Rs)',
+      forward: b.staffCost, returned: 0,
+    },
+    { sNo: 5, label: '  Agent Commission (Rs)', forward: b.commission, returned: 0, section: 'deduction' },
     { sNo: null, label: '  GST on Commission (Rs)', forward: b.commissionGst, returned: 0, section: 'deduction' },
-    { sNo: 5, label: '  TCS Charge (Rs)', forward: b.tcs, returned: 0, section: 'deduction' },
-    { sNo: 6, label: '  TDS Charge (194O & Q)(Rs)', forward: b.tds, returned: 0, section: 'deduction' },
+    { sNo: 6, label: '  TCS Charge (Rs)', forward: b.tcs, returned: 0, section: 'deduction' },
+    { sNo: 7, label: '  TDS Charge (194O & Q)(Rs)', forward: b.tds, returned: 0, section: 'deduction' },
   ];
 
   const numbered = (rows: BreakupLine[]) => rows.filter((l) => l.sNo !== null).length;
-  const additions = nilBlock('additions', 6);
-  const deductions = nilBlock('deductions', 6 + numbered(additions));
-  const oneTime = nilBlock('one_time', 6 + numbered(additions) + numbered(deductions));
+  const additions = nilBlock('additions', 7);
+  const deductions = nilBlock('deductions', 7 + numbered(additions));
+  const oneTime = nilBlock('one_time', 7 + numbered(additions) + numbered(deductions));
 
   const signedForward = (rows: BreakupLine[]) =>
     rows.reduce((t, l) => t + (l.section === 'deduction' ? -l.forward : l.forward), 0);

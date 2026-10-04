@@ -179,7 +179,7 @@ export const NAV: NavSection[] = [
     key: 'analytics',
     label: 'Analytics',
     items: [
-      { label: 'Trip Profitability', href: '/analytics/trips', match: '/analytics/trips', cap: 'profitability.view', keywords: ['margin', 'trip margin', 'profit per trip', 'tour profit'] },
+      { label: 'Profitability', href: '/analytics/trips', match: '/analytics/trips', cap: 'profitability.view', keywords: ['margin', 'trip margin', 'profit per trip', 'profit per invoice', 'sale margin', 'tour profit', 'trip profitability'] },
       { label: 'Packages', href: '/analytics/packages', cap: 'profitability.view', keywords: ['package margin', 'itinerary profit'] },
       { label: 'Agents', href: '/analytics/agents', cap: 'profitability.view', keywords: ['agent performance', 'sales rep'] },
       { label: 'Cost Centres', href: '/analytics/cost-centres', cap: 'profitability.view', keywords: ['departments', 'branches', 'analytic'] },

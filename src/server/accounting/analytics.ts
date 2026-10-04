@@ -73,6 +73,232 @@ export async function analyticCostBreakdown(orgId: string, analyticId: string) {
 }
 
 // ---------------------------------------------------------------------------
+// Profitability per SALE — keyed on the customer invoice
+// ---------------------------------------------------------------------------
+
+/**
+ * ===========================================================================
+ * WHAT ONE SALE EARNED, AND WHAT IT COST TO DELIVER.
+ * ===========================================================================
+ * The analytic version above is the right answer for an agency that works in
+ * TRIPS: costs are tagged to a `bookings` row's analytic account, the margin
+ * is the general ledger sliced by that tag, and it reconciles to the P&L
+ * because it IS the P&L.
+ *
+ * It answers nothing at all for an agency that does not. A booking is created
+ * only for a CRM lead carrying a package number; an agency whose leads do not
+ * carry one has no bookings, therefore no trip analytic accounts, therefore no
+ * analytic distributions — and a profitability report that sums analytic
+ * distributions is empty however many invoices have been raised and however
+ * many supplier bills have been paid. That is not a reporting bug that can be
+ * fixed in the report: the unit it reports on does not exist in the data.
+ *
+ * THE INVOICE IS THE UNIT THAT ALWAYS EXISTS. The agency raised it — that is
+ * why the costs are being incurred — so every cost record can name it, and
+ * three of them now do: a vendor bill (`documents.linked_invoice_id`), an
+ * expense claim and an agent commission. Profit is revenue less those three.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS IS NOT A SECOND SET OF BOOKS
+ * ---------------------------------------------------------------------------
+ * Every figure below is read from the documents themselves — the same rows the
+ * trial balance is built from, selected by the link somebody made when they
+ * recorded the cost. Nothing is stored, nothing is cached, and editing an
+ * invoice changes this margin in the same instant it changes the P&L.
+ *
+ * It does NOT double-count against the analytic report. A sale attached to a
+ * trip appears in both, saying the same thing about the same rupees from two
+ * directions; the screen shows the analytic table and then the sales NOT
+ * attached to a trip, so nothing is added twice on one page.
+ *
+ * ---------------------------------------------------------------------------
+ * EVERY FIGURE IS NET OF TAX, ON BOTH SIDES
+ * ---------------------------------------------------------------------------
+ * Output GST is collected for the government and input GST is reclaimed from
+ * it. Neither is the agency's, and a margin that counted either would move
+ * with the tax rate rather than with the trading — which on an 18% book is the
+ * difference between a profitable package and a loss-making one. So `untaxed`
+ * is summed throughout, never `total`.
+ *
+ * ---------------------------------------------------------------------------
+ * POSTED ONLY, AND THE DRAFTS ARE COUNTED SEPARATELY
+ * ---------------------------------------------------------------------------
+ * A drafted bill is an intention, not a cost; including it would make a margin
+ * that moves when somebody opens a form. But an agency with eighteen drafted
+ * invoices and three posted ones needs to be told that, not shown an almost
+ * empty report — so what is excluded is counted and named rather than silently
+ * dropped. `draft_cost` is the same sum over unposted bills and claims, which
+ * is what the margin is ABOUT to become.
+ */
+export interface SaleProfit {
+  document_id: string;
+  number: string | null;
+  /** The CRM's own invoice number, which is the one an agent recognises. */
+  crm_number: string | null;
+  doc_date: string;
+  state: string;
+  partner_name: string | null;
+  booking_id: string | null;
+  booking_ref: string | null;
+  /** Net of GST and net of credit notes raised against the sale. */
+  revenue: number;
+  credited: number;
+  bill_cost: number;
+  expense_cost: number;
+  commission_cost: number;
+  cost: number;
+  profit: number;
+  margin: number;
+  /** Costs recorded but not yet posted — what the margin is about to become. */
+  draft_cost: number;
+  /** How much of the sale has actually been collected. */
+  received: number;
+  outstanding: number;
+}
+
+export async function saleProfitability(orgId: string, opts: {
+  from?: string; to?: string; documentId?: string; limit?: number;
+} = {}): Promise<SaleProfit[]> {
+  const clauses = ['d.org_id = ?', "d.doc_type = 'out_invoice'", "d.state <> 'cancelled'"];
+  const params: Array<string | number> = [orgId];
+  if (opts.documentId) { clauses.push('d.id = ?'); params.push(opts.documentId); }
+  if (opts.from) { clauses.push('d.doc_date >= ?'); params.push(opts.from); }
+  if (opts.to) { clauses.push('d.doc_date <= ?'); params.push(opts.to); }
+
+  /*
+   * CORRELATED SUBQUERIES RATHER THAN FOUR LEFT JOINS, and the reason is
+   * arithmetic rather than taste. Joining bills, expenses and commissions onto
+   * one invoice row multiplies them together — two bills and three claims
+   * produce six rows, and every figure on the invoice is then counted six
+   * times. A subquery per cost source is one scalar each, and cannot fan out.
+   *
+   * A CREDIT NOTE REDUCES REVENUE. `reversal_of` is what ties a note to the
+   * invoice it cancels, and a cancelled sale that still showed its full
+   * revenue beside its full cost would report a loss on a trip that never ran.
+   *
+   * A DEBIT NOTE REDUCES COST, for the mirror reason: the hotel refunded a
+   * room, and the trip did not bear it.
+   */
+  const rows = await all<Omit<SaleProfit, 'cost' | 'profit' | 'margin'>>(
+    `SELECT d.id AS document_id, d.number, ci.invoice_number AS crm_number,
+            d.doc_date, d.state, p.name AS partner_name,
+            d.booking_id, b.ref AS booking_ref,
+            d.untaxed
+              - COALESCE((SELECT SUM(n.untaxed) FROM documents n
+                           WHERE n.org_id = d.org_id AND n.reversal_of = d.id
+                             AND n.doc_type = 'out_refund' AND n.state = 'posted'), 0)
+              AS revenue,
+            COALESCE((SELECT SUM(n.untaxed) FROM documents n
+                       WHERE n.org_id = d.org_id AND n.reversal_of = d.id
+                         AND n.doc_type = 'out_refund' AND n.state = 'posted'), 0) AS credited,
+            COALESCE((SELECT SUM(CASE WHEN c.doc_type = 'in_refund' THEN -c.untaxed ELSE c.untaxed END)
+                        FROM documents c
+                       WHERE c.org_id = d.org_id AND c.linked_invoice_id = d.id
+                         AND c.doc_type IN ('in_invoice','in_refund') AND c.state = 'posted'), 0)
+              AS bill_cost,
+            COALESCE((SELECT SUM(e.amount) FROM expenses e
+                       WHERE e.org_id = d.org_id AND e.linked_invoice_id = d.id
+                         AND e.state IN ('posted','paid')), 0) AS expense_cost,
+            COALESCE((SELECT SUM(m.amount) FROM commissions m
+                       WHERE m.org_id = d.org_id AND m.linked_invoice_id = d.id
+                         AND m.state IN ('posted','paid')), 0) AS commission_cost,
+            COALESCE((SELECT SUM(c.untaxed) FROM documents c
+                       WHERE c.org_id = d.org_id AND c.linked_invoice_id = d.id
+                         AND c.doc_type = 'in_invoice' AND c.state = 'draft'), 0)
+            + COALESCE((SELECT SUM(e.amount) FROM expenses e
+                         WHERE e.org_id = d.org_id AND e.linked_invoice_id = d.id
+                           AND e.state NOT IN ('posted','paid','refused')), 0)
+            + COALESCE((SELECT SUM(m.amount) FROM commissions m
+                         WHERE m.org_id = d.org_id AND m.linked_invoice_id = d.id
+                           AND m.state = 'draft'), 0) AS draft_cost,
+            CASE WHEN d.state = 'posted' THEN d.total - d.residual ELSE 0 END AS received,
+            CASE WHEN d.state = 'posted' THEN d.residual ELSE 0 END AS outstanding
+       FROM documents d
+       LEFT JOIN partners p ON p.id = d.partner_id
+       LEFT JOIN bookings b ON b.id = d.booking_id
+       LEFT JOIN LATERAL (
+         SELECT x.invoice_number FROM crm_invoices x
+          WHERE x.org_id = d.org_id AND x.document_id = d.id
+          ORDER BY x.fetched_at DESC LIMIT 1
+       ) ci ON TRUE
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY d.doc_date DESC, d.number DESC
+      LIMIT ${opts.limit ?? 500}`,
+    ...params,
+  );
+
+  return rows.map((r) => {
+    const cost = r.bill_cost + r.expense_cost + r.commission_cost;
+    const profit = r.revenue - cost;
+    return { ...r, cost, profit, margin: marginOf(r.revenue, profit) };
+  });
+}
+
+/** One sale's margin — the same figures, for a single invoice. */
+export async function saleMargin(orgId: string, documentId: string): Promise<SaleProfit | null> {
+  const [row] = await saleProfitability(orgId, { documentId, limit: 1 });
+  return row ?? null;
+}
+
+/**
+ * Every cost record recorded against one sale, in one list.
+ *
+ * THE DETAIL BEHIND THE MARGIN, and it has to be one list rather than three
+ * because the question is "where did the money go", not "show me the bills".
+ * A guide paid in cash and a hotel invoiced on 30 days are the same kind of
+ * fact about this package, and a reader comparing them should not have to
+ * visit three screens to add them up.
+ *
+ * DRAFTS ARE INCLUDED AND FLAGGED. They are not in the margin — nothing
+ * unposted is — but they are exactly what the reader needs to see when asking
+ * why the margin looks too good, so they are listed with their state rather
+ * than hidden until somebody remembers to post them.
+ */
+export interface SaleCostRow {
+  kind: 'bill' | 'expense' | 'commission';
+  id: string;
+  number: string | null;
+  on_date: string;
+  party: string | null;
+  description: string | null;
+  state: string;
+  /** Net of reclaimable tax, signed: a supplier's credit note is negative. */
+  amount: number;
+  tax_amount: number;
+}
+
+export async function saleCosts(orgId: string, documentId: string): Promise<SaleCostRow[]> {
+  const bills = await all<SaleCostRow>(
+    `SELECT 'bill' AS kind, d.id, d.number, d.doc_date AS on_date,
+            p.name AS party, d.supplier_ref AS description, d.state,
+            CASE WHEN d.doc_type = 'in_refund' THEN -d.untaxed ELSE d.untaxed END AS amount,
+            d.tax_total AS tax_amount
+       FROM documents d LEFT JOIN partners p ON p.id = d.partner_id
+      WHERE d.org_id = ? AND d.linked_invoice_id = ?
+        AND d.doc_type IN ('in_invoice','in_refund') AND d.state <> 'cancelled'`,
+    orgId, documentId,
+  );
+  const expenses = await all<SaleCostRow>(
+    `SELECT 'expense' AS kind, e.id, e.number, e.expense_date AS on_date,
+            e.employee_name AS party, e.description, e.state,
+            e.amount, e.tax_amount
+       FROM expenses e
+      WHERE e.org_id = ? AND e.linked_invoice_id = ? AND e.state <> 'refused'`,
+    orgId, documentId,
+  );
+  const commissions = await all<SaleCostRow>(
+    `SELECT 'commission' AS kind, c.id, NULL AS number, COALESCE(c.due_date, c.created_at) AS on_date,
+            c.agent_name AS party, 'Agent commission' AS description, c.state,
+            c.amount, 0 AS tax_amount
+       FROM commissions c
+      WHERE c.org_id = ? AND c.linked_invoice_id = ? AND c.state <> 'reversed'`,
+    orgId, documentId,
+  );
+  return [...bills, ...expenses, ...commissions]
+    .sort((a, b) => (a.on_date < b.on_date ? -1 : a.on_date > b.on_date ? 1 : 0));
+}
+
+// ---------------------------------------------------------------------------
 // Booking financial tab (plan section 42)
 // ---------------------------------------------------------------------------
 

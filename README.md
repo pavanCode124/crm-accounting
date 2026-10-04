@@ -123,9 +123,11 @@ legislature, IGST at every slab, tax-inclusive pricing, TDS, and a tax report
 read from the ledger's tax lines — component-wise, in the shape GSTR-3B Table
 3.1 is filed from, as well as rate by rate.
 
-**Travel** — a financial tab on every booking, trip profitability backed by
-analytic accounts, package and agent profitability, agent commissions on
-revenue or on margin, cancellation reporting.
+**Travel** — a financial tab on every booking; profitability by trip (backed
+by analytic accounts) and by SALE (every vendor bill, staff claim and agent
+commission recorded against a customer invoice, which is the unit an agency
+without CRM bookings actually has); package and agent profitability; agent
+commissions on revenue or on profit; cancellation reporting.
 
 **Management** — analytic plans for trips, departments, branches and agents;
 budgets whose actuals come from the ledger; employee expenses with an approval

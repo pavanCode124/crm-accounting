@@ -977,6 +977,9 @@ export async function saveExpenseAction(formData: FormData) {
       accountId: str(formData, 'account_id'),
       analyticId: opt(formData, 'analytic_id'),
       bookingId: opt(formData, 'booking_id'),
+      // The sale this was spent on. The server takes the trip off that sale,
+      // so a claim names one thing and reaches both. See `tripOfInvoice`.
+      linkedInvoiceId: opt(formData, 'linked_invoice_id'),
       paidBy: str(formData, 'paid_by') === 'company' ? 'company' : 'employee',
       journalId: opt(formData, 'journal_id'),
     }, actorOf(s));
@@ -1022,7 +1025,11 @@ export async function commissionAction(formData: FormData) {
     }
     return await createCommission(s.orgId, {
       agentName: str(formData, 'agent_name'),
-      bookingId: str(formData, 'booking_id'),
+      // Either, and `createCommission` refuses both blank: a commission is
+      // earned on something, and which it was decides what the base is read
+      // from — the sale's own revenue and costs, or the trip's analytic account.
+      linkedInvoiceId: opt(formData, 'linked_invoice_id'),
+      bookingId: opt(formData, 'booking_id'),
       basis: str(formData, 'basis') === 'revenue' ? 'revenue' : 'profit',
       rateBps: Math.round(parseFloat(str(formData, 'rate') || '0') * 100),
       fixedAmount: money(formData, 'fixed_amount'),

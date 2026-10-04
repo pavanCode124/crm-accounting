@@ -1486,3 +1486,48 @@ UPDATE taxes SET tax_group = 'utgst'
 -- inventing a relationship to satisfy a column.
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS linked_invoice_id TEXT;
 CREATE INDEX IF NOT EXISTS ix_doc_linked_invoice ON documents(org_id, linked_invoice_id);
+
+-- ---------------------------------------------------------------------------
+-- EVERY COST CARRIES THE SALE IT WAS INCURRED FOR
+-- ---------------------------------------------------------------------------
+-- `documents.linked_invoice_id` above gave a vendor bill a sale to belong to.
+-- A bill is not the only cost of a sale, and a margin built from one third of
+-- the costs is worse than no margin at all -- it is confidently wrong, always
+-- in the flattering direction.
+--
+-- WHY THE INVOICE AND NOT THE TRIP, once more, because this is the column that
+-- settles it. Trip profitability was built on `bookings`, and a booking exists
+-- only for a CRM lead that carried a package number. An agency whose leads do
+-- not -- which is a real and ordinary way to run a travel business -- has no
+-- bookings, therefore no trip analytic accounts, therefore no analytic
+-- distributions, therefore an empty profitability report however much it has
+-- invoiced and spent. The report could not be fixed from the reporting end;
+-- the unit it reports on was missing from the data.
+--
+-- The INVOICE is never missing. The agency raised it, so it exists by
+-- definition, and everything spent against it -- a supplier's bill, a guide an
+-- employee paid in cash, the commission owed to whoever closed it -- can name
+-- it. That is the whole mechanism: one nullable column on each of the three
+-- cost records, and profit is revenue less the three.
+--
+-- NULLABLE EVERYWHERE. Office rent belongs to no sale, and an agency that has
+-- not started using the field keeps working exactly as before.
+ALTER TABLE expenses    ADD COLUMN IF NOT EXISTS linked_invoice_id TEXT;
+ALTER TABLE commissions ADD COLUMN IF NOT EXISTS linked_invoice_id TEXT;
+CREATE INDEX IF NOT EXISTS ix_exp_linked_invoice ON expenses(org_id, linked_invoice_id);
+CREATE INDEX IF NOT EXISTS ix_com_linked_invoice ON commissions(org_id, linked_invoice_id);
+
+-- A COMMISSION NO LONGER REQUIRES A BOOKING.
+--
+-- It was `REFERENCES bookings(id)` and the form made it mandatory, which is
+-- the same assumption as above wearing a different hat: an agency with no
+-- bookings could not record a commission at all. It is now earned against the
+-- SALE, and the booking is optional context for the agencies that have one.
+-- Dropped rather than loosened, because a FK to a table the row need not use
+-- is a constraint that only ever refuses correct data.
+ALTER TABLE commissions ALTER COLUMN booking_id DROP NOT NULL;
+DO $$
+BEGIN
+  ALTER TABLE commissions DROP CONSTRAINT IF EXISTS commissions_booking_id_fkey;
+EXCEPTION WHEN undefined_object THEN NULL;
+END $$;

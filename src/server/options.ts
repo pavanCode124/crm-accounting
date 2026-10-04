@@ -92,23 +92,7 @@ export async function documentFormOptions(orgId: string, docType: DocType, canPo
      * customer, the date and the total, which is what identifies a sale to the
      * person holding a supplier's bill — the invoice number alone does not.
      */
-    invoices: isBill
-      ? (await listDocuments(orgId, { docType: 'out_invoice', limit: 200 }))
-        .filter((d) => d.state !== 'cancelled')
-        .map((d) => ({
-          id: d.id,
-          label: [
-            d.number ?? d.crm_invoice_number ?? '(draft)',
-            d.partner_name,
-            fmtDate(d.doc_date),
-            `₹${(d.total / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`,
-            d.booking_ref,
-          ].filter(Boolean).join(' · '),
-          hint: d.analytic_id ?? '',
-          total: d.total,
-          date: d.doc_date,
-        }))
-      : [],
+    invoices: isBill ? await saleOptions(orgId) : [],
     paymentTerms: (await listPaymentTerms(orgId)).map((t) => ({ id: t.id, label: t.name })),
     products: await lineCatalogue(orgId, isBill),
     /*
@@ -383,6 +367,45 @@ export async function accountOptions(orgId: string, kinds?: string[]) {
 export async function analyticOptions(orgId: string, planCode?: string) {
   return (await listAnalyticAccounts(orgId, planCode))
     .map((a) => ({ id: a.id, label: `${a.plan_name}: ${a.name}` }));
+}
+
+/**
+ * THE SALES A COST CAN BE RECORDED AGAINST, for every form that records one.
+ *
+ * Shared by the vendor bill, the expense claim and the commission, because
+ * the three are the same question — which sale was this spent on — and three
+ * differently-filtered dropdowns would be three different answers about which
+ * invoices exist.
+ *
+ * POSTED AND DRAFT BOTH. A trip is routinely invoiced and supplied in the same
+ * week, and the hotel's bill can easily arrive before anyone has posted the
+ * sale. Offering only posted invoices would mean the cost could not be tied to
+ * the sale at the moment somebody knows what it is for, and nothing would
+ * bring them together afterwards. Cancelled ones are excluded: there is no
+ * sale there to have a margin.
+ *
+ * THE LABEL IS WHAT IDENTIFIES A SALE TO SOMEBODY HOLDING A SUPPLIER'S BILL —
+ * the customer, the date and the total. An invoice number alone does not, and
+ * the number this ledger assigned is one the agent has often never seen, so
+ * the CRM's own number is shown when the document is still a draft and has no
+ * number of its own.
+ */
+export async function saleOptions(orgId: string) {
+  return (await listDocuments(orgId, { docType: 'out_invoice', limit: 200 }))
+    .filter((d) => d.state !== 'cancelled')
+    .map((d) => ({
+      id: d.id,
+      label: [
+        d.number ?? d.crm_invoice_number ?? '(draft)',
+        d.partner_name,
+        fmtDate(d.doc_date),
+        `₹${(d.total / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`,
+        d.booking_ref,
+      ].filter(Boolean).join(' · '),
+      hint: d.analytic_id ?? '',
+      total: d.total,
+      date: d.doc_date,
+    }));
 }
 
 export async function bookingOptions(orgId: string) {
