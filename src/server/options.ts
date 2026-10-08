@@ -4,7 +4,7 @@ import { listAccounts, listJournals, listPartners, listPaymentTerms, listProduct
 import { listDocuments } from './accounting/documents';
 import { listTaxes, listWithholdingTaxes } from './accounting/tax';
 import { listAnalyticAccounts, listBookings } from './accounting/analytics';
-import { livePackages, packagePrice } from './crm/live';
+import { livePackages, packagePrice, liveBatches, batchLabel } from './crm/live';
 import { mirroredPackages } from './crm/mirror';
 import { packageTaxMap, saleTaxOptions, defaultTaxOf, splitInclusive } from './crm/packageTax';
 import { GST_STATES, getOrganisation } from './accounting/organisation';
@@ -72,6 +72,9 @@ export async function documentFormOptions(orgId: string, docType: DocType, canPo
     // form tags the lines without a second round trip.
     bookings: (await listBookings(orgId, { limit: 100 }))
       .map((b) => ({ id: b.id, label: `${b.ref} — ${b.title}`, hint: b.analytic_id ?? '' })),
+    // Live from TripzoCRM, on both an invoice and a bill — a batch is sold
+    // (invoices) and bought for (vendor bills). See `batchOptions` below.
+    batches: await batchOptions(orgId),
     /*
      * THE SALES A VENDOR BILL CAN BE RECORDED AGAINST.
      *
@@ -406,6 +409,41 @@ export async function saleOptions(orgId: string) {
       total: d.total,
       date: d.doc_date,
     }));
+}
+
+/**
+ * The agency's departures, LIVE from TripzoCRM, for the Batch field on
+ * invoices, vendor bills, expense claims and commissions.
+ *
+ * `orgId` is unused — like `livePackages`, the read is scoped by the
+ * signed-in accountant's own CRM session (`crmSession()` inside `live()`),
+ * not by this ledger's org id. Kept as a parameter so every other `*Options`
+ * helper in this file reads the same way and a caller never has to remember
+ * which ones take it.
+ *
+ * NEVER FATAL: `liveBatches` returns its error rather than throwing, so a CRM
+ * that is down or a visitor not signed in leaves the Batch dropdown simply
+ * empty — raising a document by hand has to keep working when the CRM does
+ * not, same as every other live read in this file.
+ */
+export async function batchOptions(orgId: string) {
+  const live = await liveBatches();
+  return live.rows.map((b) => ({ id: b.id, label: batchLabel(b) }));
+}
+
+/**
+ * The label to snapshot for a chosen batch id, for a server action behind a
+ * plain HTML form with no script to keep a hidden field in sync (expenses,
+ * commissions — unlike the invoice/bill form, which is a client component and
+ * sends its own snapshot straight off the dropdown's `onChange`).
+ *
+ * One more live call to TripzoCRM, on save rather than on render — acceptable
+ * here because these are single, occasional submissions, not a list screen.
+ */
+export async function resolveBatchName(orgId: string, crmBatchId: string | null | undefined): Promise<string | null> {
+  if (!crmBatchId) return null;
+  const options = await batchOptions(orgId);
+  return options.find((b) => b.id === crmBatchId)?.label ?? null;
 }
 
 export async function bookingOptions(orgId: string) {

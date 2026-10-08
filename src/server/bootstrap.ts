@@ -1,7 +1,7 @@
 import 'server-only';
 import { redirect } from 'next/navigation';
 import { ensureDemoBooks } from './seed';
-import { ensureGstComponents } from './provision';
+import { ensureGstComponents, ensureCoaNames } from './provision';
 import { getSession, NotSignedInError, NoAgencyError, type Session } from './auth';
 
 /**
@@ -56,6 +56,13 @@ export async function ctx(): Promise<Session> {
      * remembered per process, so the cost after a cold start is nothing.
      */
     await ensureGstComponents(session.orgId);
+    /*
+     * THE AGENCY'S OWN NAMES for accounts this ledger already carries under a
+     * generic one, plus the handful it was missing (Drawings, Bad Debts,
+     * Computer Laptops...). Same top-up shape as the GST call above — additive,
+     * idempotent, remembered per process. See `ensureCoaNames`.
+     */
+    await ensureCoaNames(session.orgId);
     return session;
   } catch (e) {
     if (e instanceof NotSignedInError) redirect('/login');

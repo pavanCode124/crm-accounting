@@ -32,6 +32,20 @@ export interface DocFormProps {
   analytics: Option[];
   bookings: Option[];
   /**
+   * The agency's departures, LIVE from TripzoCRM — a batch is a dated
+   * departure of a package that several invoices are commonly raised against,
+   * and that vendor bills and expenses are often bought for as a whole rather
+   * than per traveller.
+   *
+   * OFFERED ON BOTH AN INVOICE AND A BILL, unlike the trip/invoice block below
+   * it which branches: a batch is sold (customer invoices) and bought for
+   * (vendor bills), so both directions carry it. It is independent of that
+   * block — a document can name a trip AND a batch, or a sale AND a batch —
+   * because a batch groups invoices the way a trip groups GL lines, which is a
+   * different cut of the same costs.
+   */
+  batches: Option[];
+  /**
    * VENDOR BILLS: THE CUSTOMER INVOICES A COST CAN BE RECORDED AGAINST.
    *
    * This REPLACES the trip picker on a bill, and the replacement is the point.
@@ -110,7 +124,7 @@ export interface DocFormProps {
   existing?: { id: string };
   defaults?: {
     partnerName?: string; journalId?: string; bookingId?: string; analyticId?: string;
-    linkedInvoiceId?: string; date?: string;
+    linkedInvoiceId?: string; crmBatchId?: string; batchName?: string; date?: string;
     dueDate?: string; paymentTermsId?: string; supplierRef?: string;
     currency?: string; rate?: string; withholdingTaxId?: string; note?: string;
     placeOfSupply?: string; partyGstin?: string; supplyType?: 'b2b' | 'b2c';
@@ -206,7 +220,7 @@ function hsnOfAccount(accounts: Option[], orgDefault: string | undefined, accoun
 }
 
 export function DocumentForm(props: DocFormProps) {
-  const { docType, partners, journals, accounts, taxes, analytics, bookings, paymentTerms } = props;
+  const { docType, partners, journals, accounts, taxes, analytics, bookings, batches, paymentTerms } = props;
   const isBill = docType.startsWith('in_');
   // A column that can never be filled is worse than no column: it teaches the
   // reader to skip past one. Vendor bills have no packages by definition, and a
@@ -223,6 +237,9 @@ export function DocumentForm(props: DocFormProps) {
     return [blankLine(first, hsnOfAccount(accounts, props.defaultHsn, first))];
   });
   const [analyticId, setAnalyticId] = useState(props.defaults?.analyticId ?? '');
+  // The batch's own label, snapshotted into a hidden field at the moment it is
+  // picked — see the Batch field below and the schema note on `batch_name`.
+  const [batchName, setBatchName] = useState(props.defaults?.batchName ?? '');
   // A line with no description or no account is dropped on the server, and the
   // whole form would bounce back empty — everything typed, lost. Catch it here
   // instead, before anything is submitted.
@@ -590,6 +607,43 @@ export function DocumentForm(props: DocFormProps) {
               </select>
             </Field>
           )}
+          {/*
+            THE BATCH, LIVE FROM TRIPZOCRM — INDEPENDENT OF THE FIELD ABOVE.
+
+            A departure that several invoices are raised against, and that
+            vendor bills and expenses are often bought for as a whole rather
+            than per traveller. Offered on both an invoice and a bill, unlike
+            the field above: a batch is sold (invoices) and bought for
+            (bills), so both directions carry it.
+
+            THE LABEL IS THE FIX for the dropdown that showed nothing to pick:
+            unlike Trip/booking, which is empty until a CRM lead has been
+            synced or a booking created by hand, this is read live from the
+            CRM on every form load, so it has content from the first invoice
+            an agency raises — and it is named id, package and date so it is
+            never a bare, unreadable id in a list.
+          */}
+          <Field label="Batch" hint="The CRM departure this is for — several invoices often share one, and a bill or expense can be bought for the whole batch.">
+            <select
+              name="crm_batch_id"
+              className={inputClass}
+              defaultValue={props.defaults?.crmBatchId ?? ''}
+              onChange={(e) => {
+                const b = batches.find((x) => x.id === e.target.value);
+                setBatchName(b?.label ?? '');
+              }}
+            >
+              <option value="">— not against a particular batch</option>
+              {batches.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}
+            </select>
+            {/*
+              SNAPSHOTTED AT THE MOMENT IT IS PICKED, like a package's name and
+              price when a line is added — so a document raised against this
+              batch still reads sensibly months later even if the departure is
+              renamed or removed in the CRM afterwards.
+            */}
+            <input type="hidden" name="batch_name" value={batchName} />
+          </Field>
           {/*
             THE PLACE OF SUPPLY IS NOT DECORATION.
 

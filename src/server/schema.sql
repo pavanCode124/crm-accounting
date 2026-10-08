@@ -1531,3 +1531,36 @@ BEGIN
   ALTER TABLE commissions DROP CONSTRAINT IF EXISTS commissions_booking_id_fkey;
 EXCEPTION WHEN undefined_object THEN NULL;
 END $$;
+
+-- ---------------------------------------------------------------------------
+-- BATCHES -- a TripzoCRM departure, carried the same way as linked_invoice_id
+-- ---------------------------------------------------------------------------
+-- A travel agency sells several invoices against ONE departure of a package --
+-- "the 12 Dec Goa batch" -- and buys hotel/transport/guide costs for that same
+-- departure rather than per traveller. `crm_batch_id` is the id of the
+-- `package_batches` row in TripzoCRM's own database (read LIVE, never synced or
+-- stored here -- see src/server/crm/live.ts), so it is a plain TEXT, not a
+-- foreign key: a batch is not a row in this database any more than a package
+-- is.
+--
+-- `batch_name` is a SNAPSHOT of what the dropdown showed at the moment someone
+-- picked it, same reasoning as `crm_package_tax.package_name`: a document from
+-- six months ago should still say what batch it was against even if that
+-- departure has since been renamed or removed in the CRM.
+--
+-- ON documents THIS APPLIES TO BOTH DIRECTIONS, unlike linked_invoice_id: a
+-- batch is sold (customer invoices) and bought for (vendor bills), because both
+-- live in this one table.
+--
+-- NULLABLE EVERYWHERE, including on commissions, where it is explicitly not
+-- required -- an agent's commission is earned on the sale or the trip, and the
+-- batch is optional extra context when there is one.
+ALTER TABLE documents   ADD COLUMN IF NOT EXISTS crm_batch_id TEXT;
+ALTER TABLE documents   ADD COLUMN IF NOT EXISTS batch_name   TEXT;
+ALTER TABLE expenses    ADD COLUMN IF NOT EXISTS crm_batch_id TEXT;
+ALTER TABLE expenses    ADD COLUMN IF NOT EXISTS batch_name   TEXT;
+ALTER TABLE commissions ADD COLUMN IF NOT EXISTS crm_batch_id TEXT;
+ALTER TABLE commissions ADD COLUMN IF NOT EXISTS batch_name   TEXT;
+CREATE INDEX IF NOT EXISTS ix_doc_batch ON documents(org_id, crm_batch_id);
+CREATE INDEX IF NOT EXISTS ix_exp_batch ON expenses(org_id, crm_batch_id);
+CREATE INDEX IF NOT EXISTS ix_com_batch ON commissions(org_id, crm_batch_id);

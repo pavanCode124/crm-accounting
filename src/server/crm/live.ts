@@ -151,3 +151,68 @@ export function packageDuration(pkg: CrmPackage): string {
   const nights = Number(pkg.nights ?? Math.max(days - 1, 0));
   return days ? `${days}D / ${nights}N` : '';
 }
+
+// ---------------------------------------------------------------------------
+// Batches — a dated departure of a package, with seats
+// ---------------------------------------------------------------------------
+
+/**
+ * One departure of a package: `package_batches` in TripzoCRM's own database,
+ * read through `/api/batches` exactly as the mobile app does — never a direct
+ * table read (see the module note above) and never synced into this ledger.
+ *
+ * NARROWER THAN WHAT THE ENDPOINT RETURNS, on purpose, same discipline as
+ * `CrmPackage`: these are the fields a document form's Batch dropdown and the
+ * TripzoCRM → Batches screen actually use.
+ *
+ * NO SNAPSHOT FALLBACK, unlike packages. A batch field is optional everywhere
+ * it appears — unlike the package catalogue, nothing in this product requires
+ * one to raise a document — so "empty while the CRM cannot be reached" is an
+ * acceptable degrade, the same one the Trip/booking and linked-invoice
+ * dropdowns already have.
+ */
+export interface CrmBatch {
+  id: string;
+  package_id: string;
+  batch_name?: string | null;
+  batch_code?: string | null;
+  start_date?: string | null;
+  end_date?: string | null;
+  seats_total?: number | null;
+  seats_booked?: number | null;
+  seats_available?: number | null;
+  status?: string | null;          // open | closed | cancelled
+  package_name?: string | null;
+  destinations?: string[] | null;
+}
+
+/**
+ * The organisation's batches, newest-departure-first as the CRM returns them.
+ *
+ * `/api/batches` answers a bare array when scoped by `package_id` and
+ * `{ rows, total, page, limit }` otherwise — `rows()` in `client.ts` already
+ * tries `'rows'` among its fallback keys, so both shapes land correctly
+ * without this function having to know which one came back.
+ */
+export function liveBatches(query?: string, limit = 200): Promise<Live<CrmBatch>> {
+  const params = new URLSearchParams({ page: '1', limit: String(limit) });
+  if (query?.trim()) params.set('q', query.trim());
+  return live<CrmBatch>('batches', `/api/batches?${params}`);
+}
+
+/**
+ * What identifies a batch to the person picking one off a dropdown: its own
+ * name, the package it is a departure of, and when it leaves — because "which
+ * package/invoice this is for" is precisely the thing a bare id cannot say.
+ */
+export function batchLabel(b: CrmBatch): string {
+  const name = (b.batch_name?.trim() || b.batch_code?.trim()) || 'Batch';
+  const pkg = b.package_name?.trim();
+  const date = b.start_date
+    ? new Date(b.start_date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
+    : '';
+  const seats = b.seats_total
+    ? `${b.seats_booked ?? 0}/${b.seats_total} seats`
+    : '';
+  return [name, pkg, date, seats].filter(Boolean).join(' — ');
+}

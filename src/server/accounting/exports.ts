@@ -12,6 +12,8 @@ import {
   tripDossier,
   type TripDossier, type TripDocItemRow, type TripExpenseRow,
   type TripCommissionRow, type TripPaymentRow, type TripLedgerRow,
+  saleMargin, saleCosts, type SaleProfit, type SaleCostRow,
+  batchMargin, batchCosts, batchInvoices, type BatchProfit, type BatchInvoiceRow,
 } from './analytics';
 import {
   getSettlement, settlementDocuments, settlementCharges, CHARGE_KINDS,
@@ -1932,4 +1934,185 @@ export async function tripWorkbook(orgId: string, analyticId: string): Promise<T
   ];
 
   return { buffer: buildXlsx(sheets), dossier };
+}
+
+// ---------------------------------------------------------------------------
+// Per-invoice and per-batch workbooks
+// ---------------------------------------------------------------------------
+
+/**
+ * A cost sheet shared by the sale and batch workbooks: one row per bill,
+ * staff claim or commission, whichever of the three it is, because the
+ * reader's question is "where did the money go" rather than "show me the
+ * bills" — the same reasoning `saleCosts` itself is built on.
+ */
+function costsSheet(rows: SaleCostRow[], subtitle: string): Sheet {
+  const headers = [
+    'S.No.', 'Kind', 'Reference', 'Date', 'Party', 'Description', 'State',
+    'Amount (Rs)', 'Tax (Rs)', 'Total (Rs)',
+  ];
+  const body: CellInput[][] = [
+    [text('Costs', 'title')],
+    [text(subtitle, 'muted')],
+    [],
+    headers.map((h) => text(h, 'header')),
+  ];
+
+  rows.forEach((r, i) => {
+    body.push([
+      { v: i + 1, s: 'int' },
+      text(r.kind === 'bill' ? 'Vendor bill' : r.kind === 'expense' ? 'Staff expense' : 'Commission'),
+      text(r.number),
+      text(fmtDate(r.on_date)),
+      text(r.party),
+      text(r.description),
+      text(titleise(r.state)),
+      money(r.amount),
+      moneyOrDash(r.tax_amount),
+      money(r.amount + r.tax_amount, 'moneyBold'),
+    ]);
+  });
+
+  const blank = (n: number) => Array.from({ length: n }, () => ({ v: null, s: 'section' as const }));
+  body.push([]);
+  body.push([
+    text('Total', 'section'), ...blank(6),
+    money(rows.reduce((t, r) => t + r.amount, 0), 'sectionMoney'),
+    money(rows.reduce((t, r) => t + r.tax_amount, 0), 'sectionMoney'),
+    money(rows.reduce((t, r) => t + r.amount + r.tax_amount, 0), 'sectionMoney'),
+  ]);
+
+  return {
+    name: 'Costs', rows: body,
+    cols: [7, 15, 16, 12, 24, 34, 12, 14, 12, 14],
+    freezeRows: 4,
+  };
+}
+
+function saleSummarySheet(s: SaleProfit, orgName: string): Sheet {
+  const rows: CellInput[][] = [
+    [null, null, text(`${orgName} — Invoice Profitability`, 'title')],
+    [null, null, text(`${s.number ?? s.crm_number ?? '(draft)'} — ${s.partner_name ?? ''}`, 'muted')],
+    [],
+    tripKv('Invoice date', fmtDate(s.doc_date)),
+    tripKv('State', titleise(s.state)),
+    tripKv('Customer', s.partner_name ?? '-'),
+    tripKv('Booking', s.booking_ref ?? '-'),
+    [],
+    tripSection('What it earned'),
+    tripLine(null, '  Revenue (net of GST and credit notes)', s.revenue),
+    tripLine(null, '  Credited back (credit notes)', s.credited),
+    tripLine(null, '  Received so far', s.received),
+    tripLine(null, '  Still outstanding', s.outstanding),
+    [],
+    tripSection('What it cost'),
+    tripLine(1, '  Vendor bills', s.bill_cost, 'Sheet: Costs'),
+    tripLine(2, '  Staff expense claims', s.expense_cost, 'Sheet: Costs'),
+    tripLine(3, '  Agent commission', s.commission_cost, 'Sheet: Costs'),
+    tripLine(null, '  Recorded but not yet posted', s.draft_cost, 'Not in the cost below until posted'),
+    tripTotal('Total cost', s.cost),
+    [],
+    tripTotal('Profit', s.profit),
+    [null, null, text('Margin', 'section'), { v: Number(s.margin.toFixed(2)), s: 'rate' }, text('% of revenue', 'section')],
+  ];
+  return { name: 'Summary', rows, cols: [3, 9, 46, 20, 52], merges: ['B2:E2'] };
+}
+
+export interface SaleWorkbook { buffer: Buffer; sale: SaleProfit }
+
+/**
+ * One customer invoice, in full: what it earned and what it cost, from
+ * `saleProfitability`/`saleCosts` — the same figures the "By invoice" card on
+ * `/analytics/trips` shows, downloadable for whoever was not looking at the
+ * screen.
+ */
+export async function saleWorkbook(orgId: string, documentId: string): Promise<SaleWorkbook | null> {
+  const sale = await saleMargin(orgId, documentId);
+  if (!sale) return null;
+  const org = await seller(orgId);
+  const costs = await saleCosts(orgId, documentId);
+  const sheets: Sheet[] = [
+    saleSummarySheet(sale, org.name),
+    costsSheet(costs, `Every vendor bill, staff claim and commission recorded against ${sale.number ?? sale.crm_number ?? 'this invoice'}.`),
+  ];
+  return { buffer: buildXlsx(sheets), sale };
+}
+
+function batchSummarySheet(b: BatchProfit, orgName: string): Sheet {
+  const rows: CellInput[][] = [
+    [null, null, text(`${orgName} — Batch Profitability`, 'title')],
+    [null, null, text(b.batch_name ?? b.crm_batch_id, 'muted')],
+    [],
+    tripKv('Invoices raised against this batch', b.invoices),
+    [],
+    tripSection('What it earned'),
+    tripLine(null, '  Revenue (net of GST and credit notes), every invoice', b.revenue, 'Sheet: Invoices'),
+    tripLine(null, '  Credited back (credit notes)', b.credited),
+    tripLine(null, '  Received so far', b.received),
+    tripLine(null, '  Still outstanding', b.outstanding),
+    [],
+    tripSection('What it cost'),
+    tripLine(1, '  Vendor bills — against the batch or against one of its invoices', b.bill_cost, 'Sheet: Costs'),
+    tripLine(2, '  Staff expense claims', b.expense_cost, 'Sheet: Costs'),
+    tripLine(3, '  Agent commission', b.commission_cost, 'Sheet: Costs'),
+    tripTotal('Total cost', b.cost),
+    [],
+    tripTotal('Profit', b.profit),
+    [null, null, text('Margin', 'section'), { v: Number(b.margin.toFixed(2)), s: 'rate' }, text('% of revenue', 'section')],
+  ];
+  return { name: 'Summary', rows, cols: [3, 9, 46, 20, 52], merges: ['B2:E2'] };
+}
+
+function batchInvoiceSheet(rows: BatchInvoiceRow[]): Sheet {
+  const headers = ['S.No.', 'Invoice', 'Date', 'Customer', 'State', 'Taxable (Rs)', 'Total (Rs)', 'Outstanding (Rs)'];
+  const body: CellInput[][] = [
+    [text('Invoices in this batch', 'title')],
+    [text('Every customer invoice raised against this departure.', 'muted')],
+    [],
+    headers.map((h) => text(h, 'header')),
+  ];
+  rows.forEach((r, i) => {
+    body.push([
+      { v: i + 1, s: 'int' },
+      text(r.number ?? r.crm_number ?? '(draft)'),
+      text(fmtDate(r.doc_date)),
+      text(r.partner_name),
+      text(titleise(r.state)),
+      money(r.untaxed),
+      money(r.total, 'moneyBold'),
+      moneyOrDash(r.residual),
+    ]);
+  });
+  const blank = (n: number) => Array.from({ length: n }, () => ({ v: null, s: 'section' as const }));
+  body.push([]);
+  body.push([
+    text('Total', 'section'), ...blank(4),
+    money(rows.reduce((t, r) => t + r.untaxed, 0), 'sectionMoney'),
+    money(rows.reduce((t, r) => t + r.total, 0), 'sectionMoney'),
+    money(rows.reduce((t, r) => t + r.residual, 0), 'sectionMoney'),
+  ]);
+  return { name: 'Invoices', rows: body, cols: [7, 16, 12, 28, 12, 14, 14, 16], freezeRows: 4 };
+}
+
+export interface BatchWorkbook { buffer: Buffer; batch: BatchProfit }
+
+/**
+ * One TripzoCRM departure, in full: every invoice raised against it and every
+ * cost — direct or inherited from one of those invoices — recorded against
+ * it. The same figures the "By batch" card on `/analytics/trips` shows.
+ */
+export async function batchWorkbook(orgId: string, crmBatchId: string): Promise<BatchWorkbook | null> {
+  const batch = await batchMargin(orgId, crmBatchId);
+  if (!batch) return null;
+  const org = await seller(orgId);
+  const [invoices, costs] = await Promise.all([
+    batchInvoices(orgId, crmBatchId),
+    batchCosts(orgId, crmBatchId),
+  ]);
+  const sheets: Sheet[] = [
+    batchSummarySheet(batch, org.name),
+    batchInvoiceSheet(invoices),
+    costsSheet(costs, `Every vendor bill, staff claim and commission tagged to ${batch.batch_name ?? 'this batch'} directly, or to one of its invoices.`),
+  ];
+  return { buffer: buildXlsx(sheets), batch };
 }

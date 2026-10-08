@@ -4,6 +4,7 @@ import { isoDate, fiscalYearOf } from '@/lib/accounting';
 import { setSetting } from './accounting/settings';
 import { createFiscalYear } from './accounting/periods';
 import { upsertAccount, upsertJournal, upsertProduct } from './accounting/masters';
+import { audit } from './accounting/audit';
 
 /**
  * ONE AGENCY'S OPENING SET OF BOOKS.
@@ -827,6 +828,127 @@ export async function ensureGstComponents(orgId: string): Promise<void> {
     }
   }
   gstComponentsReady.add(orgId);
+}
+
+// ---------------------------------------------------------------------------
+// Chart-of-accounts top-up: the agency's own names for accounts this ledger
+// already carries under a generic one, plus the handful it was missing.
+// ---------------------------------------------------------------------------
+
+/**
+ * Existing account (by code) → the agency's preferred name for it.
+ *
+ * A RENAME, NOT A NEW ACCOUNT. The code, kind, reconcilable flag and every
+ * posting already made against it are untouched — only the label changes, so
+ * every report that reads the account by its `kind` or by `org_settings`
+ * continues to resolve exactly as before.
+ *
+ * THE UPDATE ONLY FIRES WHILE THE ACCOUNT STILL CARRIES ITS SEEDED NAME. That
+ * is what makes this safe to run on every page load forever rather than once:
+ * the first run renames "Bank — Primary" to "Bank AC"; if the agency later
+ * renames it again themselves, a later run finds the name no longer matches
+ * the seeded one and leaves it alone, the same way `ensureGstComponents`
+ * leaves an agency's own tax rows alone.
+ */
+const COA_RENAMES: Array<[code: string, from: string, to: string]> = [
+  ['101000', 'Bank — Primary', 'Bank AC'],
+  ['100000', 'Cash on Hand', 'Cash AC'],
+  ['110000', 'Accounts Receivable', 'Debtors AC'],
+  ['200000', 'Accounts Payable', 'Creditors AC'],
+  ['300000', 'Owner Capital', 'Capital AC'],
+  ['602000', 'Marketing', 'Advertisement & Marketing'],
+  ['400000', 'Package Revenue', 'Sales Tour Packages'],
+  ['402000', 'Flight Revenue', 'Sales Traveling (Bus, Train & Flights)'],
+  ['404000', 'Transport Revenue', 'Sales Travels (Car, Tempo Traveler & Bus)'],
+  ['500000', 'Hotel Cost', 'Purchase (Hotels & Restaurants)'],
+  ['501000', 'Flight Cost', 'Purchase Traveling (Bus, Train & Flight)'],
+  ['502000', 'Transport Cost', 'Purchase Travels (Car, Tempo Traveler & Bus)'],
+  ['507000', 'Package Direct Cost', 'Purchase Tour Packages'],
+  ['600000', 'Salaries', 'Salary & Wages'],
+  ['603000', 'Software Subscriptions', 'Website, CRM & Domain Charges'],
+  ['610000', 'Agent Commission', 'Commissions & Brokerage'],
+];
+
+/**
+ * Accounts genuinely missing from the seeded chart — everything on the
+ * agency's pasted list that had no existing equivalent at all. Codes extend
+ * the block each belongs to (Drawings beside Capital, the new direct-cost
+ * line after 507000, and so on) rather than reusing the agency's own 0001-0028
+ * numbering, so the chart keeps one consistent code scheme.
+ *
+ * Deliberately NOT on this list, and why: a flat "GST" account is skipped
+ * because the chart already splits output/input CGST, SGST, IGST and UTGST
+ * into the accounts GSTR-3B is actually filed from (`210000`-`210300`,
+ * `170000`-`170300`) — a single undifferentiated GST account would sit unused
+ * beside the ones everything already posts to. "Deferred Income / Other
+ * Income" is skipped because it is better served by the two accounts it would
+ * merge — `246000 Deferred Revenue` (a liability) and `409000 Other Travel
+ * Revenue` (income) can't be one ledger row anyway. "Fixed Assets" and "Fixed
+ * Liability" are category labels, not accounts: their members already exist
+ * (`150000`, `151000`, the new `152000` here; `601000 Rent`, which stays an
+ * operating expense rather than becoming a liability, plus the new `613000`
+ * Electricity below).
+ */
+const COA_NEW_ACCOUNTS: Array<[code: string, name: string, kind: string]> = [
+  ['305000', 'Drawings', 'equity'],
+  ['508000', 'Expenses By Employee On Tour', 'expense_direct'],
+  ['152000', 'Computer Laptops (Assets)', 'asset_fixed'],
+  ['412000', 'Sales Trekking', 'income'],
+  ['613000', 'Electricity', 'expense_operating'],
+  ['614000', 'Other Expenses', 'expense_operating'],
+  ['615000', 'Payment Gateway Charges', 'expense_operating'],
+  ['616000', 'Bad Debts', 'expense_operating'],
+];
+
+const coaNamesReady = new Set<string>();
+
+/**
+ * BRING AN EXISTING SET OF BOOKS UP TO THE AGENCY'S OWN ACCOUNT NAMES.
+ *
+ * Same shape as `ensureGstComponents` above and for the same reason: this runs
+ * on every connected agency's existing ledger, not only on a fresh
+ * `provisionOrg`, because `provisionOrg` itself runs exactly once per agency
+ * and nothing re-runs it on books that already exist.
+ *
+ * IDEMPOTENT AND ADDITIVE ONLY. Renames are conditioned on the account still
+ * carrying its seeded name (see `COA_RENAMES`); new accounts are inserted only
+ * when their code is not already in use, so an agency that has already added
+ * its own "152000" is left alone rather than fought over.
+ */
+export async function ensureCoaNames(orgId: string): Promise<void> {
+  if (coaNamesReady.has(orgId)) return;
+
+  for (const [code, from, to] of COA_RENAMES) {
+    const match = await one<{ id: string }>(
+      'SELECT id FROM accounts WHERE org_id = ? AND code = ? AND name = ?', orgId, code, from,
+    );
+    if (!match) continue;
+    await run('UPDATE accounts SET name = ? WHERE id = ?', to, match.id);
+    await audit(orgId, {}, 'modified', 'account', match.id, `${code} renamed to ${to}`);
+  }
+
+  for (const [code, name, kind] of COA_NEW_ACCOUNTS) {
+    /*
+     * `ON CONFLICT ... DO NOTHING` RATHER THAN A SELECT-THEN-INSERT, because
+     * the obvious check-then-act race is a real one here: several of a page's
+     * server-component data fetches can call `ctx()` — and therefore this
+     * function — concurrently, and two requests that both see the code
+     * missing both try to insert it, the second failing the unique
+     * constraint and taking the whole page down with it. The conflict target
+     * is the chart's own `UNIQUE (org_id, code)`, so this is safe under any
+     * amount of concurrency without a lock.
+     */
+    const inserted = await one<{ id: string }>(
+      `INSERT INTO accounts (id, org_id, code, name, kind, reconcilable, active)
+       VALUES (?,?,?,?,?,0,1)
+       ON CONFLICT (org_id, code) DO NOTHING
+       RETURNING id`,
+      id('acc'), orgId, code, name, kind,
+    );
+    if (inserted) await audit(orgId, {}, 'created', 'account', inserted.id, `${code} ${name}`);
+  }
+
+  coaNamesReady.add(orgId);
 }
 
 /**

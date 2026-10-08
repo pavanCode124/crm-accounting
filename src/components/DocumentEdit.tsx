@@ -140,6 +140,8 @@ export async function DocumentEdit({ orgId, docId, basePath, role, message }: {
           // show the invoice it was recorded against, or saving the edit would
           // quietly unlink it — and the trip's cost would vanish with it.
           linkedInvoiceId: doc.linked_invoice_id ?? '',
+          crmBatchId: doc.crm_batch_id ?? '',
+          batchName: doc.batch_name ?? '',
           analyticId: doc.analytic_id ?? '',
           date: doc.doc_date,
           dueDate: doc.due_date ?? '',

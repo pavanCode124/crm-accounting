@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { ctx } from '@/server/bootstrap';
 import { one, resolveRange, type SearchParams } from '@/lib/range';
-import { tripProfitability, saleProfitability } from '@/server/accounting/analytics';
+import { tripProfitability, saleProfitability, batchProfitability } from '@/server/accounting/analytics';
 import { fmt } from '@/lib/money';
 import { fmtDate } from '@/lib/accounting';
 import { RangeBar } from '@/components/RangeBar';
@@ -44,6 +44,7 @@ export default async function TripsPage({ searchParams }: { searchParams: Promis
   );
   const trips = await tripProfitability(s.orgId, range);
   const allSales = await saleProfitability(s.orgId, range);
+  const batches = await batchProfitability(s.orgId, range);
   /*
    * ONLY THE SALES NOT ALREADY IN A TRIP'S MARGIN. An invoice tagged to a
    * booking has its revenue and its costs inside the analytic figures above;
@@ -187,8 +188,9 @@ export default async function TripsPage({ searchParams }: { searchParams: Promis
       )}
 
       <Card
-        title={trips.length > 0 ? 'By sale (not attached to a trip)' : 'By sale'}
+        title={trips.length > 0 ? 'By invoice (not attached to a trip)' : 'By invoice'}
         padded={false}
+        className="mb-5"
         subtitle="One row per customer invoice: what it was sold for, less every vendor bill, staff claim and agent commission recorded against it. Net of GST on both sides — output tax is collected for the government and input tax is reclaimed, so neither is a margin."
       >
         {sales.length === 0 ? (
@@ -203,7 +205,7 @@ export default async function TripsPage({ searchParams }: { searchParams: Promis
                 <Th>Invoice</Th><Th>Customer</Th><Th>Date</Th>
                 <Th align="right">Revenue</Th>
                 <Th align="right">Bills</Th><Th align="right">Claims</Th><Th align="right">Commission</Th>
-                <Th align="right">Profit</Th><Th align="right">Margin</Th><Th width="140px">Share</Th>
+                <Th align="right">Profit</Th><Th align="right">Margin</Th><Th width="140px">Share</Th><Th>Export</Th>
               </tr>
             </thead>
             <tbody>
@@ -233,6 +235,14 @@ export default async function TripsPage({ searchParams }: { searchParams: Promis
                     </span>
                   </Td>
                   <Td><Bar value={x.revenue} max={peakSale} color="var(--color-sec-analytics)" /></Td>
+                  <Td>
+                    {/* A download, not a client-side navigation — same reasoning as the trip export link above. */}
+                    <a href={`/api/exports/sale/${x.document_id}`}
+                      className="font-semibold text-brand hover:underline"
+                      title="Download this invoice's margin in full — revenue, bills, claims and commission">
+                      Excel
+                    </a>
+                  </Td>
                 </tr>
               ))}
             </tbody>
@@ -255,12 +265,71 @@ export default async function TripsPage({ searchParams }: { searchParams: Promis
                     {saleRevenue ? (((saleRevenue - saleCost) / saleRevenue) * 100).toFixed(1) : '0.0'}%
                   </span>
                 </Td>
-                <Td />
+                <Td /><Td />
               </tr>
             </tfoot>
           </Table>
         )}
       </Card>
+
+      {/*
+        BY BATCH — A DIFFERENT CUT OF THE SAME LINKS "BY INVOICE" READS,
+        GROUPED ACROSS EVERY INVOICE RAISED AGAINST ONE DEPARTURE.
+
+        Not nested inside the table above and not added into its totals: a
+        batch's revenue is the sum of several of those very invoice rows, so
+        counting both into one KPI would double the agency's own turnover. The
+        card is shown only when at least one document has been tagged to a
+        batch, same discipline as the Trips card above.
+      */}
+      {batches.length > 0 && (
+        <Card
+          title="By batch"
+          padded={false}
+          subtitle="One row per TripzoCRM departure: every invoice raised against it, less every vendor bill, staff claim and agent commission tagged to the batch or to one of its invoices. These rupees already appear in the invoice rows above — this is the same links, added up a different way."
+        >
+          <Table>
+            <thead>
+              <tr>
+                <Th>Batch</Th><Th align="right">Invoices</Th>
+                <Th align="right">Revenue</Th>
+                <Th align="right">Bills</Th><Th align="right">Claims</Th><Th align="right">Commission</Th>
+                <Th align="right">Profit</Th><Th align="right">Margin</Th><Th width="140px">Share</Th><Th>Export</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {[...batches].sort((a, b) => a.margin - b.margin).map((x) => (
+                <tr key={x.crm_batch_id} className="hover:bg-canvas">
+                  <Td><span className="font-semibold">{x.batch_name ?? x.crm_batch_id}</span></Td>
+                  <Td align="right"><span className="num">{x.invoices}</span></Td>
+                  <Td align="right"><Money value={x.revenue} /></Td>
+                  <Td align="right"><Money value={x.bill_cost} /></Td>
+                  <Td align="right"><Money value={x.expense_cost} /></Td>
+                  <Td align="right"><Money value={x.commission_cost} /></Td>
+                  <Td align="right">
+                    <span className={`num font-bold ${x.profit >= 0 ? 'text-positive' : 'text-negative'}`}>
+                      {fmt(x.profit)}
+                    </span>
+                  </Td>
+                  <Td align="right">
+                    <span className={`num font-bold ${x.margin < 10 && x.revenue > 0 ? 'text-negative' : ''}`}>
+                      {x.revenue ? `${x.margin.toFixed(1)}%` : '—'}
+                    </span>
+                  </Td>
+                  <Td><Bar value={x.revenue} max={Math.max(1, ...batches.map((b) => b.revenue))} color="var(--color-sec-analytics)" /></Td>
+                  <Td>
+                    <a href={`/api/exports/batch/${x.crm_batch_id}`}
+                      className="font-semibold text-brand hover:underline"
+                      title="Download this batch in full — every invoice, bill, staff claim and commission behind the margin">
+                      Excel
+                    </a>
+                  </Td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+        </Card>
+      )}
     </>
   );
 }

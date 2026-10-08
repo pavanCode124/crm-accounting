@@ -74,6 +74,7 @@ export const NAV: NavSection[] = [
     label: 'TripzoCRM',
     items: [
       { label: 'Packages', href: '/crm/packages', match: '/crm/packages', keywords: ['catalogue', 'tours', 'products', 'tripzo'] },
+      { label: 'Batches', href: '/crm/batches', match: '/crm/batches', keywords: ['departures', 'batch', 'tripzo'] },
       /*
        * NOT the same screen as Sales → Invoices, and the distinction is the
        * reason this section exists. Sales → Invoices is the BOOK OF ACCOUNT:

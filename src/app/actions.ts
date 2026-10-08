@@ -40,7 +40,7 @@ import {
 } from '@/server/accounting/settlements';
 import { setSetting, type SettingKey } from '@/server/accounting/settings';
 import { resetAndSeed } from '@/server/seed';
-import { journalOfBankAccount } from '@/server/options';
+import { journalOfBankAccount, resolveBatchName } from '@/server/options';
 import { run, id } from '@/server/db';
 import { connect as connectCrm, disconnect as disconnectCrm } from '@/server/crm/connection';
 import { setPackageTax } from '@/server/crm/packageTax';
@@ -462,6 +462,10 @@ export async function saveDocumentAction(formData: FormData) {
        * `deriveTripFromInvoice`.
        */
       linkedInvoiceId: opt(formData, 'linked_invoice_id'),
+      // The CRM departure this document is for, and its label snapshotted at
+      // the moment it was picked — see `batch_name` on the Batch field.
+      crmBatchId: opt(formData, 'crm_batch_id'),
+      batchName: opt(formData, 'batch_name'),
       docDate: str(formData, 'doc_date') || isoDate(),
       dueDate: opt(formData, 'due_date'),
       paymentTermsId: opt(formData, 'payment_terms_id'),
@@ -980,6 +984,8 @@ export async function saveExpenseAction(formData: FormData) {
       // The sale this was spent on. The server takes the trip off that sale,
       // so a claim names one thing and reaches both. See `tripOfInvoice`.
       linkedInvoiceId: opt(formData, 'linked_invoice_id'),
+      crmBatchId: opt(formData, 'crm_batch_id'),
+      batchName: await resolveBatchName(s.orgId, opt(formData, 'crm_batch_id')),
       paidBy: str(formData, 'paid_by') === 'company' ? 'company' : 'employee',
       journalId: opt(formData, 'journal_id'),
     }, actorOf(s));
@@ -1030,6 +1036,10 @@ export async function commissionAction(formData: FormData) {
       // from — the sale's own revenue and costs, or the trip's analytic account.
       linkedInvoiceId: opt(formData, 'linked_invoice_id'),
       bookingId: opt(formData, 'booking_id'),
+      // Optional, per the instruction that a commission's batch is not
+      // required — it is extra context when there is one, nothing refuses it.
+      crmBatchId: opt(formData, 'crm_batch_id'),
+      batchName: await resolveBatchName(s.orgId, opt(formData, 'crm_batch_id')),
       basis: str(formData, 'basis') === 'revenue' ? 'revenue' : 'profit',
       rateBps: Math.round(parseFloat(str(formData, 'rate') || '0') * 100),
       fixedAmount: money(formData, 'fixed_amount'),

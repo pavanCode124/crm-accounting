@@ -43,6 +43,9 @@ export interface ExpenseInput {
    * invoice-backed ones start working at all.
    */
   linkedInvoiceId?: string | null;
+  /** The CRM departure this claim was spent on, and its label as it was picked. */
+  crmBatchId?: string | null;
+  batchName?: string | null;
 }
 
 /**
@@ -102,12 +105,14 @@ export async function createExpense(input: ExpenseInput, actor: Actor = {}): Pro
       `INSERT INTO expenses
          (id, org_id, number, employee_id, employee_name, description, expense_date, amount,
           tax_id, tax_amount, account_id, analytic_id, booking_id, linked_invoice_id,
+          crm_batch_id, batch_name,
           paid_by, journal_id, state, receipt, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft',?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft',?,?)`,
       expenseId, input.orgId, await nextExpenseNumber(input.orgId), input.employeeId ?? null,
       input.employeeName, input.description, input.expenseDate, input.amount,
       input.taxId ?? null, taxAmount, input.accountId, trip.analyticId,
-      trip.bookingId, trip.linkedInvoiceId, input.paidBy, input.journalId ?? null,
+      trip.bookingId, trip.linkedInvoiceId, input.crmBatchId ?? null, input.batchName ?? null,
+      input.paidBy, input.journalId ?? null,
       input.receipt ?? null, nowIso(),
     );
     await audit(input.orgId, actor, 'created', 'expense', expenseId, input.description);
@@ -328,6 +333,14 @@ export async function createCommission(orgId: string, input: {
    */
   linkedInvoiceId?: string | null;
   bookingId?: string | null;
+  /**
+   * THE CRM DEPARTURE, EXPLICITLY OPTIONAL. A commission is earned on a sale
+   * or a trip (one of those two is required, enforced below) — the batch is
+   * extra context recorded alongside it when the agent asks for one, never a
+   * basis for the commission and never required.
+   */
+  crmBatchId?: string | null;
+  batchName?: string | null;
   basis: CommissionBasis; rateBps?: number; fixedAmount?: number; dueDate?: string | null;
 }, actor: Actor = {}): Promise<string> {
   return await tx(async () => {
@@ -345,11 +358,12 @@ export async function createCommission(orgId: string, input: {
     const commissionId = id('com');
     await run(
       `INSERT INTO commissions
-         (id, org_id, agent_id, agent_name, booking_id, linked_invoice_id, basis, rate_bps,
-          fixed_amount, base_amount, amount, due_date, state, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'draft',?)`,
+         (id, org_id, agent_id, agent_name, booking_id, linked_invoice_id, crm_batch_id, batch_name,
+          basis, rate_bps, fixed_amount, base_amount, amount, due_date, state, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft',?)`,
       commissionId, orgId, input.agentId ?? null, input.agentName, trip.bookingId,
-      trip.linkedInvoiceId, input.basis, input.rateBps ?? 0, input.fixedAmount ?? 0, base, amount,
+      trip.linkedInvoiceId, input.crmBatchId ?? null, input.batchName ?? null,
+      input.basis, input.rateBps ?? 0, input.fixedAmount ?? 0, base, amount,
       input.dueDate ?? null, nowIso(),
     );
     await audit(orgId, actor, 'created', 'commission', commissionId,

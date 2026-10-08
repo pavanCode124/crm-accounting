@@ -99,6 +99,26 @@ export interface DocInput {
    * would be the system disagreeing with the person typing.
    */
   linkedInvoiceId?: string | null;
+  /**
+   * THE CRM DEPARTURE THIS DOCUMENT IS FOR.
+   *
+   * Unlike `linkedInvoiceId`, this applies on BOTH a customer invoice and a
+   * vendor bill — a batch is sold (invoices) and bought for (bills), and both
+   * live in this one table. It is independent of the trip/invoice fields
+   * above: a document can carry a trip, a linked invoice AND a batch at once,
+   * because a batch groups several invoices the way a trip groups GL lines —
+   * a different cut of the same costs, not a replacement for either.
+   *
+   * NOT DERIVED FROM ANYTHING ELSE ON SAVE, unlike the trip. A batch is a
+   * choice the person recording the document makes directly off the live CRM
+   * list, not something to infer from a linked invoice — two invoices against
+   * the same departure can legitimately be raised by two different people who
+   * each pick the batch themselves, and a vendor bill bought for one
+   * traveller's invoice is not necessarily bought for the whole batch.
+   */
+  crmBatchId?: string | null;
+  /** The batch's own label, SNAPSHOTTED at the moment it was picked — see `crm_batch_id` in schema.sql. */
+  batchName?: string | null;
   docDate: string;
   dueDate?: string | null;
   paymentTermsId?: string | null;
@@ -183,6 +203,9 @@ export interface DocRow {
   booking_id: string | null; booking_ref?: string | null; analytic_id: string | null;
   /** Vendor bills: the customer invoice this cost was incurred for. */
   linked_invoice_id: string | null;
+  /** The CRM departure this document is for, and its label as it was picked. */
+  crm_batch_id: string | null;
+  batch_name: string | null;
   /** Joined for display — the invoice's own number and what it was raised for. */
   linked_invoice_number?: string | null;
   linked_invoice_date?: string | null;
@@ -230,14 +253,16 @@ export async function createDocument(input: DocInput, actor: Actor = {}): Promis
     await run(
       `INSERT INTO documents
          (id, org_id, doc_type, partner_id, journal_id, booking_id, analytic_id, linked_invoice_id,
+          crm_batch_id, batch_name,
           doc_date, due_date, payment_terms_id, supplier_ref, currency, rate_e6,
           state, payment_state, withholding_tax_id, note,
           place_of_supply, party_gstin, supply_type, irn, irn_ack_no, irn_ack_date, order_ref, order_date,
           stated_discount, stated_tax, stated_advance,
           created_by, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft','not_paid',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft','not_paid',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       docId, input.orgId, input.docType, input.partnerId, input.journalId,
-      trip.bookingId, trip.analyticId, trip.linkedInvoiceId, input.docDate, due,
+      trip.bookingId, trip.analyticId, trip.linkedInvoiceId,
+      input.crmBatchId ?? null, input.batchName ?? null, input.docDate, due,
       input.paymentTermsId ?? null, input.supplierRef ?? null,
       input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
       input.withholdingTaxId ?? null, input.note ?? null,
@@ -274,13 +299,14 @@ export async function updateDocument(docId: string, input: DocInput, actor: Acto
     const trip = await deriveTripFromInvoice(input);
     await run(
       `UPDATE documents SET partner_id=?, journal_id=?, booking_id=?, analytic_id=?,
-              linked_invoice_id=?,
+              linked_invoice_id=?, crm_batch_id=?, batch_name=?,
               doc_date=?, due_date=?, payment_terms_id=?, supplier_ref=?, currency=?, rate_e6=?,
               withholding_tax_id=?, note=?, place_of_supply=?, party_gstin=?, supply_type=?,
               irn=?, irn_ack_no=?, irn_ack_date=?, order_ref=?, order_date=?,
               stated_discount=?, stated_tax=?, stated_advance=?
          WHERE id=? AND org_id=?`,
       input.partnerId, input.journalId, trip.bookingId, trip.analyticId, trip.linkedInvoiceId,
+      input.crmBatchId ?? null, input.batchName ?? null,
       input.docDate, input.dueDate ?? await deriveDueDate(input), input.paymentTermsId ?? null,
       input.supplierRef ?? null, input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
       input.withholdingTaxId ?? null, input.note ?? null,
@@ -1032,13 +1058,14 @@ export async function amendDocument(docId: string, input: DocInput, actor: Actor
 
     await run(
       `UPDATE documents SET partner_id=?, journal_id=?, booking_id=?, analytic_id=?,
-              linked_invoice_id=?,
+              linked_invoice_id=?, crm_batch_id=?, batch_name=?,
               doc_date=?, due_date=?, payment_terms_id=?, supplier_ref=?, currency=?, rate_e6=?,
               withholding_tax_id=?, note=?, place_of_supply=?, party_gstin=?, supply_type=?,
               irn=?, irn_ack_no=?, irn_ack_date=?, order_ref=?, order_date=?,
               stated_discount=?, stated_tax=?, stated_advance=?
          WHERE id=? AND org_id=?`,
       input.partnerId, input.journalId, trip.bookingId, trip.analyticId, trip.linkedInvoiceId,
+      input.crmBatchId ?? null, input.batchName ?? null,
       input.docDate, input.dueDate ?? await deriveDueDate(input), input.paymentTermsId ?? null,
       input.supplierRef ?? null, input.currency ?? 'INR', input.rateE6 ?? 1_000_000,
       input.withholdingTaxId ?? null, input.note ?? null,

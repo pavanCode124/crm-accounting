@@ -1,7 +1,7 @@
 import { ctx } from '@/server/bootstrap';
 import { msg, type SearchParams } from '@/lib/range';
 import { listCommissions, commissionBasisLabel } from '@/server/accounting/expenses';
-import { bookingOptions, saleOptions } from '@/server/options';
+import { bookingOptions, saleOptions, batchOptions } from '@/server/options';
 import { fmtDate, isoDate } from '@/lib/accounting';
 import { bpsToPct } from '@/lib/money';
 import { commissionAction } from '@/app/actions';
@@ -27,6 +27,7 @@ export default async function CommissionsPage({ searchParams }: { searchParams: 
   const rows = await listCommissions(s.orgId);
   const bookings = await bookingOptions(s.orgId);
   const sales = await saleOptions(s.orgId);
+  const batches = await batchOptions(s.orgId);
   const today = isoDate();
 
   const payable = rows.filter((r) => r.state === 'posted').reduce((sum, r) => sum + r.amount, 0);
@@ -125,6 +126,13 @@ export default async function CommissionsPage({ searchParams }: { searchParams: 
               <select name="booking_id" className={inputClass} defaultValue="">
                 <option value="">—</option>
                 {bookings.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}
+              </select>
+            </Field>
+            {/* Live from TripzoCRM, entirely optional — context, never a basis. */}
+            <Field label="Batch" hint="The CRM departure this was earned on, if relevant. Not required.">
+              <select name="crm_batch_id" className={inputClass} defaultValue="">
+                <option value="">—</option>
+                {batches.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}
               </select>
             </Field>
             <Field label="Basis"

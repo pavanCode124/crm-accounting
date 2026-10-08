@@ -240,6 +240,171 @@ export async function saleMargin(orgId: string, documentId: string): Promise<Sal
   return row ?? null;
 }
 
+// ---------------------------------------------------------------------------
+// Profitability per BATCH — keyed on the TripzoCRM departure
+// ---------------------------------------------------------------------------
+
+/**
+ * ===========================================================================
+ * WHAT ONE DEPARTURE EARNED, ACROSS EVERY INVOICE RAISED AGAINST IT.
+ * ===========================================================================
+ * The per-sale report above answers "what did this one invoice earn"; an
+ * agency selling a shared departure wants the same question asked of the
+ * BATCH — several travellers' invoices and the costs bought for the group as
+ * a whole, hotel rooms and a coach booked once for everyone on it rather than
+ * once per traveller.
+ *
+ * `crm_batch_id` on `documents`, `expenses` and `commissions` is the same
+ * mechanism as `linked_invoice_id`, one level up: a cost reaches a batch
+ * either DIRECTLY — someone picked the batch itself on the bill because it
+ * covers the whole departure — or INDIRECTLY, by naming an invoice that is
+ * itself tagged to the batch. Both count, via `COALESCE(cost.crm_batch_id,
+ * linked_invoice.crm_batch_id)` in every cost subquery below, so a hotel bill
+ * tagged at the invoice level and one tagged at the batch level land in the
+ * same total.
+ *
+ * NOT DOUBLE-COUNTED AGAINST "BY INVOICE": the two are different cuts of the
+ * same `crm_batch_id`/`linked_invoice_id` links, read independently rather
+ * than one nested inside the other — the screen says so.
+ */
+export interface BatchProfit {
+  crm_batch_id: string;
+  batch_name: string | null;
+  invoices: number;
+  /** Net of GST and net of credit notes raised against invoices in the batch. */
+  revenue: number;
+  credited: number;
+  bill_cost: number;
+  expense_cost: number;
+  commission_cost: number;
+  cost: number;
+  profit: number;
+  margin: number;
+  received: number;
+  outstanding: number;
+}
+
+export async function batchProfitability(orgId: string, opts: {
+  from?: string; to?: string; batchId?: string; limit?: number;
+} = {}): Promise<BatchProfit[]> {
+  const clauses = [
+    'd.org_id = ?', "d.doc_type = 'out_invoice'", "d.state <> 'cancelled'", 'd.crm_batch_id IS NOT NULL',
+  ];
+  const params: Array<string | number> = [orgId];
+  if (opts.batchId) { clauses.push('d.crm_batch_id = ?'); params.push(opts.batchId); }
+  if (opts.from) { clauses.push('d.doc_date >= ?'); params.push(opts.from); }
+  if (opts.to) { clauses.push('d.doc_date <= ?'); params.push(opts.to); }
+
+  const rows = await all<Omit<BatchProfit, 'cost' | 'profit' | 'margin'>>(
+    `SELECT d.crm_batch_id, MAX(d.batch_name) AS batch_name,
+            COUNT(*) AS invoices,
+            COALESCE(SUM(d.untaxed - cr.credited), 0) AS revenue,
+            COALESCE(SUM(cr.credited), 0) AS credited,
+            COALESCE((SELECT SUM(CASE WHEN c.doc_type = 'in_refund' THEN -c.untaxed ELSE c.untaxed END)
+                        FROM documents c
+                        LEFT JOIN documents li ON li.id = c.linked_invoice_id AND li.org_id = c.org_id
+                       WHERE c.org_id = d.org_id AND c.doc_type IN ('in_invoice','in_refund') AND c.state = 'posted'
+                         AND COALESCE(c.crm_batch_id, li.crm_batch_id) = d.crm_batch_id), 0) AS bill_cost,
+            COALESCE((SELECT SUM(e.amount) FROM expenses e
+                        LEFT JOIN documents li ON li.id = e.linked_invoice_id AND li.org_id = e.org_id
+                       WHERE e.org_id = d.org_id AND e.state IN ('posted','paid')
+                         AND COALESCE(e.crm_batch_id, li.crm_batch_id) = d.crm_batch_id), 0) AS expense_cost,
+            COALESCE((SELECT SUM(m.amount) FROM commissions m
+                        LEFT JOIN documents li ON li.id = m.linked_invoice_id AND li.org_id = m.org_id
+                       WHERE m.org_id = d.org_id AND m.state IN ('posted','paid')
+                         AND COALESCE(m.crm_batch_id, li.crm_batch_id) = d.crm_batch_id), 0) AS commission_cost,
+            COALESCE(SUM(CASE WHEN d.state = 'posted' THEN d.total - d.residual ELSE 0 END), 0) AS received,
+            COALESCE(SUM(CASE WHEN d.state = 'posted' THEN d.residual ELSE 0 END), 0) AS outstanding
+       FROM documents d
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(SUM(n.untaxed), 0) AS credited FROM documents n
+          WHERE n.org_id = d.org_id AND n.reversal_of = d.id AND n.doc_type = 'out_refund' AND n.state = 'posted'
+       ) cr ON TRUE
+      WHERE ${clauses.join(' AND ')}
+      GROUP BY d.crm_batch_id, d.org_id
+      ORDER BY revenue DESC
+      LIMIT ${opts.limit ?? 200}`,
+    ...params,
+  );
+
+  return rows.map((r) => {
+    const cost = r.bill_cost + r.expense_cost + r.commission_cost;
+    const profit = r.revenue - cost;
+    return { ...r, cost, profit, margin: marginOf(r.revenue, profit) };
+  });
+}
+
+/** One batch's margin — the same figures, for a single departure. */
+export async function batchMargin(orgId: string, crmBatchId: string): Promise<BatchProfit | null> {
+  const [row] = await batchProfitability(orgId, { batchId: crmBatchId, limit: 1 });
+  return row ?? null;
+}
+
+/**
+ * Every cost record recorded against one batch, directly or via one of its
+ * invoices — the detail behind `batchProfitability`, same shape as
+ * `saleCosts` for the same reason: a hotel bill and a guide paid in cash are
+ * the same kind of fact about this departure.
+ */
+export async function batchCosts(orgId: string, crmBatchId: string): Promise<SaleCostRow[]> {
+  const bills = await all<SaleCostRow>(
+    `SELECT 'bill' AS kind, d.id, d.number, d.doc_date AS on_date,
+            p.name AS party, d.supplier_ref AS description, d.state,
+            CASE WHEN d.doc_type = 'in_refund' THEN -d.untaxed ELSE d.untaxed END AS amount,
+            d.tax_total AS tax_amount
+       FROM documents d
+       LEFT JOIN partners p ON p.id = d.partner_id
+       LEFT JOIN documents li ON li.id = d.linked_invoice_id AND li.org_id = d.org_id
+      WHERE d.org_id = ? AND COALESCE(d.crm_batch_id, li.crm_batch_id) = ?
+        AND d.doc_type IN ('in_invoice','in_refund') AND d.state <> 'cancelled'`,
+    orgId, crmBatchId,
+  );
+  const expenses = await all<SaleCostRow>(
+    `SELECT 'expense' AS kind, e.id, e.number, e.expense_date AS on_date,
+            e.employee_name AS party, e.description, e.state,
+            e.amount, e.tax_amount
+       FROM expenses e
+       LEFT JOIN documents li ON li.id = e.linked_invoice_id AND li.org_id = e.org_id
+      WHERE e.org_id = ? AND COALESCE(e.crm_batch_id, li.crm_batch_id) = ? AND e.state <> 'refused'`,
+    orgId, crmBatchId,
+  );
+  const commissions = await all<SaleCostRow>(
+    `SELECT 'commission' AS kind, c.id, NULL AS number, COALESCE(c.due_date, c.created_at) AS on_date,
+            c.agent_name AS party, 'Agent commission' AS description, c.state,
+            c.amount, 0 AS tax_amount
+       FROM commissions c
+       LEFT JOIN documents li ON li.id = c.linked_invoice_id AND li.org_id = c.org_id
+      WHERE c.org_id = ? AND COALESCE(c.crm_batch_id, li.crm_batch_id) = ? AND c.state <> 'reversed'`,
+    orgId, crmBatchId,
+  );
+  return [...bills, ...expenses, ...commissions]
+    .sort((a, b) => (a.on_date < b.on_date ? -1 : a.on_date > b.on_date ? 1 : 0));
+}
+
+export interface BatchInvoiceRow {
+  document_id: string; number: string | null; crm_number: string | null;
+  doc_date: string; state: string; partner_name: string | null;
+  untaxed: number; total: number; residual: number;
+}
+
+/** Every invoice raised against one batch, for the export's Invoices sheet. */
+export async function batchInvoices(orgId: string, crmBatchId: string): Promise<BatchInvoiceRow[]> {
+  return await all<BatchInvoiceRow>(
+    `SELECT d.id AS document_id, d.number, ci.invoice_number AS crm_number,
+            d.doc_date, d.state, p.name AS partner_name, d.untaxed, d.total, d.residual
+       FROM documents d
+       LEFT JOIN partners p ON p.id = d.partner_id
+       LEFT JOIN LATERAL (
+         SELECT x.invoice_number FROM crm_invoices x
+          WHERE x.org_id = d.org_id AND x.document_id = d.id
+          ORDER BY x.fetched_at DESC LIMIT 1
+       ) ci ON TRUE
+      WHERE d.org_id = ? AND d.crm_batch_id = ? AND d.doc_type = 'out_invoice' AND d.state <> 'cancelled'
+      ORDER BY d.doc_date, d.number`,
+    orgId, crmBatchId,
+  );
+}
+
 /**
  * Every cost record recorded against one sale, in one list.
  *

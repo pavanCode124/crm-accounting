@@ -1,6 +1,6 @@
 import { ctx } from '@/server/bootstrap';
 import { msg, one, type SearchParams } from '@/lib/range';
-import { accountOptions, journalOptions, analyticOptions, bookingOptions, saleOptions } from '@/server/options';
+import { accountOptions, journalOptions, analyticOptions, bookingOptions, saleOptions, batchOptions } from '@/server/options';
 import { listTaxes } from '@/server/accounting/tax';
 import { isoDate } from '@/lib/accounting';
 import { saveExpenseAction, employeeAdvanceAction } from '@/app/actions';
@@ -29,6 +29,7 @@ export default async function NewExpensePage({ searchParams }: { searchParams: P
   const analytics = await analyticOptions(s.orgId);
   const bookings = await bookingOptions(s.orgId);
   const sales = await saleOptions(s.orgId);
+  const batches = await batchOptions(s.orgId);
   const taxes = await listTaxes(s.orgId, 'purchase');
   const today = isoDate();
 
@@ -124,6 +125,24 @@ export default async function NewExpensePage({ searchParams }: { searchParams: P
                   </select>
                 </Field>
               </div>
+
+              {/*
+                Live from TripzoCRM, same field as on invoices and bills — a
+                guide paid in cash on day three of a departure is often a cost
+                of the whole batch rather than of one traveller's invoice.
+
+                NO HIDDEN "batch_name" SNAPSHOT HERE, unlike the invoice form:
+                this page is a server component with no script to keep one in
+                sync via onChange. `saveExpenseAction` resolves the label from
+                the chosen id against the same live list on save instead — see
+                `resolveBatchName` in src/app/actions.ts.
+              */}
+              <Field label="Batch" hint="The CRM departure this was spent on, if it is for the batch as a whole rather than one invoice.">
+                <select name="crm_batch_id" className={inputClass} defaultValue="">
+                  <option value="">— not against a particular batch</option>
+                  {batches.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}
+                </select>
+              </Field>
 
               <Field label="Paid by">
                 <select name="paid_by" className={inputClass} defaultValue="employee">
